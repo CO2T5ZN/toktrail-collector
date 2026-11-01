@@ -661,13 +661,16 @@ func TestConnectSecurityAndValidation(t *testing.T) {
 	})
 
 	t.Run("no_ticket_leak_in_errors", func(t *testing.T) {
-		testErr := fmt.Errorf("connection to %s failed: secret is %s", validURL, validTicket)
+		testErr := fmt.Errorf("connection to %s failed: secret is %s and %s", validURL, validTicket, strings.ToUpper(validTicket))
 		sanitized := sanitizeError(testErr, validTicket)
-		if strings.Contains(sanitized.Error(), validTicket) {
-			t.Fatalf("sanitized error leaked ticket: %s", sanitized.Error())
+		if strings.Contains(strings.ToLower(sanitized.Error()), strings.ToLower(validTicket)) {
+			t.Fatalf("sanitized error leaked ticket in any case: %s", sanitized.Error())
 		}
-		if !strings.Contains(sanitized.Error(), "[REDACTED]") {
-			t.Fatalf("sanitized error should redact ticket: %s", sanitized.Error())
+		if strings.Contains(sanitized.Error(), validURL) {
+			t.Fatalf("sanitized error leaked the URL: %s", sanitized.Error())
+		}
+		if !errors.Is(sanitized, testErr) {
+			t.Fatal("sanitized error lost the errors.Is chain")
 		}
 	})
 }
@@ -925,9 +928,9 @@ func TestConnectToolStatusReportFailures(t *testing.T) {
 		if strings.Contains(err.Error(), validTicket) {
 			t.Fatalf("error must redact the connect ticket: %v", err)
 		}
-		if !strings.Contains(err.Error(), "[REDACTED]") {
-			t.Fatalf("error should contain the redaction marker: %v", err)
-		}
+		// The syncclient now strips untrusted server free text before it
+		// reaches this layer, so the ticket is absent outright rather
+		// than replaced with a marker; absence is the security property.
 	})
 
 	t.Run("undeployed_endpoint_404_tolerated", func(t *testing.T) {

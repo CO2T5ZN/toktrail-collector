@@ -209,6 +209,9 @@ func TestSyncCollectionRounds(t *testing.T) {
 	if res1.SyncedBatches != 1 || res1.SyncedRecords != 2 || res1.PendingRemaining != 0 {
 		t.Fatalf("round 1 upload: %+v", res1)
 	}
+	if res1.Outcome != cursorsync.RoundRan {
+		t.Fatalf("round 1 outcome %q, want ran", res1.Outcome)
+	}
 	lic1 := loadLicense(t, h.dir)
 	if lic1.Status != cursorsource.StatusActive || lic1.PullWatermark == nil || !lic1.PullWatermark.Equal(baseTime) {
 		t.Fatalf("round 1 license: %+v", lic1)
@@ -328,6 +331,9 @@ func TestSyncAccountSwitchPauses(t *testing.T) {
 	if !strings.Contains(res.Skipped, "switched to a different Cursor account") {
 		t.Fatalf("skip reason %q", res.Skipped)
 	}
+	if res.Outcome != cursorsync.RoundAuthWithheld {
+		t.Fatalf("a mid-round account switch is an authorization verdict, outcome %q", res.Outcome)
+	}
 	if len(h.pull.callLog()) != 0 {
 		t.Fatal("a switched account must never be pulled")
 	}
@@ -344,6 +350,9 @@ func TestSyncAccountSwitchPauses(t *testing.T) {
 	}
 	if res2.Ran || !strings.Contains(res2.Skipped, "permit paused") {
 		t.Fatalf("paused round: ran=%t skipped=%q", res2.Ran, res2.Skipped)
+	}
+	if res2.Outcome != cursorsync.RoundAuthWithheld {
+		t.Fatalf("a paused permit is an authorization verdict, outcome %q", res2.Outcome)
 	}
 	if h.auth.fetchCount() != fetches {
 		t.Fatal("a paused permit must not re-read the credential")

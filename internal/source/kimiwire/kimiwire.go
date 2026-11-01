@@ -2,6 +2,7 @@ package kimiwire
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -66,10 +67,22 @@ type kimiFileContext struct {
 // Kimi CLI writes StatusUpdate events with token_usage snake_case counters;
 // Kimi Code writes usage.record events with camelCase counters. Both are
 // per-turn self-reported counts in wire.jsonl. Kimi Code session-scoped
-// cumulative usage records are ignored to avoid double counting.
+// cumulative usage records are ignored to avoid double counting. It keeps the
+// historical uncancellable signature for direct callers; the adapter's Load
+// passes its cancellation scope through loadRecordsContext.
 func LoadRecords(root string, cfg SourceConfig) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), root, cfg)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// during file discovery, once per file, and once per line. On cancellation it
+// returns ctx.Err() (matchable with errors.Is(err, context.Canceled) or
+// errors.Is(err, context.DeadlineExceeded)) and no partial result — records,
+// issues, and quarantine counts accumulated so far are discarded, so a scan
+// cut short never exports half of the Kimi usage.
+func loadRecordsContext(ctx context.Context, root string, cfg SourceConfig) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
-	files, err := wireFiles(root)
+	files, err := wireFilesContext(ctx, root)
 	if err != nil {
 		return result, err
 	}
@@ -106,6 +119,9 @@ func LoadRecords(root string, cfg SourceConfig) (adapter.LoadResult, error) {
 		records[key] = rec
 	}
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
 		if info, err := os.Lstat(file); err != nil {
 			return adapter.LoadResult{}, err
 		} else if !info.Mode().IsRegular() {
@@ -113,14 +129,17 @@ func LoadRecords(root string, cfg SourceConfig) (adapter.LoadResult, error) {
 			continue
 		}
 		fallbackSession := sessionFromPath(file)
-		ctx := &kimiFileContext{}
-		if err := jsonl.WalkLines(file, func(line jsonl.Line) error {
+		fileCtx := &kimiFileContext{}
+		if err := jsonl.WalkLinesContext(ctx, file, func(line jsonl.Line) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			row, err := jsonl.DecodeObject(line.Text)
 			if err != nil {
 				issue(line.File, line.Number, "invalid JSON")
 				return nil
 			}
-			obs, ok, reason := parseKimiLine(row, fallbackSession, line.File, line.Number, ctx)
+			obs, ok, reason := parseKimiLine(row, fallbackSession, line.File, line.Number, fileCtx)
 			if reason != "" {
 				issue(line.File, line.Number, reason)
 				return nil
@@ -152,7 +171,14 @@ func LoadRecords(root string, cfg SourceConfig) (adapter.LoadResult, error) {
 	return result, nil
 }
 
-func wireFiles(root string) ([]string, error) {
+// wireFilesContext discovers the wire.jsonl files under an explicitly granted
+// root with cancellation support: the context is checked before the root is
+// resolved and once per walked directory entry, mirroring
+// jsonl.FilesContext's coarse boundaries.
+func wireFilesContext(ctx context.Context, root string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	clean := strings.TrimSpace(root)
 	info, err := os.Stat(clean)
 	if err != nil {
@@ -166,6 +192,9 @@ func wireFiles(root string) ([]string, error) {
 	}
 	var files []string
 	if err := filepath.WalkDir(clean, func(path string, d os.DirEntry, err error) error {
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return err
 		}
@@ -403,13 +432,17 @@ func Adapter(cfg SourceConfig) adapter.Adapter {
 		Source:      cfg.Source,
 		Description: cfg.Tool + " wire JSONL",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input, cfg)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input, cfg)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, cfg.Source, cfg.Tool, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, cfg.Source, cfg.Tool, records)
 		},
 	}
 }
@@ -417,7 +450,20 @@ func Adapter(cfg SourceConfig) adapter.Adapter {
 func KimiCLIAdapter() adapter.Adapter  { return Adapter(KimiCLIConfig) }
 func KimiCodeAdapter() adapter.Adapter { return Adapter(KimiCodeConfig) }
 
-func filterKnownRecords(stateDir, source, tool string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full rescans cannot re-export known records. The context is
+// consulted at coarse boundaries (entry, per outbox batch, per stored
+// record, before the quarantine load, per quarantine entry, per fresh
+// record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir, source, tool string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -445,6 +491,9 @@ func filterKnownRecords(stateDir, source, tool string, records []adapter.Record)
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != source {
 			continue
 		}
@@ -468,16 +517,25 @@ func filterKnownRecords(stateDir, source, tool string, records []adapter.Record)
 			return nil, fmt.Errorf("%s history batch identity mismatch", tool)
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == source {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -486,6 +544,9 @@ func filterKnownRecords(stateDir, source, tool string, records []adapter.Record)
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

@@ -39,6 +39,7 @@ type overrideRemote struct {
 	mu           sync.Mutex
 	posts        int
 	selfCalls    int
+	requests     int // every HTTP request of any kind, capabilities included
 	posted       []postedOverride
 	receipts     map[string]syncclient.BatchReceipt
 	rejectAll    bool // reject every record with record_conflict
@@ -52,6 +53,7 @@ func newOverrideRemote(t *testing.T) (*overrideRemote, *httptest.Server) {
 	h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.requests++
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/capabilities":
@@ -110,6 +112,15 @@ func (f *overrideRemote) snapshot() []postedOverride {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]postedOverride(nil), f.posted...)
+}
+
+// requestCount reports every HTTP request the fake has served, the
+// unauthenticated capabilities probe included, so a cancellation test can
+// prove zero network traffic of any kind.
+func (f *overrideRemote) requestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests
 }
 
 // ---------------------------------------------------------------------------

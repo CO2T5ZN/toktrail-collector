@@ -183,7 +183,7 @@ func New(opts Options) (*Client, error) {
 	// replayed against a Location the client did not choose, and Cursor's
 	// endpoints answer directly.
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return errors.New("cursor api: redirects are not allowed")
+		return errRedirectRefused
 	}
 	c.httpClient = &httpClient
 	return c, nil
@@ -244,7 +244,25 @@ type FetchOptions struct {
 // cumulative byte ceiling overrun is an error rather than a silently
 // partial result. When the caller's context has no deadline, the whole walk
 // is bounded by DefaultWalkBudget.
-func (c *Client) FetchUsageEvents(ctx context.Context, sess Session, opts FetchOptions) (*UsageEvents, error) {
+//
+// Error privacy, double-gated: the strict row parser's errors carry only
+// fixed field names and categories (never the row or a field value), and
+// every error leaving this walk is additionally passed through
+// sanitizeToken against the session token — the second layer behind the
+// request-level sanitization. The boundary keeps errors.Is/As contracts
+// intact: a token-free error passes through untouched with its full chain
+// (ErrSessionExpired, cancellation, url.Error …), and a token-bearing
+// message is redacted by a wrapper that keeps the cause reachable through
+// Unwrap, so sentinel and net.Error matching survive the redaction too.
+func (c *Client) FetchUsageEvents(ctx context.Context, sess Session, opts FetchOptions) (result *UsageEvents, err error) {
+	// Second sanitization layer (see the function comment): applied on
+	// every error exit, after the request-level one. Clean errors are
+	// returned untouched, so no Is/As contract is lost unnecessarily.
+	defer func() {
+		if err != nil {
+			err = sanitizeToken(err, sess.Token)
+		}
+	}()
 	if strings.TrimSpace(sess.Token) == "" {
 		return nil, errors.New("cursor api: session token is empty")
 	}
@@ -266,7 +284,7 @@ func (c *Client) FetchUsageEvents(ctx context.Context, sess Session, opts FetchO
 	// skew allowance: an accepted future row cannot move the window.
 	maxTimestamp := endMS + clockSkewMS
 
-	result := &UsageEvents{StartDateMS: startMS, EndDateMS: endMS}
+	result = &UsageEvents{StartDateMS: startMS, EndDateMS: endMS}
 	completed := false
 	seenPages := make(map[[32]byte]bool)
 	rowsRead := 0
@@ -416,11 +434,23 @@ func (c *Client) FetchUsageSummary(ctx context.Context, sess Session) (*UsageSum
 	return summary, nil
 }
 
-// request performs one call, enforcing status, size, and redirect policy.
-// jsonHeaders selects the dashboard CSRF headers (Content-Type + Origin).
-// maxBytes bounds this call's response body; callers advancing a paginated
-// walk pass what remains of their cumulative budget.
+// request performs one call, enforcing status, size, and redirect
+// policy. jsonHeaders selects the dashboard CSRF headers (Content-Type +
+// Origin). maxBytes bounds this call's response body; callers advancing
+// a paginated walk pass what remains of their cumulative budget.
+//
+// Error privacy: every request-construction, transport and body-read
+// failure is wrapped by wrapTransportError — a fixed human message with
+// the cause kept reachable through Unwrap. The raw transport text
+// embeds the full request URL and therefore anything a hostile server
+// placed into a refused redirect's Location header (the session token,
+// a case variant, or any other secret), which sanitizeToken's
+// exact-token replacement could not catch; the fixed wording never
+// renders any of it, while errors.Is/As (cancellation, deadlines,
+// net.Error, the redirect refusal, ErrSessionExpired on the status
+// paths) keep matching exactly.
 func (c *Client) request(ctx context.Context, path, method string, sess Session, body any, jsonHeaders bool, maxBytes int) ([]byte, error) {
+	scope := "cursor api: " + endpointScope(path)
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -431,7 +461,7 @@ func (c *Client) request(ctx context.Context, path, method string, sess Session,
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL.JoinPath(path).String(), reader)
 	if err != nil {
-		return nil, sanitizeToken(fmt.Errorf("cursor api: failed to build request: %w", err), sess.Token)
+		return nil, wrapTransportError(scope+" request could not be built", err)
 	}
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", acceptLanguage)
@@ -445,7 +475,7 @@ func (c *Client) request(ctx context.Context, path, method string, sess Session,
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, sanitizeToken(fmt.Errorf("cursor api: request %s failed: %w", path, err), sess.Token)
+		return nil, wrapTransportError(scope+" request failed on the transport", err)
 	}
 	defer resp.Body.Close()
 
@@ -453,7 +483,7 @@ func (c *Client) request(ctx context.Context, path, method string, sess Session,
 		return nil, ErrSessionExpired
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("cursor api: %s returned status %d", path, resp.StatusCode)
+		return nil, fmt.Errorf("cursor api: %s returned status %d", endpointScope(path), resp.StatusCode)
 	}
 
 	remaining := maxBytes
@@ -462,55 +492,145 @@ func (c *Client) request(ctx context.Context, path, method string, sess Session,
 	}
 	text, err := readBodyCapped(resp, remaining)
 	if err != nil {
-		return nil, sanitizeToken(err, sess.Token)
+		// The byte-cap refusal is locally constructed fixed text; only
+		// the read failure is a transport error needing the
+		// cause-preserving wrapper.
+		if errors.Is(err, errResponseBodyCap) {
+			return nil, err
+		}
+		return nil, wrapTransportError(scope+" response could not be read", err)
 	}
 	return text, nil
 }
 
+// errResponseBodyCap is the sentinel behind the cumulative body-cap
+// refusals, so request can tell a local policy error from a transport
+// failure.
+var errResponseBodyCap = errors.New("cursor api: response body exceeds the byte limit")
+
 // readBodyCapped reads at most limit bytes, refusing an oversized
-// Content-Length before reading and the actual stream while reading.
+// Content-Length before reading and the actual stream while reading. A
+// read failure is returned raw — the caller wraps it, keeping its cause
+// (cancellation, connection loss) matchable through Unwrap.
 func readBodyCapped(resp *http.Response, limit int) ([]byte, error) {
 	if resp.ContentLength > int64(limit) {
-		return nil, fmt.Errorf("cursor api: response body exceeds the %d byte limit", limit)
+		return nil, fmt.Errorf("%w (%d bytes)", errResponseBodyCap, limit)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
-		return nil, errors.New("cursor api: failed to read response body")
+		return nil, err
 	}
 	if len(data) > limit {
-		return nil, fmt.Errorf("cursor api: response body exceeds the %d byte limit", limit)
+		return nil, fmt.Errorf("%w (%d bytes)", errResponseBodyCap, limit)
 	}
 	return data, nil
 }
 
-// redactedError hides a credential and deliberately does NOT keep the
-// original error reachable: its message may carry the token, and
-// errors.Unwrap / errors.As would surface the secret-bearing cause in
-// logs. Only the context cancellation sentinels survive, through Is, so
-// callers can still distinguish a canceled or timed-out walk.
+// errRedirectRefused is the cloned client's no-redirect policy error. A
+// redirect answer is a deliberate local security refusal (the session
+// cookie must never travel to another origin), not a network failure.
+var errRedirectRefused = errors.New("cursor api: redirects are not allowed")
+
+// endpointScope renders a request path as a fixed internal label — the
+// only form in which a path may appear in a message. An unknown path
+// (impossible from this package's own callers) is not displayed at all.
+func endpointScope(path string) string {
+	switch path {
+	case UsageEventsPath:
+		return "usage events"
+	case UsageSummaryPath:
+		return "usage summary"
+	default:
+		return "request"
+	}
+}
+
+// transportError renders a fixed, human-safe message for a transport
+// failure while keeping the original cause reachable through Unwrap, so
+// every errors.Is / errors.As contract of the wrapped error survives:
+// context cancellation and deadlines, net.Error shapes, the redirect
+// refusal and any retry marker all keep matching exactly as on the
+// unredacted error. Go's formatting never renders an error's chain —
+// fmt's %v/%+v, the log package and %w-wrapping print only Error() —
+// so the cause's raw text (which embeds the request URL and anything a
+// hostile server put into a refused redirect's Location) never reaches
+// a human message.
+type transportError struct {
+	msg   string
+	cause error
+}
+
+func (e *transportError) Error() string {
+	return e.msg + ": " + transportCauseText(e.cause)
+}
+
+// Unwrap keeps the original cause reachable so errors.Is/As keep their
+// full matching semantics; see the type comment for why that is safe.
+func (e *transportError) Unwrap() error { return e.cause }
+
+// wrapTransportError builds the sanitized wrapper. A nil err stays nil.
+func wrapTransportError(msg string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &transportError{msg: msg, cause: err}
+}
+
+// transportCauseText renders a transport failure's identity as fixed,
+// safe wording. A hostile endpoint cannot influence any of these strings
+// (they key off sentinel identities, not error text); everything else
+// collapses to the generic withheld-cause wording.
+func transportCauseText(err error) string {
+	switch {
+	case errors.Is(err, errRedirectRefused):
+		return "redirect refused (credentials never follow redirects)"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed out"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "connection closed by the server before a response"
+	default:
+		return "transport failure (network-level error text withheld; the cause remains matchable with errors.Is/errors.As)"
+	}
+}
+
+// redactedError renders a sanitized message while keeping the original
+// cause reachable through Unwrap, so every errors.Is / errors.As
+// contract of the wrapped error survives redaction: authorization
+// sentinels (ErrSessionExpired), cancellation, retry markers and
+// net.Error shapes all keep matching exactly as on the unredacted
+// error.
+//
+// Logging safety: Go's formatting never renders an error's chain —
+// fmt's %v/%+v, the log package and %w-wrapping all print only
+// Error(), which is the redacted text. The secret-bearing cause is
+// reachable only by explicitly unwrapping or errors.As traversal, which
+// no logging or classification path performs. The alternative —
+// dropping the cause — would silently strip authorization and retry
+// classification from a failure, a correctness loss the redaction must
+// never cause.
 type redactedError struct {
-	msg      string
-	canceled bool
-	deadline bool
+	msg   string
+	cause error
 }
 
 func (e *redactedError) Error() string { return e.msg }
 
-// Is reports the cancellation sentinels of the dropped original error.
-func (e *redactedError) Is(target error) bool {
-	if e.canceled && errors.Is(target, context.Canceled) {
-		return true
-	}
-	return e.deadline && errors.Is(target, context.DeadlineExceeded)
-}
+// Unwrap keeps the original cause reachable so errors.Is/As keep their
+// full matching semantics; see the type comment for why that is safe.
+func (e *redactedError) Unwrap() error { return e.cause }
 
-// sanitizeToken keeps the session token out of the rendered error message.
-// Errors whose message carries no token are returned untouched, so their
-// full chain (url.Error, context sentinels, …) stays reachable. A
-// secret-bearing error is replaced by a redactedError: the message is
-// redacted, the original cause is dropped (never reachable through Unwrap
-// or As), and only context.Canceled / context.DeadlineExceeded remain
-// detectable through errors.Is.
+// sanitizeToken keeps the session token out of the rendered error
+// message. Errors whose message carries no token are returned untouched,
+// so their full chain (url.Error, context sentinels, …) stays reachable.
+// A secret-bearing error is wrapped by a redactedError: the rendered
+// message is redacted (every occurrence of the token replaced), while
+// the original cause stays reachable through Unwrap so no errors.Is /
+// errors.As contract — authorization sentinels, cancellation, retry
+// markers, net.Error — is lost to the redaction. A wrapped chain's
+// Error() renders every nested message, so a token anywhere in the
+// chain surfaces in the top-level rendering and is caught here.
 func sanitizeToken(err error, token string) error {
 	if err == nil || token == "" {
 		return err
@@ -520,9 +640,8 @@ func sanitizeToken(err error, token string) error {
 		return err
 	}
 	return &redactedError{
-		msg:      strings.ReplaceAll(msg, token, "[REDACTED]"),
-		canceled: errors.Is(err, context.Canceled),
-		deadline: errors.Is(err, context.DeadlineExceeded),
+		msg:   strings.ReplaceAll(msg, token, "[REDACTED]"),
+		cause: err,
 	}
 }
 

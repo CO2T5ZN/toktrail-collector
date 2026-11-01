@@ -1,6 +1,7 @@
 package codexjsonl
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -31,19 +32,19 @@ func TestCodexKnownHistoryAcrossPendingAckAndQuarantine(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			got, err := filterKnownCodexRecords(dir, []adapter.Record{old, fresh})
+			got, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{old, fresh})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(got) != 1 || got[0]["recordKey"] != fresh["recordKey"] {
 				t.Fatalf("expected only appended line, got %v", got)
 			}
-			got, err = filterKnownCodexRecords(dir, []adapter.Record{old})
+			got, err = filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{old})
 			if err != nil || len(got) != 0 {
 				t.Fatalf("repeat: %v %v", got, err)
 			}
 			changed := adapter.Record{"recordKey": old["recordKey"], "inputTokens": "1"}
-			if _, err := filterKnownCodexRecords(dir, []adapter.Record{changed}); err == nil {
+			if _, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{changed}); err == nil {
 				t.Fatal("mutated immutable line accepted")
 			}
 		})
@@ -54,7 +55,7 @@ func TestCodexHistoryMissingBatchFailsClosed(t *testing.T) {
 	if err := outbox.New(dir).Save(outbox.Outbox{Batches: []outbox.BatchEntry{{BatchID: "lost", File: filepath.Join(dir, "missing"), Source: "codex-jsonl", Status: outbox.StatusSynced}}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := filterKnownCodexRecords(dir, nil); err == nil {
+	if _, err := filterKnownCodexRecordsContext(context.Background(), dir, nil); err == nil {
 		t.Fatal("missing immutable history was ignored")
 	}
 }

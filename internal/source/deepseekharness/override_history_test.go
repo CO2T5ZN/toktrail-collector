@@ -1,6 +1,7 @@
 package deepseekharness
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -50,11 +51,11 @@ func TestDSHHistoryHonorsOverrideBaseline(t *testing.T) {
 	if err := overrides.New(dir).Save(ledger); err != nil {
 		t.Fatal(err)
 	}
-	got, err := filterKnownDSHRecords(dir, []adapter.Record{current})
+	got, err := filterKnownDSHRecordsContext(context.Background(), dir, []adapter.Record{current})
 	if err != nil || len(got) != 0 {
 		t.Fatalf("current scan must drop against the confirmed override: %v %v", got, err)
 	}
-	if _, err := filterKnownDSHRecords(dir, []adapter.Record{old}); err == nil {
+	if _, err := filterKnownDSHRecordsContext(context.Background(), dir, []adapter.Record{old}); err == nil {
 		t.Fatal("the superseded archived payload must fail closed as a new drift")
 	}
 	pending := ledger.Entries[key]
@@ -66,7 +67,7 @@ func TestDSHHistoryHonorsOverrideBaseline(t *testing.T) {
 	if err := overrides.New(dir).Save(ledger); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := filterKnownDSHRecords(dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "pending") {
+	if _, err := filterKnownDSHRecordsContext(context.Background(), dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "pending") {
 		t.Fatalf("a pending override must block the dsh scan: %v", err)
 	}
 }

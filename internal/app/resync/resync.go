@@ -20,6 +20,19 @@
 //     account history, or recoverable quarantine records — are not part of
 //     resync, and output says so explicitly instead of claiming a full
 //     restore.
+//   - An optional caller snapshot can restrict a NEW job to the synced
+//     batches that existed when the snapshot was captured (connect does
+//     this, under its setup state lock, so its automatic retransmission
+//     never immediately replays the batches the same run's collection
+//     uploads). The restriction is durable: the job's journal freezes the
+//     ORIGINAL snapshot id universe — including entries the local grants
+//     excluded at plan time, so a widened authorization can recover them
+//     — and both resume and every consent-scope re-plan preserve that
+//     boundary, never widening it to batches synced after the capture. A
+//     nil snapshot (the explicit resync pass, and legacy journals without
+//     the field) keeps the original full-archive semantics, and a
+//     non-nil snapshot with zero batch ids records a first install
+//     (nothing was synced yet), which is distinct from nil.
 //   - Local authorization is strict: only batches whose (source, input)
 //     currently matches an enabled local source grant are retransmitted. A
 //     missing grant config denies by default, so residual archives cannot
@@ -30,9 +43,11 @@
 //     against a fresh live snapshot after the preflight. When the
 //     authorization revision or scope content changed — narrowed or
 //     widened — the old decisions are not treated as completing the
-//     current scope: the complete synced history is re-planned under the
-//     fresh scope and saved as the new journal, the run stops before any
-//     upload, and the next explicit pass executes the re-planned plan
+//     current scope: the job is re-planned under the fresh scope, within
+//     its frozen snapshot universe when it has one and over the complete
+//     synced history otherwise, and saved as the new journal; the run
+//     stops before any upload, and the next explicit pass executes the
+//     re-planned plan
 //     (already-delivered records replay without double counting). A
 //     finalize-only run (crash after the last upload, before the
 //     completion write) may only complete after the same verification.
@@ -49,6 +64,16 @@
 //     child batch identities keep partial-scope retransmissions stable, and
 //     the server's replay receipts keep repeated uploads from double
 //     counting. A completed job is replaced by the next explicit full pass.
+//   - An optional shared POST budget (Options.Budget) can cap the concrete
+//     ingest POST attempts one pass makes: every history retransmission
+//     target reserves exactly one attempt, under the "history" queue,
+//     immediately before its POST and only after the authorization,
+//     privacy, and scope gates. A decline stops the pass BEFORE that POST
+//     — the declined target is not marked failed, the journal keeps the
+//     job resumable, and the next run continues — while an externally
+//     canceled context keeps its original upload-failure semantics. A nil
+//     budget (the default, and the explicit resync CLI) leaves the pass
+//     unbudgeted, exactly as before.
 //   - Note: the outbox does not record which device originally synced a
 //     batch, so idempotency is guaranteed for the CURRENT device identity
 //     only; cross-device de-duplication on the server is not promised.
@@ -77,8 +102,52 @@ import (
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
+	"toktrail-collector/internal/syncbudget"
 	"toktrail-collector/internal/syncclient"
+	"toktrail-collector/internal/syncretry"
 )
+
+// SyncedBatchSnapshot freezes which synced outbox batches one automatic
+// retransmission pass may cover. connect captures it under its setup
+// state lock, BEFORE this run's collection syncs anything, so its
+// automatic pass covers exactly the history that existed when the
+// authorization gesture started and never immediately replays the
+// batches the same run uploads.
+//
+// The nil/empty distinction is load-bearing:
+//   - a nil Options.Snapshot keeps the original full-pass semantics (the
+//     explicit `toktrail resync --all`, and every pre-snapshot caller);
+//   - a non-nil snapshot with zero BatchIDs records a first install —
+//     nothing was synced yet — so the restricted pass plans nothing and
+//     completes as an empty pass.
+//
+// Batch ids the outbox no longer lists (or no longer marks synced) are
+// simply absent from the plan: the snapshot is a filter, not a checklist.
+type SyncedBatchSnapshot struct {
+	// BatchIDs lists the outbox batch ids that were already synced when
+	// the snapshot was captured. Order and duplicates are irrelevant.
+	BatchIDs []string `json:"batchIds"`
+}
+
+// NewSyncedBatchSnapshot captures the given synced batch ids as a
+// restriction snapshot. It ALWAYS returns a non-nil snapshot — including
+// for an empty or nil id list, which means "nothing was synced yet" — so
+// a caller can never accidentally collapse the empty set into the
+// no-restriction nil. The ids are copied defensively and the slice is
+// never nil, so the journal round-trip keeps the empty set distinct from
+// an absent (unrestricted) field.
+func NewSyncedBatchSnapshot(batchIDs []string) *SyncedBatchSnapshot {
+	return &SyncedBatchSnapshot{BatchIDs: append(make([]string, 0, len(batchIDs)), batchIDs...)}
+}
+
+// cloneSnapshot returns a defensive copy of the universe with a non-nil
+// BatchIDs slice; nil stays nil (unrestricted).
+func cloneSnapshot(s *SyncedBatchSnapshot) *SyncedBatchSnapshot {
+	if s == nil {
+		return nil
+	}
+	return &SyncedBatchSnapshot{BatchIDs: append(make([]string, 0, len(s.BatchIDs)), s.BatchIDs...)}
+}
 
 // Options configures one resync run.
 type Options struct {
@@ -91,10 +160,62 @@ type Options struct {
 	// positive value stops after that many uploads and reports the
 	// remainder for the next run. Negative values are rejected.
 	MaxBatches int
+	// Budget optionally caps the concrete ingest POST attempts this pass
+	// may make through a budget shared with its caller: every history
+	// retransmission target — verbatim parents, derived children, and the
+	// override-ledger retransmission — reserves exactly one attempt,
+	// under the "history" queue, immediately before its POST and only
+	// after the authorization, privacy, and scope gates. When the shared
+	// budget declines an attempt the pass stops BEFORE that POST: the
+	// declined target is not marked failed, the journal keeps the job
+	// resumable, and re-running the same command continues the pass. An
+	// externally canceled context is not a decline and keeps the original
+	// upload-failure semantics. nil (the default, and the explicit resync
+	// CLI) leaves the pass unbudgeted and identical to before.
+	Budget *syncbudget.Budget
+	// Retry, when set, opts this pass's retransmission sends into the
+	// bounded retry policy (internal/syncretry) — the AUTOMATIC history
+	// pass (connect) wires it; the explicit `resync --all` CLI and the
+	// override pass deliberately do not, keeping the historical
+	// single-shot semantics. The policy wraps each target's send INSIDE
+	// syncclient.Run (one retry loop per POST, never a loop around the
+	// target list): every attempt resends the same batch ID with the same
+	// immutable bytes, re-runs the fresh self preflight, and reserves the
+	// shared Budget again before its real POST. The target keeps its
+	// BatchFile selection and never gains a StateDir — synced outbox
+	// entries stay terminal and untouched — while the per-attempt
+	// authorization accounting rides syncclient's preflight-only hook
+	// against this run's own ledger, so every self GET of every attempt
+	// (retries included) stays durably accounted exactly once and a
+	// failed accounting write stops the send with zero HTTP traffic.
+	// Nil keeps the single-attempt behavior exactly as before.
+	Retry      *syncretry.Policy
 	HTTPClient *http.Client
 	// DryRun plans offline: no network access, no state changes, no journal
 	// write. The remote consent scope is NOT verified in a dry run.
 	DryRun bool
+	// Snapshot optionally restricts a NEW job to the outbox batches that
+	// were already synced when the caller captured it (connect captures
+	// one under its setup state lock, before any collection runs).
+	//
+	// nil keeps the original full-archive semantics — the explicit
+	// `toktrail resync --all` pass and every pre-snapshot caller. A
+	// non-nil snapshot restricts NEW jobs to exactly its listed batch
+	// ids, and an empty BatchIDs list is meaningful (nothing was synced
+	// yet: a first install plans an empty pass), which is why the
+	// distinction from nil is load-bearing.
+	//
+	// The restriction is durable. The job's journal freezes the snapshot
+	// id universe as captured — BEFORE grant filtering, so entries the
+	// grants exclude at plan time stay in it — and a resume keeps the
+	// frozen plan while a consent-scope change re-plans WITHIN that
+	// universe: batches synced after the capture (most commonly the same
+	// run's collection uploads) never join the job lineage, while
+	// grant-excluded entries rejoin once a widened authorization allows
+	// them. Jobs without a universe (nil, or legacy journals without the
+	// field) plan and re-plan over the complete synced history, exactly
+	// as before.
+	Snapshot *SyncedBatchSnapshot
 	// Confirm is invoked exactly once before any state change or network
 	// traffic (execution only, after planning). Returning an error aborts
 	// the run with zero uploads. Required for non-dry-run runs.
@@ -136,6 +257,18 @@ type Plan struct {
 
 	ExcludedReorganized int
 	ExcludedPending     int
+	// ExcludedAfterSnapshot counts synced batches the plan deliberately
+	// did not include because they were synced after the restricting
+	// snapshot was captured — most commonly the batches this very run's
+	// collection uploaded, which an immediate replay would only
+	// duplicate. Always zero for unrestricted passes.
+	ExcludedAfterSnapshot int
+	// SnapshotRestricted is true when this plan was restricted to a
+	// caller-captured synced-batch snapshot (connect's automatic pass).
+	// False is the explicit full pass. A resumed job reports what its
+	// journal recorded, and a consent-scope re-plan preserves the job's
+	// frozen universe, so the flag survives re-plans.
+	SnapshotRestricted bool
 	// ExcludedLocalGrant lists batch IDs withheld because their
 	// (source, input) has no currently enabled local source grant.
 	ExcludedLocalGrant []string
@@ -195,14 +328,52 @@ type Result struct {
 	Remaining                int
 	Completed                bool
 	// Stopped is non-empty when the run ended before finishing the plan
-	// (budget reached, upload failure, an authorization stop, or a
-	// consent-scope change that re-planned the job).
+	// (a budget stop — the per-run MaxBatches cap or a shared sync-budget
+	// decline — upload failure, an authorization stop, or a consent-scope
+	// change that re-planned the job).
 	Stopped     string
 	JournalPath string
 }
 
 // coverageNote is the fixed scope statement every plan and report carries.
 const coverageNote = "resync covers the device outbox (this collector's already-synced batches) only; independent account-source ledgers (such as cursor account history) and recoverable quarantine records are not included, and completion is not a claim of restoring anything beyond that ledger"
+
+// restrictedCoverageSuffix extends the coverage note for a pass whose
+// plan a caller snapshot restricted, so its report never claims the
+// complete synced archive.
+const restrictedCoverageSuffix = "this pass was restricted to the batches already synced when the caller captured its snapshot, so batches synced afterwards (for example by the same run's collection) were excluded and are NOT retransmitted here — an explicit full pass covers the complete synced archive"
+
+// coverageNoteFor renders the coverage note for one pass, restricted or
+// not.
+func coverageNoteFor(restricted bool) string {
+	if restricted {
+		return coverageNote + "; " + restrictedCoverageSuffix
+	}
+	return coverageNote
+}
+
+// budgetQueueHistory is the syncbudget queue name every retransmission
+// POST of a resync pass reserves under, so a caller sharing one Budget
+// across collection and history retransmission can cap them
+// independently (collection reserves under "device").
+const budgetQueueHistory = "history"
+
+// budgetStopped is the Result.Stopped marker for a pass the shared POST
+// budget declined: the declined target never POSTed, nothing was marked
+// failed, and the journal keeps the job resumable for the next run.
+const budgetStopped = "sync budget exhausted"
+
+// budgetDecline reports whether err is a shared-budget decline that
+// syncclient returned before an ingest POST — the run-wide total, this
+// queue's own cap, or the budget's own deadline ran out, so nothing was
+// submitted for the target. A canceled caller context is deliberately
+// NOT a decline: it keeps the original upload-failure semantics instead
+// of being reported as a budget stop.
+func budgetDecline(err error) bool {
+	return errors.Is(err, syncbudget.ErrTotalExhausted) ||
+		errors.Is(err, syncbudget.ErrQueueExhausted) ||
+		errors.Is(err, syncbudget.ErrDeadlineExceeded)
+}
 
 // Run performs one resync pass. The caller must hold the state directory
 // process lock (the CLI does); Run itself never locks.
@@ -319,6 +490,14 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	var finalizeOnly bool
 	if resumed {
 		jb = existing
+		// A resumed job keeps the plan its journal froze — including the
+		// snapshot universe recorded when it was planned. This run's own
+		// Snapshot option is deliberately NOT applied to a resume: the
+		// journal is the plan, and re-deriving it from a fresh snapshot
+		// could silently drop batches the job still owes (or admit
+		// batches synced after the job's boundary was captured).
+		plan.SnapshotRestricted = jb.Snapshot != nil
+		plan.CoverageNote = coverageNoteFor(jb.Snapshot != nil)
 		remaining, done, err := resumePlan(stateDir, jb, out)
 		if err != nil {
 			return Result{}, err
@@ -340,7 +519,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			fillExclusions(&plan, jb.Exclusions)
 		}
 	} else {
-		jb, plan, err = buildNewJob(stateDir, st, serverURL, out, now, plan)
+		jb, plan, err = buildNewJob(stateDir, st, serverURL, out, now, plan, opt.Snapshot)
 		if err != nil {
 			return Result{}, err
 		}
@@ -393,6 +572,23 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 
+	// Retry wiring (the automatic pass only; the explicit CLI leaves
+	// opt.Retry nil). The hook hands syncclient's per-attempt self GETs
+	// the same durable preflight accounting this pass performs for its
+	// own authorization reads — one persisted record per GET, retries
+	// included — while the target keeps its BatchFile selection and never
+	// gains a StateDir: the outbox is never re-marked and synced batches
+	// stay terminal. With the hook wired, syncclient accounts the FIRST
+	// attempt's GET itself, so the per-target records below are skipped
+	// to keep the accounting exactly one record per GET.
+	var retryPreflight func(time.Time) error
+	if opt.Retry != nil {
+		retryPreflight = func(at time.Time) error {
+			_, err := ledger.RecordPreflightAttempt(at)
+			return err
+		}
+	}
+
 	// Live authorization preflight before anything is retransmitted. The
 	// attempt accounting write happens first: if it fails, zero HTTP
 	// traffic of any kind occurs.
@@ -418,11 +614,13 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	// Scope gate: the job's recorded done/skip decisions are valid only
 	// under the live consent scope they were made under. Verify the job's
 	// baseline against this fresh snapshot; on any change (revision or
-	// content, narrowed or widened) re-plan the complete synced history
-	// under the fresh scope and stop before any upload — stale decisions
-	// are never treated as completing the current authorization. This
-	// also guards the crash-recovery finalize above: a job whose every
-	// batch is done may only be marked complete under an unchanged scope.
+	// content, narrowed or widened) re-plan under the fresh scope and stop
+	// before any upload — stale decisions are never treated as completing
+	// the current authorization. The re-plan preserves the job's frozen
+	// snapshot universe when it has one (batch boundary intact) and
+	// covers the complete synced history otherwise. This also guards the
+	// crash-recovery finalize above: a job whose every batch is done may
+	// only be marked complete under an unchanged scope.
 	gate, err := reconcileJobScope(stateDir, st, serverURL, out, &jb, scope, now)
 	if err != nil {
 		result.Stopped = scopeGateStopped
@@ -431,7 +629,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if gate.replanned {
 		result.Stopped = scopeGateStopped
 		result.Remaining = countNotDone(gate.job)
-		return result, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s); the job's earlier done/skip decisions were made under the old authorization and were NOT treated as completing the current scope. The complete synced history was re-planned as job %s (%d batch(es)) and saved to %s; re-run the same toktrail resync --all command to execute the re-planned pass — already-delivered records replay without double counting, and records outside the live scope stay withheld as a normal exclusion rather than a gap. Nothing was retransmitted in this run", jb.JobID, gate.change, gate.job.JobID, len(gate.job.Batches), journalPath(stateDir))
+		return result, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s); the job's earlier done/skip decisions were made under the old authorization and were NOT treated as completing the current scope. The job was re-planned as %s (%d batch(es)) under the fresh scope — within its original snapshot boundary when it had one, so batches synced after that snapshot was captured stay excluded — and saved to %s; re-run the same toktrail resync --all command to execute the re-planned pass — already-delivered records replay without double counting, and records outside the live scope stay withheld as a normal exclusion rather than a gap. Nothing was retransmitted in this run", jb.JobID, gate.change, gate.job.JobID, len(gate.job.Batches), journalPath(stateDir))
 	}
 
 	uploads := 0
@@ -581,20 +779,40 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			}
 			// Account Run's internal self GET before it happens, mirroring
 			// the syncclient guarantee that every authorization GET is
-			// preceded by a durable attempt record.
-			if _, err := ledger.RecordPreflightAttempt(now().UTC()); err != nil {
-				result.Stopped = "preflight accounting failed"
-				return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", t.BatchID, err)
+			// preceded by a durable attempt record. Under the retry policy
+			// the syncclient performs this accounting itself — before
+			// EVERY attempt's GET, retries included — so the record is
+			// made here only for the single-shot pass.
+			if retryPreflight == nil {
+				if _, err := ledger.RecordPreflightAttempt(now().UTC()); err != nil {
+					result.Stopped = "preflight accounting failed"
+					return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", t.BatchID, err)
+				}
 			}
 			res, runErr := syncclient.Run(ctx, store, syncclient.Options{
-				ServerURL:       serverURL,
-				BatchFile:       t.File,
-				BatchID:         t.BatchID,
-				HTTPClient:      client,
-				ReplaceExisting: t.Replace,
+				ServerURL:           serverURL,
+				BatchFile:           t.File,
+				BatchID:             t.BatchID,
+				HTTPClient:          client,
+				ReplaceExisting:     t.Replace,
+				Budget:              opt.Budget,
+				BudgetQueue:         budgetQueueHistory,
+				Retry:               opt.Retry,
+				PreflightAccounting: retryPreflight,
 			})
 			if runErr != nil {
 				switch {
+				case errors.Is(runErr, syncclient.ErrPreflightAccounting):
+					// The durable preflight accounting write failed before
+					// any self GET: zero HTTP traffic happened and nothing
+					// was submitted, so the target is NOT marked failed —
+					// the job stays resumable exactly like the pass-level
+					// accounting failure above.
+					if err := saveJob(stateDir, jb); err != nil {
+						return result, err
+					}
+					result.Stopped = "preflight accounting failed"
+					return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", t.BatchID, runErr)
 				case errors.Is(runErr, syncclient.ErrDeviceRevoked), errors.Is(runErr, syncclient.ErrSubjectDeleted):
 					if err := saveJob(stateDir, jb); err != nil {
 						return result, err
@@ -617,6 +835,21 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					result.Stopped = "server scope rejection"
 					emit(opt.Progress, ProgressEvent{BatchID: b.BatchID, Outcome: outcomeBlocked, Records: b.Records, Skipped: len(skipped), Err: b.BlockedReason})
 					return result, fmt.Errorf("resync stopped after a server-side scope rejection of batch %s; the local scope snapshot may be stale, the job stays resumable: %w", b.BatchID, runErr)
+				case budgetDecline(runErr):
+					// The shared POST budget declined this attempt after
+					// the authorization and scope gates but BEFORE the
+					// ingest POST, so nothing was submitted. That is not
+					// a batch failure and the journal is not lost: the
+					// batch keeps its previous outcome (a later run
+					// re-evaluates planned, failed, and blocked batches
+					// alike), and the pass stops here, resumable by
+					// re-running the same command under a fresh budget.
+					if err := saveJob(stateDir, jb); err != nil {
+						return result, err
+					}
+					result.Stopped = budgetStopped
+					result.Remaining = countNotDone(jb)
+					return result, fmt.Errorf("resync stopped before the upload of %s: the shared sync POST budget declined the attempt, so no ingest POST was made for it and the batch was NOT marked failed; the job stays resumable — re-run the same toktrail resync --all command to continue: %w", t.BatchID, runErr)
 				default:
 					b.Outcome = outcomeFailed
 					b.Error = runErr.Error()
@@ -675,7 +908,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			if drift, why := selfDrift(scope, res.Self, st); drift {
 				result.Stopped = scopeGateStopped
 				result.Remaining = countNotDone(jb)
-				return result, fmt.Errorf("resync stopped mid-pass: the consent scope changed while retransmitting (%s); the server accepted the upload of %s under the live authorization, but this run's remaining done/skip decisions were planned under the old scope and were NOT treated as completing the current scope — re-run the same toktrail resync --all command and it re-plans the complete synced history under the live scope (already-delivered records replay without double counting)", why, t.BatchID)
+				return result, fmt.Errorf("resync stopped mid-pass: the consent scope changed while retransmitting (%s); the server accepted the upload of %s under the live authorization, but this run's remaining done/skip decisions were planned under the old scope and were NOT treated as completing the current scope — re-run the same toktrail resync --all command and it re-plans under the live scope, within the job's original snapshot boundary when it had one (already-delivered records replay without double counting)", why, t.BatchID)
 			}
 		}
 		if stopped != "" {
@@ -762,18 +995,49 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				result.Stopped = "override batch write failed"
 				return result, fmt.Errorf("resync stopped before the override-ledger retransmission; the job stays resumable: %w", werr)
 			}
-			if _, perr := ledger.RecordPreflightAttempt(now().UTC()); perr != nil {
-				result.Stopped = "preflight accounting failed"
-				return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", id, perr)
+			// Same accounting contract as the history targets above: the
+			// single-shot pass records Run's internal self GET itself;
+			// under the retry policy the syncclient's hook accounts every
+			// attempt (retries included) exactly once.
+			if retryPreflight == nil {
+				if _, perr := ledger.RecordPreflightAttempt(now().UTC()); perr != nil {
+					result.Stopped = "preflight accounting failed"
+					return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", id, perr)
+				}
 			}
 			res, runErr := syncclient.Run(ctx, store, syncclient.Options{
-				ServerURL:       serverURL,
-				BatchFile:       file,
-				BatchID:         id,
-				HTTPClient:      client,
-				ReplaceExisting: true,
+				ServerURL:           serverURL,
+				BatchFile:           file,
+				BatchID:             id,
+				HTTPClient:          client,
+				ReplaceExisting:     true,
+				Budget:              opt.Budget,
+				BudgetQueue:         budgetQueueHistory,
+				Retry:               opt.Retry,
+				PreflightAccounting: retryPreflight,
 			})
 			if runErr != nil {
+				if errors.Is(runErr, syncclient.ErrPreflightAccounting) {
+					// Zero HTTP traffic, nothing submitted: the job stays
+					// resumable and the target is not marked failed.
+					if serr := saveJob(stateDir, jb); serr != nil {
+						return result, serr
+					}
+					result.Stopped = "preflight accounting failed"
+					return result, fmt.Errorf("cannot persist preflight attempt accounting before the override-ledger upload of %s; the job stays resumable: %w", id, runErr)
+				}
+				if budgetDecline(runErr) {
+					// Same contract as the history batches above: the
+					// budget declined before the ingest POST, so nothing
+					// was submitted, nothing failed, and the journal
+					// keeps the pass resumable.
+					if serr := saveJob(stateDir, jb); serr != nil {
+						return result, serr
+					}
+					result.Stopped = budgetStopped
+					result.Remaining = countNotDone(jb)
+					return result, fmt.Errorf("resync stopped before the override-ledger upload of %s: the shared sync POST budget declined the attempt, so no ingest POST was made for it; the job stays resumable — re-run the same toktrail resync --all command to continue: %w", id, runErr)
+				}
 				if serr := saveJob(stateDir, jb); serr != nil {
 					return result, serr
 				}
@@ -838,7 +1102,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		if drift, why := selfDrift(scope, finalSelf, st); drift {
 			result.Stopped = scopeGateStopped
 			result.Remaining = countNotDone(jb)
-			return result, fmt.Errorf("resync stopped before marking the job complete: the consent scope changed while the pass was running (%s); every accepted upload stands, but the job's done/skip decisions were planned under the old scope and were NOT treated as completing the current authorization — re-run the same toktrail resync --all command and it re-plans the complete synced history under the live scope (already-delivered records replay without double counting)", why)
+			return result, fmt.Errorf("resync stopped before marking the job complete: the consent scope changed while the pass was running (%s); every accepted upload stands, but the job's done/skip decisions were planned under the old scope and were NOT treated as completing the current authorization — re-run the same toktrail resync --all command and it re-plans under the live scope, within the job's original snapshot boundary when it had one (already-delivered records replay without double counting)", why)
 		}
 		if err := completeJob(stateDir, &jb, now); err != nil {
 			return result, err
@@ -924,25 +1188,30 @@ func completeJob(stateDir string, jb *job, now func() time.Time) error {
 
 // scopeGateStopped is the Result.Stopped marker for the consent-scope
 // re-plan path: the run ended before any upload because the authorization
-// changed, and the journal now carries the re-planned full pass.
+// changed, and the journal now carries the re-planned pass.
 const scopeGateStopped = "consent scope changed"
 
 // scopeGateOutcome reports what the scope gate decided for one run.
 type scopeGateOutcome struct {
 	// replanned is true when the recorded decisions were stale and the
-	// complete synced history was re-planned under the fresh scope.
+	// job was re-planned under the fresh scope.
 	replanned bool
-	// job is the re-planned replacement job (replanned only): a fresh full
-	// plan over the current synced outbox, baseline pinned to the fresh
-	// scope, every batch planned, no carried-over outcome or receipt.
+	// job is the re-planned replacement job (replanned only): a fresh
+	// plan over the current synced outbox WITHIN the old job's frozen
+	// snapshot universe when it had one (complete history otherwise),
+	// baseline pinned to the fresh scope, every batch planned, no
+	// carried-over outcome or receipt — and the same universe frozen
+	// for the next re-plan.
 	job job
 	// change describes the detected divergence for stop messages.
 	change string
 }
 
 // reconcileJobScope verifies that the job's recorded done/skip decisions
-// were made under the live consent scope, or re-plans the complete synced
-// history under the fresh scope when they were not. It never uploads and
+// were made under the live consent scope, or re-plans the job under the
+// fresh scope — within its frozen snapshot universe when it has one, over
+// the complete synced history otherwise — when they were not. It never
+// uploads and
 // never touches anything outside the resync-owned journal:
 //
 //   - A recorded baseline (current schema) must match the fresh scope by
@@ -958,8 +1227,9 @@ type scopeGateOutcome struct {
 //
 // Adoption only mutates the in-memory job; it persists with the first
 // journal write the run performs. On re-plan the previous journal is
-// replaced atomically by a fresh full plan over the CURRENT complete
-// synced outbox (new job id, all batches planned, fresh scope baseline);
+// replaced atomically by a fresh plan over the CURRENT synced outbox,
+// restricted to the old job's frozen snapshot universe when it had one
+// (new job id, all batches planned, fresh scope baseline, same universe);
 // the outbox, batch files, per-message progress, cursors, and quarantine
 // store are untouched, and already-delivered records stay de-duplicated
 // by the server's replay receipts when the re-planned pass re-sends them.
@@ -991,23 +1261,35 @@ func reconcileJobScope(stateDir string, st statedir.DeviceState, serverURL strin
 	return replanJob(stateDir, st, serverURL, out, *jb, nil, revision, scope, now)
 }
 
-// replanJob rebuilds the resync job over the complete current synced
-// history under the fresh live scope and durably replaces the stale
+// replanJob rebuilds the resync job under the fresh live scope — within
+// the old job's frozen snapshot universe when it had one, over the
+// complete synced history otherwise — and durably replaces the stale
 // journal with it. oldScope is the recorded baseline (nil for a legacy
 // journal whose decisions attribute to legacyRevision, or 0 when they do
 // not attribute at all). A failure to build or persist leaves the
 // previous journal untouched and resumable.
 func replanJob(stateDir string, st statedir.DeviceState, serverURL string, out outbox.Outbox, old job, oldScope *jobScope, legacyRevision int64, scope liveScope, now func() time.Time) (scopeGateOutcome, error) {
 	change := describeScopeChange(oldScope, legacyRevision, scope)
+	// The re-plan preserves the job's history boundary: the frozen
+	// snapshot universe recorded when the job was planned, BEFORE grant
+	// filtering. Batches synced after that capture — most commonly the
+	// current run's own collection uploads — stay excluded, while
+	// entries the grants excluded at plan time remain in the universe
+	// and rejoin once the widened authorization allows them. An
+	// unrestricted job (nil universe: the explicit pass, or a legacy
+	// journal without the field) re-plans over the complete synced
+	// history, exactly as before. buildNewJob freezes the same universe
+	// into the replacement job, so the boundary survives every
+	// subsequent re-plan too.
 	fresh, _, err := buildNewJob(stateDir, st, serverURL, out, now, Plan{
 		DeviceID:     st.DeviceID,
 		ServerURL:    serverURL,
 		StateDir:     stateDir,
 		JournalPath:  journalPath(stateDir),
 		CoverageNote: coverageNote,
-	})
+	}, old.Snapshot)
 	if err != nil {
-		return scopeGateOutcome{}, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s), and the complete synced history cannot be re-planned: %w; the previous journal is unchanged and the job stays resumable — resolve the reported problem, or remove %s to abandon the job, then re-run", old.JobID, change, err, journalPath(stateDir))
+		return scopeGateOutcome{}, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s), and the re-planned pass cannot be built: %w; the previous journal is unchanged and the job stays resumable — resolve the reported problem, or remove %s to abandon the job, then re-run", old.JobID, change, err, journalPath(stateDir))
 	}
 	fresh.Scope = snapshotScope(scope)
 	if err := saveJob(stateDir, fresh); err != nil {
@@ -1019,6 +1301,7 @@ func replanJob(stateDir string, st statedir.DeviceState, serverURL string, out o
 func fillExclusions(plan *Plan, ex jobExclusions) {
 	plan.ExcludedReorganized = ex.Reorganized
 	plan.ExcludedPending = ex.Pending
+	plan.ExcludedAfterSnapshot = ex.AfterSnapshot
 	plan.ExcludedLocalGrant = append([]string(nil), ex.LocalGrant...)
 }
 
@@ -1076,12 +1359,41 @@ func quarantineCount(stateDir string) int {
 // anything is written or uploaded: a missing or tampered history file fails
 // the whole run closed, because silently recovering a partial history
 // would misrepresent coverage.
-func buildNewJob(stateDir string, st statedir.DeviceState, serverURL string, out outbox.Outbox, now func() time.Time, plan Plan) (job, Plan, error) {
+//
+// restrict optionally limits the plan to the synced batches a caller
+// captured earlier (connect's automatic pass): synced batches missing from
+// the snapshot are excluded and counted in ExcludedAfterSnapshot instead
+// of being silently dropped from the report. The restriction is frozen
+// into the job AS CAPTURED — before grant filtering — so a later re-plan
+// (replanJob passes the job's universe back in here) keeps the boundary
+// and can recover entries the grants excluded at plan time once the
+// authorization widens. nil plans the complete synced history (the
+// explicit pass, and every re-plan of an unrestricted job).
+func buildNewJob(stateDir string, st statedir.DeviceState, serverURL string, out outbox.Outbox, now func() time.Time, plan Plan, restrict *SyncedBatchSnapshot) (job, Plan, error) {
+	// universe is the restriction as captured, cloned defensively: the
+	// job owns it from here on, verbatim across resume and re-plan.
+	universe := cloneSnapshot(restrict)
+	var only map[string]bool
+	if universe != nil {
+		only = make(map[string]bool, len(universe.BatchIDs))
+		for _, id := range universe.BatchIDs {
+			only[id] = true
+		}
+	}
 	candidates := make([]outbox.BatchEntry, 0)
 	ex := jobExclusions{}
 	for _, entry := range out.Batches {
 		switch entry.Status {
 		case outbox.StatusSynced:
+			if only != nil && !only[entry.BatchID] {
+				// Synced after the snapshot was captured — most commonly
+				// by this very run's collection. The automatic pass
+				// excludes it (an immediate replay would only duplicate
+				// what the drain just uploaded) and reports the
+				// exclusion instead of hiding it.
+				ex.AfterSnapshot++
+				continue
+			}
 			candidates = append(candidates, entry)
 		case outbox.StatusReorganized:
 			ex.Reorganized++
@@ -1089,17 +1401,21 @@ func buildNewJob(stateDir string, st statedir.DeviceState, serverURL string, out
 			ex.Pending++
 		}
 	}
+	plan.SnapshotRestricted = universe != nil
+	plan.CoverageNote = coverageNoteFor(universe != nil)
 	if len(candidates) == 0 {
-		// Nothing synced: return a completed empty job so the next explicit
-		// pass is again a fresh full pass. Planning is pure: the empty job
-		// is persisted only by a confirmed execution run (finalizeOnly),
-		// so a dry run writes nothing.
+		// Nothing synced the plan may cover — an empty outbox, or an
+		// empty-restricted pass (a first install whose batches this
+		// run's collection will sync): return a completed empty job so
+		// the next explicit pass is again a fresh full pass. Planning is
+		// pure: the empty job is persisted only by a confirmed
+		// execution run (finalizeOnly), so a dry run writes nothing.
 		id, err := newJobID()
 		if err != nil {
 			return job{}, plan, err
 		}
 		at := now().UTC()
-		jb := job{Schema: journalSchema, JobID: id, DeviceID: st.DeviceID, ServerURL: serverURL, CreatedAt: at, CompletedAt: &at, Exclusions: ex}
+		jb := job{Schema: journalSchema, JobID: id, DeviceID: st.DeviceID, ServerURL: serverURL, CreatedAt: at, CompletedAt: &at, Exclusions: ex, Snapshot: universe}
 		plan.JobID = id
 		plan.TotalInJob = 0
 		plan.DoneInJob = 0
@@ -1154,7 +1470,7 @@ func buildNewJob(stateDir string, st statedir.DeviceState, serverURL string, out
 	if err != nil {
 		return job{}, plan, err
 	}
-	jb := job{Schema: journalSchema, JobID: id, DeviceID: st.DeviceID, ServerURL: serverURL, CreatedAt: now().UTC(), Exclusions: ex}
+	jb := job{Schema: journalSchema, JobID: id, DeviceID: st.DeviceID, ServerURL: serverURL, CreatedAt: now().UTC(), Exclusions: ex, Snapshot: universe}
 	for _, pb := range planned {
 		jb.Batches = append(jb.Batches, jobBatch{
 			BatchID:       pb.BatchID,

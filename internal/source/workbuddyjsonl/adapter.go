@@ -2,6 +2,7 @@ package workbuddyjsonl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,20 +19,35 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.WorkBuddyJSONLSource,
 		Description: "WorkBuddy request usage JSONL",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
 
-// filterKnownRecords checks immutable outbox and quarantine records, so
-// repeated full scans cannot enqueue the same request again.
-func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full scans cannot enqueue the same request again. The context
+// is consulted at coarse boundaries (entry, per outbox batch, per stored
+// record, before the quarantine load, per quarantine entry, per fresh
+// record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -59,6 +75,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.WorkBuddyJSONLSource {
 			continue
 		}
@@ -82,16 +101,25 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 			return nil, fmt.Errorf("WorkBuddy history batch identity mismatch")
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == adapter.WorkBuddyJSONLSource {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -100,6 +128,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

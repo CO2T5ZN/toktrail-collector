@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"toktrail-collector/internal/app/cursorsync"
@@ -96,6 +98,35 @@ func cursorStateDir(args []string) (string, *string, error) {
 	return dir, serverURL, nil
 }
 
+// displaySourceState maps a server-reported source state onto a fixed
+// display vocabulary: the known collecting/paused states pass through,
+// and anything else — including attacker-chosen text a malicious or
+// buggy server may place in the field — displays as "unknown". This is
+// display-layer only: the state machine, the permit and the exit codes
+// are untouched. (internal/connect/connect.go carries the same twin for
+// its enable line.)
+func displaySourceState(state string) string {
+	switch strings.TrimSpace(state) {
+	case "active", "pending", "paused":
+		return strings.TrimSpace(state)
+	case "":
+		return "unspecified"
+	default:
+		return "unknown"
+	}
+}
+
+// sourceConfiguredLabel reports the permit's source linkage for display
+// WITHOUT echoing the identifier: an old or polluted permit may carry
+// arbitrary text — the device secret included — in the field, so it is
+// never printed verbatim.
+func sourceConfiguredLabel(sourceInstanceID string) string {
+	if strings.TrimSpace(sourceInstanceID) == "" {
+		return "not configured"
+	}
+	return "configured"
+}
+
 func runCursorEnable(args []string) error {
 	dir, serverURL, manual, err := parseCursorEnableArgs(args)
 	if err != nil {
@@ -124,10 +155,11 @@ func runCursorEnable(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("cursor source enabled: sourceInstanceId=%s state=%s fenceVersion=%d nextRevision=%d\n",
-		res.Source.SourceInstanceID, res.Source.State, res.Source.FenceVersion, res.Source.NextRevision)
+	fmt.Printf("cursor source enabled: source %s state=%s fenceVersion=%d nextRevision=%d\n",
+		sourceConfiguredLabel(res.Source.SourceInstanceID), displaySourceState(res.Source.State),
+		res.Source.FenceVersion, res.Source.NextRevision)
 	if res.Sync.Ran {
-		printCursorSyncResult(res.Sync)
+		printCursorSyncResult(os.Stdout, res.Sync)
 	} else if res.Sync.Skipped != "" {
 		fmt.Printf("first sync: %s\n", res.Sync.Skipped)
 	}
@@ -156,7 +188,8 @@ func runCursorStatus(args []string) error {
 		fmt.Printf("cursor: no local permit (enable with toktrail connect or toktrail cursor enable)\n")
 	} else {
 		fmt.Printf("permit: status=%s confirmedAt=%s\n", res.License.Status, res.License.ConfirmedAt.Format(time.RFC3339))
-		fmt.Printf("source: sourceInstanceId=%s fenceVersion=%d nextRevision=%d\n", res.License.SourceInstanceID, res.License.FenceVersion, res.License.NextRevision)
+		fmt.Printf("source: %s (fenceVersion=%d nextRevision=%d)\n",
+			sourceConfiguredLabel(res.License.SourceInstanceID), res.License.FenceVersion, res.License.NextRevision)
 		if res.License.PullWatermark != nil {
 			fmt.Printf("pullWatermark=%s\n", res.License.PullWatermark.Format(time.RFC3339))
 		}
@@ -166,7 +199,8 @@ func runCursorStatus(args []string) error {
 	}
 	if res.ServerReached {
 		if res.HasSource {
-			fmt.Printf("server source: state=%s fenceVersion=%d nextRevision=%d\n", res.Source.State, res.Source.FenceVersion, res.Source.NextRevision)
+			fmt.Printf("server source: state=%s fenceVersion=%d nextRevision=%d\n",
+				displaySourceState(res.Source.State), res.Source.FenceVersion, res.Source.NextRevision)
 		} else {
 			fmt.Printf("server source: this device is not the executor of any cursor source\n")
 		}
@@ -229,20 +263,23 @@ func runCursorSync(args []string) error {
 		fmt.Printf("cursor: %s\n", res.Skipped)
 		return nil
 	}
-	printCursorSyncResult(res)
+	printCursorSyncResult(os.Stdout, res)
 	return nil
 }
 
-func printCursorSyncResult(res cursorsync.Result) {
-	fmt.Printf("cursor sync: pulledEvents=%d new=%d replaced=%d unchanged=%d noStableId=%d\n",
+// printCursorSyncResult renders the account-source round on the given
+// writer (os.Stdout for the cursor CLI, the periodic command's human
+// stream under its writer plumbing).
+func printCursorSyncResult(w io.Writer, res cursorsync.Result) {
+	fmt.Fprintf(w, "cursor sync: pulledEvents=%d new=%d replaced=%d unchanged=%d noStableId=%d\n",
 		res.PulledEvents, res.NewRecords, res.ReplacedRecords, res.SkippedUnchanged, res.SkippedNoStableID)
-	fmt.Printf("cursor sync: exportedBatches=%d syncedBatches=%d syncedRecords=%d pendingRemaining=%d\n",
+	fmt.Fprintf(w, "cursor sync: exportedBatches=%d syncedBatches=%d syncedRecords=%d pendingRemaining=%d\n",
 		res.ExportedBatches, res.SyncedBatches, res.SyncedRecords, res.PendingRemaining)
 	if res.FirstSyncCompleted {
-		fmt.Printf("cursor sync: first usage pull persisted; local permit active (upload confirmation is shown in syncedRecords/pendingRemaining)\n")
+		fmt.Fprintf(w, "cursor sync: first usage pull persisted; local permit active (upload confirmation is shown in syncedRecords/pendingRemaining)\n")
 	}
 	if res.Note != "" {
-		fmt.Printf("cursor sync: note=%s\n", res.Note)
+		fmt.Fprintf(w, "cursor sync: note=%s\n", res.Note)
 	}
 }
 

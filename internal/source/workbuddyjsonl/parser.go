@@ -2,6 +2,7 @@ package workbuddyjsonl
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +20,23 @@ import (
 
 // LoadRecords reads only JSONL files under the explicitly granted path.
 // It never opens WorkBuddy databases, traces, configuration or credentials.
+// It keeps the historical uncancellable signature for direct callers; the
+// adapter's Load passes its cancellation scope through loadRecordsContext.
 func LoadRecords(root string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), root)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// during file discovery, once per file, and once per line. On cancellation it
+// returns ctx.Err() (matchable with errors.Is(err, context.Canceled) or
+// errors.Is(err, context.DeadlineExceeded)) and no partial result — records,
+// issues, and quarantine counts accumulated so far are discarded, so a scan
+// cut short never exports half of a WorkBuddy session. The per-line check
+// mirrors jsonl.WalkLinesContext's coarse boundary; the custom reader is kept
+// because WorkBuddy tails need the torn-final-line semantics it implements.
+func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
-	files, err := jsonl.Files(root, jsonl.Options{SkipHiddenFiles: true})
+	files, err := jsonl.FilesContext(ctx, root, jsonl.Options{SkipHiddenFiles: true})
 	if err != nil {
 		return result, err
 	}
@@ -36,6 +51,9 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 		}
 	}
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
 		if !strings.EqualFold(filepath.Ext(file), ".jsonl") {
 			issue(file, 0, "non-JSONL input skipped")
 			continue
@@ -55,6 +73,10 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 		reader := bufio.NewReader(f)
 		lineNo := 0
 		for {
+			if err := ctx.Err(); err != nil {
+				f.Close()
+				return adapter.LoadResult{}, err
+			}
 			line, tooLong, terminated, readErr := readCompleteLine(reader)
 			if errors.Is(readErr, io.EOF) && line == "" && !tooLong {
 				break

@@ -65,7 +65,33 @@ func recoverPendingFilterTxn(stateDir string) error {
 // PrepareExport recovers a pending transaction BEFORE the adapter loads records, so
 // this function's own recovery is a no-op there; it is kept so direct callers of
 // FilterHistoryCutoff converge too.
+//
+// Cancellation: the interruptible, pure-computation parts (record/update
+// partitioning, quarantine entry building) consult opt.Context at coarse
+// boundaries and return its error (matchable with errors.Is(err,
+// context.Canceled) or errors.Is(err, context.DeadlineExceeded)) with nil
+// records and updates, never a prefix of the partition. A nil
+// opt.Context behaves as context.Background() and keeps the exact
+// pre-cancellation behavior.
+//
+// Two deliberately non-interruptible phases remain:
+//
+//  1. recoverPendingFilterTxn and filtertxn.Commit take no context (their
+//     journaled create→apply→remove cycle is the crash-recovery mechanism
+//     and must run to completion once started; interrupting mid-apply would
+//     leave the same half-applied state a crash does). Instead the context
+//     is checked immediately before filtertxn.Commit, so a cancelled run
+//     never STARTS a new journaled transaction, and at entry, so a
+//     cancelled run skips recovery entirely (it converges on the next
+//     non-cancelled call).
+//  2. The single-file state loads (managed consent overlay, device state,
+//     outbox/quarantine ledgers) have no context-taking API; the scope is
+//     checked between them, but a load already in progress completes.
 func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates []progress.MessagePendingUpdate) ([]adapter.Record, []progress.MessagePendingUpdate, error) {
+	ctx := opt.ContextOrBackground()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if err := recoverPendingFilterTxn(opt.StateDir); err != nil {
 		return nil, nil, err
 	}
@@ -100,11 +126,21 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 		return records, updates, nil
 	}
 
+	// The consent/state loads above are single uncancellable file reads;
+	// observe a cancellation that arrived during them before any
+	// partitioning work starts.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	kept := make([]adapter.Record, 0, len(records))
 	skipped := make([]adapter.Record, 0)
 	skippedKeys := make(map[string]bool)
 
 	for _, rec := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		tsStr := adapter.StringField(rec, "occurredAt")
 		ts, err := time.Parse(time.RFC3339Nano, tsStr)
 		if err != nil {
@@ -128,6 +164,9 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 	keptUpdates := make([]progress.MessagePendingUpdate, 0, len(updates))
 	skippedUpdates := make([]progress.MessagePendingUpdate, 0)
 	for _, u := range updates {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if skippedKeys[u.RecordKey] {
 			skippedUpdates = append(skippedUpdates, u)
 		} else {
@@ -162,9 +201,18 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 	// the Claude baseline for their message intervals in one journaled
 	// transaction, so a crash between the two writes is replayed to
 	// completion instead of losing the recoverable quarantine entries.
+	// The revision loads above are single uncancellable file reads; a
+	// cancellation that arrived during them is observed before entry
+	// building starts.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	entries := make([]quarantine.Entry, 0, len(skipped))
 	now := time.Now().UTC()
 	for _, r := range skipped {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		key := adapter.StringField(r, "recordKey")
 		if key == "" {
 			continue
@@ -194,6 +242,15 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 		Quarantine: entries,
 		Baselines:  skippedUpdates,
 		CreatedAt:  now,
+	}
+	// Last cancellation checkpoint: once filtertxn.Commit starts, the
+	// journaled create→apply→remove transaction must run to completion
+	// (crash-recovery invariant), so a cancelled run stops HERE — it never
+	// starts a transaction it would have to abandon. The next non-cancelled
+	// run recomputes the whole partition from the same records and cutoff,
+	// so nothing is lost by not committing.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	if err := filtertxn.Commit(stateDir, journal); err != nil {
 		return nil, nil, fmt.Errorf("commit history-filter transaction: %w", err)

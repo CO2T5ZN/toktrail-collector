@@ -82,6 +82,31 @@ func pendingCount(t *testing.T, dir string) int {
 // Offline: pending batches retry with their immutable revisions
 // ---------------------------------------------------------------------------
 
+func TestDrainPendingUploadsCursorOutboxWithoutCredentialOrPull(t *testing.T) {
+	h := newHarness(t)
+	h.srv.setSource(defaultSource())
+	h.writeLicense(t, activeLicenseForA())
+	seedPendingBatch(t, h.dir, "cursor-drain-only-1", 1)
+	seedPendingBatch(t, h.dir, "cursor-drain-only-2", 1)
+
+	res, err := cursorsync.DrainPending(context.Background(), h.options(), syncGate())
+	if err != nil {
+		t.Fatalf("drain pending: %v", err)
+	}
+	if !res.Ran || res.SyncedBatches != 2 || res.PendingRemaining != 0 {
+		t.Fatalf("drain pending result: %+v", res)
+	}
+	if res.PulledEvents != 0 || res.NewRecords != 0 || res.ExportedBatches != 0 {
+		t.Fatalf("drain-only must not pull or export new cursor records: %+v", res)
+	}
+	if h.auth.fetchCount() != 0 {
+		t.Fatal("drain-only must not read desktop credentials")
+	}
+	if len(h.pull.callLog()) != 0 {
+		t.Fatalf("drain-only must not pull upstream usage: %+v", h.pull.callLog())
+	}
+}
+
 // TestSyncOfflinePendingRetried verifies an upload failure keeps the
 // batch durably pending (watermark and cache already advanced), and the
 // next round drains it first with the exact same revisions.
@@ -143,6 +168,34 @@ func TestSyncOfflinePendingRetried(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Source fence takeover: old pending fenced, cache and watermark reset
 // ---------------------------------------------------------------------------
+
+func TestDrainPendingFenceChangePreservesRecovery(t *testing.T) {
+	h := newHarness(t)
+	h.srv.setSource(defaultSource())
+	h.writeLicense(t, activeLicenseForA())
+	h.pull.setEvents(ev("evt-0001", baseTime.Add(-30*time.Minute), 100, 0, 0, 50))
+	h.srv.setIngestFails(true)
+	if _, err := cursorsync.Sync(context.Background(), h.options(), syncGate()); err == nil {
+		t.Fatal("expected initial upload failure")
+	}
+	h.srv.setIngestFails(false)
+	h.srv.setSource(protocol.Source{SourceInstanceID: "src_inst_1", SourceType: protocol.SourceType, State: "active", FenceVersion: 2, NextRevision: 10})
+	before := len(h.pull.callLog())
+	res, err := cursorsync.DrainPending(context.Background(), h.options(), syncGate())
+	if err != nil || !strings.Contains(res.Skipped, "full sync") || res.PendingRemaining != 1 {
+		t.Fatalf("fence change must stop without consuming pending data: %+v, %v", res, err)
+	}
+	if lic := loadLicense(t, h.dir); lic.FenceVersion != 1 || lic.PullWatermark == nil {
+		t.Fatalf("drain must retain old fence and watermark for recovery: %+v", lic)
+	}
+	if len(h.pull.callLog()) != before {
+		t.Fatal("drain-only must not pull")
+	}
+	full, err := cursorsync.Sync(context.Background(), h.options(), syncGate())
+	if err != nil || full.NewRecords != 1 || full.SyncedRecords != 1 {
+		t.Fatalf("full sync must re-produce fenced history: %+v, %v", full, err)
+	}
+}
 
 // TestSyncFenceMovedRecovery covers the takeover fence: after the server
 // moves the source fence, an unacknowledged pending batch is fenced out

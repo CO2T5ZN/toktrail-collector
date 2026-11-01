@@ -1154,14 +1154,17 @@ func TestGrantSyncOfflineNeverSeenKeepsLegacyReading(t *testing.T) {
 	enableGrant(t, stateDir, "claude-code-jsonl", claude)
 
 	// The server becomes unreachable before the first successful fetch.
-	url := server.URL
 	server.Close()
 
 	res, err := Run(t.Context(), Options{StateDir: stateDir, HomeDir: t.TempDir()})
 	if err == nil {
 		t.Fatal("the drain must surface the network failure")
 	}
-	if !strings.Contains(err.Error(), url) && !strings.Contains(err.Error(), "sync") && !strings.Contains(err.Error(), "connection") {
+	// The drain's network failure surfaces as the syncclient's sanitized
+	// transport wording: the raw network error text (endpoint, runtime
+	// detail) is withheld by design, so the fixed "transport failure"
+	// phrase is the observable classification.
+	if !strings.Contains(err.Error(), "transport failure") {
 		t.Fatalf("expected the drain's network failure, got %v", err)
 	}
 	// Reading DID happen under the legacy local grants before the drain

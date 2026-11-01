@@ -58,10 +58,7 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 	if serverURL == "" {
 		return Result{}, errors.New("server URL is required")
 	}
-	client := opt.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
+	client := noRedirectClient(opt.HTTPClient)
 	if strings.TrimSpace(opt.StateDir) != "" {
 		if _, err := outbox.New(opt.StateDir).RecordPreflightAttempt(time.Now().UTC()); err != nil {
 			return Result{}, err
@@ -108,7 +105,9 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 	req.Header.Set("X-Consent-Revision", strconv.FormatInt(self.ConsentRevision, 10))
 	resp, err := client.Do(req)
 	if err != nil {
-		return Result{}, err
+		// Raw transport text never reaches a human message; the cause
+		// stays matchable through Unwrap.
+		return Result{}, wrapTransportError("tool status report", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
@@ -116,14 +115,14 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 			return Result{State: st, Self: self, Status: resp.StatusCode}, nil
 		}
 		var body ingestResponse
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(capResponseBody(resp.Body)).Decode(&body); err != nil {
 			return Result{}, fmt.Errorf("tool status response HTTP %d", resp.StatusCode)
 		}
-		code, message := "", ""
+		code := ""
 		if body.Error != nil {
-			code, message = body.Error.Code, body.Error.Message
+			code = body.Error.Code
 		}
-		return Result{}, classifyIngestError(resp.StatusCode, code, message)
+		return Result{}, classifyIngestError(resp.StatusCode, code)
 	}
 	return Result{State: st, Self: self, Status: resp.StatusCode}, nil
 }

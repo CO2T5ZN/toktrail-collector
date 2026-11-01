@@ -1,16 +1,34 @@
 package usagejson
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"toktrail-collector/internal/source/adapter"
 	"unicode/utf8"
+
+	"toktrail-collector/internal/source/adapter"
 )
 
+// LoadRecords reads one normalized usage JSON file. It keeps the historical
+// uncancellable signature for direct callers; the adapter's Load passes its
+// cancellation scope through loadRecordsContext.
 func LoadRecords(path string) ([]adapter.Record, error) {
+	return loadRecordsContext(context.Background(), path)
+}
+
+// loadRecordsContext reads with cancellation support: the context is checked
+// before the input file is opened and once per extracted record. On
+// cancellation it returns ctx.Err() (matchable with errors.Is(err,
+// context.Canceled) or errors.Is(err, context.DeadlineExceeded)) and no
+// partial result — records extracted so far are discarded, so a scan cut
+// short never yields half of a fixture.
+func loadRecordsContext(ctx context.Context, path string) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(strings.TrimSpace(path))
 	if err != nil {
 		return nil, err
@@ -22,7 +40,7 @@ func LoadRecords(path string) ([]adapter.Record, error) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, err
 	}
-	records, err := extractRecords(raw)
+	records, err := extractRecords(ctx, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -33,13 +51,13 @@ func LoadRecords(path string) ([]adapter.Record, error) {
 	// never rewritten by this projection.
 	return adapter.SanitizeUsageJSONRecords(records), nil
 }
-func extractRecords(raw any) ([]adapter.Record, error) {
+func extractRecords(ctx context.Context, raw any) ([]adapter.Record, error) {
 	switch v := raw.(type) {
 	case []any:
-		return extractRecordArray(v)
+		return extractRecordArray(ctx, v)
 	case map[string]any:
 		if arr, ok := v["records"].([]any); ok {
-			return extractRecordArray(arr)
+			return extractRecordArray(ctx, arr)
 		}
 		if rec, ok := v["record"].(map[string]any); ok {
 			return []adapter.Record{adapter.Record(rec)}, nil
@@ -50,9 +68,12 @@ func extractRecords(raw any) ([]adapter.Record, error) {
 	}
 }
 
-func extractRecordArray(arr []any) ([]adapter.Record, error) {
+func extractRecordArray(ctx context.Context, arr []any) ([]adapter.Record, error) {
 	records := make([]adapter.Record, 0, len(arr))
 	for idx, item := range arr {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		obj, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("item %d is not an object", idx)
@@ -68,7 +89,7 @@ func extractRecordArray(arr []any) ([]adapter.Record, error) {
 
 func Adapter() adapter.Adapter {
 	return adapter.Adapter{Source: adapter.UsageJSONSource, Description: "Normalized usage JSON", Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-		records, err := LoadRecords(opt.Input)
+		records, err := loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		return adapter.LoadResult{Records: records}, err
 	}}
 }

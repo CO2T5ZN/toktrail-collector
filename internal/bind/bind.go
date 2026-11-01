@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -45,6 +46,15 @@ type bindRequest struct {
 	DeviceSecret      string `json:"deviceSecret"`
 }
 
+// responseError mirrors the server's error block. Both fields are untrusted
+// free text: a hostile server can reflect the request's ticket or
+// deviceSecret straight into them, so neither value may ever reach an error
+// message (see responseCategory).
+type responseError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 type bindResponse struct {
 	Device struct {
 		DeviceID          string    `json:"deviceId"`
@@ -56,10 +66,171 @@ type bindResponse struct {
 		BoundAt           time.Time `json:"boundAt"`
 		Replay            bool      `json:"replay"`
 	} `json:"device"`
-	Error *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	Error *responseError `json:"error,omitempty"`
+}
+
+// maxResponseBodyBytes bounds how much of a bind response Run reads.
+//
+// A legitimate bind receipt is the small JSON device block decoded into
+// bindResponse (a few hundred bytes); even a generously extended receipt
+// with extra unknown fields stays far below 64 KiB, so a 1 MiB ceiling
+// leaves >16x headroom for large legitimate receipts while stopping an
+// untrusted server from making the collector buffer an unbounded body. A
+// response whose first JSON value exceeds the ceiling fails with a fixed
+// sanitized error. Trailing data after the first JSON value is never read,
+// matching the previous streaming-decoder behavior.
+const maxResponseBodyBytes = 1 << 20
+
+// Error is the sanitized failure type Run returns for bind failures that
+// involve the server round trip.
+//
+// Its message is assembled only from fixed literal strings, the numeric HTTP
+// status, and category labels from the fixed tables in this file, so it can
+// never echo server-controlled response values or the bind credentials
+// (ticket, deviceSecret). A wrapped cause stays reachable through
+// errors.Is/errors.As for programmatic handling.
+type Error struct {
+	msg      string
+	category string
+	status   int
+	cause    error
+}
+
+func (e *Error) Error() string { return e.msg }
+
+// Unwrap keeps errors.Is/errors.As semantics for the wrapped cause.
+func (e *Error) Unwrap() error { return e.cause }
+
+// Category returns the fixed failure category. It is either a literal from
+// serverErrorCodeCategories / serverStatusCategories or CategoryOther — never
+// a server-reported code.
+func (e *Error) Category() string { return e.category }
+
+// Status returns the HTTP status code of the bind response, or 0 when the
+// request never completed, so callers can map exit codes without string
+// matching.
+func (e *Error) Status() int { return e.status }
+
+// Fixed Error categories surfaced by Category.
+const (
+	CategoryTransport       = "transport"
+	CategoryInvalidResponse = "invalid_response"
+	CategoryOther           = "other"
+)
+
+// serverStatusCategories maps HTTP status codes to fixed category labels.
+// The numeric status carries no server free text, so surfacing it (plus a
+// label from this fixed table) cannot leak response values. The 3xx entries
+// back the redirect refusal: redirects are never followed, so a 3xx answer
+// is reported as an ordinary refused status.
+var serverStatusCategories = map[int]string{
+	http.StatusBadRequest:          "bad_request",
+	http.StatusUnauthorized:        "unauthorized",
+	http.StatusForbidden:           "forbidden",
+	http.StatusNotFound:            "not_found",
+	http.StatusConflict:            "conflict",
+	http.StatusUnprocessableEntity: "invalid_request",
+	http.StatusTooManyRequests:     "rate_limited",
+	http.StatusInternalServerError: "server_error",
+	http.StatusBadGateway:          "server_error",
+	http.StatusServiceUnavailable:  "server_error",
+	http.StatusGatewayTimeout:      "server_error",
+	http.StatusMovedPermanently:    "redirect",
+	http.StatusFound:               "redirect",
+	http.StatusSeeOther:            "redirect",
+	http.StatusTemporaryRedirect:   "redirect",
+	http.StatusPermanentRedirect:   "redirect",
+}
+
+// serverErrorCodeCategories is the fixed whitelist of server error codes Run
+// reports by name. A received code is used only for an exact table lookup;
+// the surfaced label is always the literal stored here, never the received
+// string. Codes outside the whitelist — including anything a hostile server
+// reflects back, such as the ticket or deviceSecret — never surface: the
+// category then falls back to the HTTP-status table, then CategoryOther.
+// Extend this table only with fixed literals vetted against the server
+// contract.
+var serverErrorCodeCategories = map[string]string{
+	"unauthorized": "unauthorized",
+}
+
+// responseCategory resolves the fixed category for a refused bind. The
+// server-reported code only selects a whitelisted label; unknown codes
+// contribute nothing and the category falls back to the HTTP-status table,
+// then CategoryOther.
+func responseCategory(status int, srvErr *responseError) string {
+	if srvErr != nil {
+		if category, ok := serverErrorCodeCategories[srvErr.Code]; ok {
+			return category
+		}
+	}
+	if category, ok := serverStatusCategories[status]; ok {
+		return category
+	}
+	return CategoryOther
+}
+
+// transportErrorMessage is the fixed message surfaced for every bind
+// transport failure. Transport error text is not enumerable: besides this
+// run's ticket and deviceSecret, a custom transport, proxy, or TLS layer can
+// embed other principals' credentials, proxy URLs, or reflected request data
+// that bind cannot predict. The underlying text is therefore never surfaced —
+// not even when it looks clean.
+const transportErrorMessage = "bind request failed: transport error (details withheld because transport error text may contain credentials)"
+
+// newTransportError wraps a failed bind request with the fully fixed
+// transportErrorMessage. The cause stays wrapped so errors.Is/errors.As
+// still work.
+func newTransportError(cause error) *Error {
+	return &Error{msg: transportErrorMessage, category: CategoryTransport, cause: cause}
+}
+
+// reflectedCredentialMessage is the fixed error surfaced when a bind receipt
+// echoes this run's credentials back. The affected field is never named.
+const reflectedCredentialMessage = "bind failed: response contained reflected credential material"
+
+// reflectedCredential reports whether any server-controlled string that bind
+// would persist contains one of this run's credentials. The receipt's
+// deviceId, deviceName and platform are printed and stored in state, and a
+// hostile server that saw the bind payload can reflect the ticket or
+// deviceSecret into them (applicationId/externalSubjectId are additionally
+// constrained by the identity check above). Hex credentials are
+// case-insensitive, so the comparison ignores case.
+func reflectedCredential(values []string, credentials ...string) bool {
+	for _, credential := range credentials {
+		if credential == "" {
+			continue
+		}
+		needle := strings.ToLower(credential)
+		for _, value := range values {
+			if strings.Contains(strings.ToLower(value), needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// noRedirectClient returns a shallow copy of client that never follows
+// redirects, leaving the caller's client untouched. The bind request body
+// carries the ticket and deviceSecret, so a 3xx answer must never be
+// followed: Go would forward the credentials to the server-chosen redirect
+// target (307/308 resend the body verbatim). The copy preserves the
+// original transport, timeout and jar. CheckRedirect returns
+// http.ErrUseLastResponse, so Do returns the 3xx response itself with a nil
+// error and never issues a second request; the redirect target URL is never
+// parsed or echoed (returning a plain error instead would make net/http put
+// the raw, server-controlled Location into the resulting *url.Error). The
+// 3xx response is then reported by Run as an ordinary refused status.
+func noRedirectClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = &http.Client{}
+	}
+	cloned := *client
+	cloned.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &cloned
 }
 
 func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error) {
@@ -113,28 +284,69 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	if err := store.Save(st); err != nil {
 		return Result{}, err
 	}
-	client := opt.HTTPClient
+	client := noRedirectClient(opt.HTTPClient)
 	resp, err := client.Do(req)
 	if err != nil {
-		return Result{}, err
+		return Result{}, newTransportError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		// Redirects are refused before this point (noRedirectClient), so a
+		// 3xx answer means the server tried to move the credential-bearing
+		// request elsewhere. Report it as a refused status without reading
+		// the body.
+		category := responseCategory(resp.StatusCode, nil)
+		return Result{}, &Error{
+			msg:      fmt.Sprintf("bind failed: status %d: %s", resp.StatusCode, category),
+			category: category,
+			status:   resp.StatusCode,
+		}
+	}
 	var body bindResponse
-	dec := json.NewDecoder(resp.Body)
+	// Bound the untrusted body, and never surface decode errors verbatim:
+	// json error text can quote body content, and a hostile server can echo
+	// the ticket or deviceSecret back inside the body.
+	dec := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err := dec.Decode(&body); err != nil {
-		return Result{}, err
+		return Result{}, &Error{
+			msg:      "bind failed: invalid or oversized response body",
+			category: CategoryInvalidResponse,
+			status:   resp.StatusCode,
+			cause:    err,
+		}
 	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		if body.Error != nil {
-			return Result{}, fmt.Errorf("bind failed: %s: %s", body.Error.Code, body.Error.Message)
+		// Only fixed whitelist labels and the numeric status are reported;
+		// the server's error code and message strings never reach the user.
+		category := responseCategory(resp.StatusCode, body.Error)
+		return Result{}, &Error{
+			msg:      fmt.Sprintf("bind failed: status %d: %s", resp.StatusCode, category),
+			category: category,
+			status:   resp.StatusCode,
 		}
-		return Result{}, fmt.Errorf("bind failed: status %d", resp.StatusCode)
 	}
 	if body.Device.DeviceID == "" {
 		return Result{}, errors.New("bind response missing deviceId")
 	}
 	if body.Device.ApplicationID != opt.ApplicationID || body.Device.ExternalSubjectID != opt.ExternalSubjectID {
 		return Result{}, errors.New("bind response identity does not match request")
+	}
+	// Trust boundary: every string taken from the receipt below is printed
+	// and persisted, and the server has just seen this request's ticket and
+	// deviceSecret. Fail closed on any reflection before the pending replay
+	// identity is ACKed or the bound state is saved.
+	if reflectedCredential([]string{
+		body.Device.DeviceID,
+		body.Device.ApplicationID,
+		body.Device.ExternalSubjectID,
+		body.Device.DeviceName,
+		body.Device.Platform,
+	}, opt.Ticket, st.DeviceSecret) {
+		return Result{}, &Error{
+			msg:      reflectedCredentialMessage,
+			category: CategoryInvalidResponse,
+			status:   resp.StatusCode,
+		}
 	}
 	st.PendingBindFingerprint = ""
 	st.LastBindFingerprint = fingerprint

@@ -101,12 +101,12 @@ func TestOverrideMultiInputPendingAccounting(t *testing.T) {
 		Entries: map[string]overrides.Entry{
 			"deepseek-harness:pending-b": {
 				RecordKey: "deepseek-harness:pending-b", Source: "deepseek-harness", Input: inputB,
-				PendingRecord: record("deepseek-harness:pending-b", "2026-10-20T01:05:00Z"),
+				PendingRecord:    record("deepseek-harness:pending-b", "2026-10-20T01:05:00Z"),
 				PendingAttemptID: "oa-b", Status: overrides.StatusPending, PendingSince: &at, UpdatedAt: at,
 			},
 			"deepseek-harness:pending-gone": {
 				RecordKey: "deepseek-harness:pending-gone", Source: "deepseek-harness", Input: filepath.Join(dir, "dsh", "gone"),
-				PendingRecord: record("deepseek-harness:pending-gone", "2026-10-20T01:06:00Z"),
+				PendingRecord:    record("deepseek-harness:pending-gone", "2026-10-20T01:06:00Z"),
 				PendingAttemptID: "oa-g", Status: overrides.StatusPending, PendingSince: &at, UpdatedAt: at,
 			},
 		},

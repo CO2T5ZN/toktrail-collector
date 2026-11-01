@@ -33,9 +33,15 @@ type fakeRemote struct {
 	paused, revoked, reject, wrongReceipt bool
 	failBatch                             string
 	scopeRejectBatch                      string
-	allowed                               []string
-	from                                  *time.Time
-	revision                              int64
+	// dropResponseBatch models a server that COMMITS an ingest (receipt
+	// recorded, record keys counted) but loses the response on the wire:
+	// the declared body is longer than the truncated bytes actually
+	// written, so the client cannot decode the reply while the commit
+	// stands. A retry of the same batch id then replays idempotently.
+	dropResponseBatch string
+	allowed           []string
+	from              *time.Time
+	revision          int64
 	// Mid-run authorization drift: once more than widenAfterSelf self
 	// GETs have been served, the served scope switches to
 	// widenRevision/widenFrom (modeling a consent change between this
@@ -101,6 +107,28 @@ func newRemote(t *testing.T) (*fakeRemote, *httptest.Server) {
 			fmt.Fprint(w, `{"error":{"code":"scope_changed","message":"synthetic scope change"}}`)
 			return
 		}
+		if batch.BatchID == s.dropResponseBatch {
+			// Commit exactly as a normal accept would...
+			if _, ok := s.receipts[batch.BatchID]; !ok {
+				dropped := syncclient.BatchReceipt{BatchID: batch.BatchID, Status: "accepted", AcceptedRecords: len(batch.Records), ReceivedAt: time.Now().UTC()}
+				for _, raw := range batch.Records {
+					var rec map[string]any
+					json.Unmarshal(raw, &rec)
+					if key, ok := rec["recordKey"].(string); ok {
+						s.seen[key] = true
+					}
+				}
+				s.receipts[batch.BatchID] = dropped
+			}
+			// ...then lose the response: the declared Content-Length
+			// exceeds the truncated bytes written, so the client's decode
+			// fails after the headers arrived (never retried by the
+			// transport) while the commit stands.
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"batch":{"batchId":%q,"status":"acce`, batch.BatchID)
+			return
+		}
 		receipt, ok := s.receipts[batch.BatchID]
 		if ok {
 			receipt.Replay = true
@@ -113,7 +141,16 @@ func newRemote(t *testing.T) (*fakeRemote, *httptest.Server) {
 				if s.reject {
 					receipt.AcceptedRecords--
 					receipt.RejectedRecords++
-					receipt.Status = "partial"
+					// The status word must agree with the counts: the
+					// syncclient fails contradictory receipts closed.
+					switch {
+					case receipt.RejectedRecords == 0:
+						receipt.Status = "accepted"
+					case receipt.AcceptedRecords == 0:
+						receipt.Status = "rejected"
+					default:
+						receipt.Status = "partial"
+					}
 					receipt.RecordErrors = append(receipt.RecordErrors, syncclient.RecordError{Index: idx, RecordKey: key, Code: "record_conflict", Message: "synthetic conflict"})
 				} else {
 					s.seen[key] = true
@@ -172,6 +209,21 @@ func (f *fakeRemote) postedKeys() [][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([][]string(nil), f.posted...)
+}
+
+// seenHas reports whether the fake ever committed the record key.
+func (f *fakeRemote) seenHas(key string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seen[key]
+}
+
+// receiptFor returns the committed receipt the fake holds for a batch.
+func (f *fakeRemote) receiptFor(batchID string) (syncclient.BatchReceipt, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	receipt, ok := f.receipts[batchID]
+	return receipt, ok
 }
 func record(key, occurred string) json.RawMessage {
 	b, _ := json.Marshal(map[string]any{"recordKey": key, "kind": "delta", "tool": "Codex", "model": "gpt-5.4", "occurredAt": occurred, "input": "100", "output": "50", "cacheRead": "20", "cacheWrite": "5", "adapterVersion": "synthetic", "sourceType": "fixture"})

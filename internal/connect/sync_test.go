@@ -13,7 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -47,16 +47,29 @@ type syncToktrailMock struct {
 	withProtocol   bool
 	allowedTools   []string
 	failIngest     string
-	historyDays    int // server-side consent window; 0 = unrestricted
+	historyDays    int   // server-side consent window; 0 = unrestricted
+	revision       int64 // consent revision the self endpoint serves; 0 = 1
 	ingestBatchIDs []string
 	ingestRecords  int
 	ingestKeys     map[string]bool
 	selfCalls      int
+	// flakeFirstIngest fails the FIRST ingest POST with a retryable 503
+	// (allowlisted transient code) so retry-wiring tests can observe a
+	// 503→200 resend through the full connect orchestration.
+	flakeFirstIngest bool
+	// ingestBodies captures the raw body of every ingest POST in order
+	// (failed and accepted alike), so retry tests can assert total POST
+	// counts and byte-identity.
+	ingestBodies [][]byte
+	// ingestTotal counts every ingest POST, failed and accepted alike.
+	// ingestBatchIDs below keeps its historical meaning: only POSTs the
+	// mock accepted.
+	ingestTotal int
 }
 
 func startSyncToktrailMock(t *testing.T, deviceID string) *syncToktrailMock {
 	t.Helper()
-	m := &syncToktrailMock{bindDeviceID: deviceID, ingestKeys: map[string]bool{}}
+	m := &syncToktrailMock{bindDeviceID: deviceID, ingestKeys: map[string]bool{}, revision: 1}
 	m.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -82,10 +95,14 @@ func startSyncToktrailMock(t *testing.T, deviceID string) *syncToktrailMock {
 			m.selfCalls++
 			paused, withProtocol, allowed := m.paused, m.withProtocol, m.allowedTools
 			id := m.bindDeviceID
+			revision := m.revision
 			m.mu.Unlock()
+			if revision <= 0 {
+				revision = 1
+			}
 			device := map[string]any{
 				"deviceId":         id,
-				"consentRevision":  1,
+				"consentRevision":  revision,
 				"uploadAuthorized": true,
 				"revoked":          false,
 			}
@@ -98,11 +115,17 @@ func startSyncToktrailMock(t *testing.T, deviceID string) *syncToktrailMock {
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"device": device})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/ingest/batches":
+			raw, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Errorf("invalid ingest body: %v", readErr)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			var batch struct {
 				BatchID string           `json:"batchId"`
 				Records []map[string]any `json:"records"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			if err := json.Unmarshal(raw, &batch); err != nil {
 				t.Errorf("invalid ingest body: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
@@ -110,7 +133,15 @@ func startSyncToktrailMock(t *testing.T, deviceID string) *syncToktrailMock {
 			m.mu.Lock()
 			fail := m.failIngest
 			days := m.historyDays
+			flake := m.flakeFirstIngest && len(m.ingestBodies) == 0
+			m.ingestTotal++
+			m.ingestBodies = append(m.ingestBodies, append([]byte(nil), raw...))
 			m.mu.Unlock()
+			if flake {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "service_unavailable", "message": "synthetic transient failure"}})
+				return
+			}
 			if fail != "" && batch.BatchID == fail {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "temporarily_unavailable", "message": "synthetic failure"}})
@@ -171,6 +202,39 @@ func (m *syncToktrailMock) setFailIngest(batchID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failIngest = batchID
+}
+
+// setFlakeFirstIngest arms the retryable one-shot 503 on the first ingest
+// POST (see flakeFirstIngest).
+func (m *syncToktrailMock) setFlakeFirstIngest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flakeFirstIngest = true
+}
+
+// ingestRawBodies returns a copy of the captured raw ingest POST bodies.
+func (m *syncToktrailMock) ingestRawBodies() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]byte, len(m.ingestBodies))
+	copy(out, m.ingestBodies)
+	return out
+}
+
+// ingestTotalCount reports every ingest POST the mock saw, failed and
+// accepted alike.
+func (m *syncToktrailMock) ingestTotalCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ingestTotal
+}
+
+// setRevision swaps the consent revision the self endpoint serves,
+// modeling a server-side authorization change between runs.
+func (m *syncToktrailMock) setRevision(revision int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revision = revision
 }
 
 func (m *syncToktrailMock) setHistoryDays(days int) {
@@ -351,8 +415,14 @@ func seedCodexGrant(t *testing.T, stateDir, homeDir string) {
 // runSyncConnect executes one full connect.Run against the mocks.
 func runSyncConnect(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket string) (Result, error) {
 	t.Helper()
-	out := &strings.Builder{}
-	res, err := Run(context.Background(), Options{
+	return runSyncConnectWithOptions(t, cfg, stateDir, homeDir, ticket, Options{})
+}
+
+// runCursorConnectWithOptionsOut is runSyncConnectWithOptions with the
+// run's output captured into the caller's writer for assertions.
+func runCursorConnectWithOptionsOut(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket string, extra Options, out io.Writer) (Result, error) {
+	t.Helper()
+	opt := Options{
 		URL:             fmt.Sprintf("%s/api/collector/connect#%s", cfg.URL, ticket),
 		StateDir:        stateDir,
 		HomeDir:         homeDir,
@@ -361,13 +431,75 @@ func runSyncConnect(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket
 		SchedulerRunner: &mockRunner{},
 		Now:             func() time.Time { return syncTestNow },
 		Out:             out,
-	})
+	}
+	if extra.MaxTotalBatches != 0 {
+		opt.MaxTotalBatches = extra.MaxTotalBatches
+	}
+	if extra.Cursor != nil {
+		opt.Cursor = extra.Cursor
+	}
+	if extra.CursorConfirm != nil {
+		opt.CursorConfirm = extra.CursorConfirm
+	}
+	return Run(context.Background(), opt)
+}
+
+func runSyncConnectWithOptions(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket string, extra Options) (Result, error) {
+	t.Helper()
+	out := &strings.Builder{}
+	opt := Options{
+		URL:             fmt.Sprintf("%s/api/collector/connect#%s", cfg.URL, ticket),
+		StateDir:        stateDir,
+		HomeDir:         homeDir,
+		BinaryPath:      fakeCollectorBinary(t),
+		HTTPClient:      cfg.Client(),
+		SchedulerRunner: &mockRunner{},
+		Now:             func() time.Time { return syncTestNow },
+		Out:             out,
+	}
+	if extra.MaxTotalBatches != 0 {
+		opt.MaxTotalBatches = extra.MaxTotalBatches
+	}
+	if extra.Cursor != nil {
+		opt.Cursor = extra.Cursor
+	}
+	if extra.CursorConfirm != nil {
+		opt.CursorConfirm = extra.CursorConfirm
+	}
+	if extra.Retry != nil {
+		opt.Retry = extra.Retry
+	}
+	res, err := Run(context.Background(), opt)
 	return res, err
 }
 
 func journalExists(stateDir string) bool {
 	_, err := os.Stat(filepath.Join(stateDir, "resync-journal.json"))
 	return err == nil
+}
+
+// journalBatchIDs reads the resync job journal's planned batch ids. The
+// connect package cannot use resync's private journal types, so the file
+// is parsed as plain JSON.
+func journalBatchIDs(t *testing.T, stateDir string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(stateDir, "resync-journal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jb struct {
+		Batches []struct {
+			BatchID string `json:"batchId"`
+		} `json:"batches"`
+	}
+	if err := json.Unmarshal(raw, &jb); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(jb.Batches))
+	for _, b := range jb.Batches {
+		ids = append(ids, b.BatchID)
+	}
+	return ids
 }
 
 func pendingCount(t *testing.T, stateDir string) int {
@@ -385,12 +517,14 @@ func pendingCount(t *testing.T, stateDir string) int {
 	return n
 }
 
-// TestSyncFirstInstallRetransmitsFreshBatches verifies the first-install
-// path: pending batches drain through the initial collection, and the
-// retransmission phase then replays those freshly synced batches once
-// (server de-duplication makes that safe), completing the resync job
-// with no incompleteness.
-func TestSyncFirstInstallRetransmitsFreshBatches(t *testing.T) {
+// TestSyncFirstInstallDoesNotReplayFreshBatches verifies the first-install
+// path under the connect snapshot: pending batches drain through the
+// initial collection, and because the snapshot captured under the setup
+// lock was empty (nothing was synced before this connect), the
+// retransmission phase replays NOTHING — the batches this run just
+// uploaded are not immediately re-sent. The pass still completes (an
+// empty restricted job), leaving a journal, with no incompleteness.
+func TestSyncFirstInstallDoesNotReplayFreshBatches(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
 	mock := startSyncToktrailMock(t, "dev-first-1")
@@ -410,21 +544,24 @@ func TestSyncFirstInstallRetransmitsFreshBatches(t *testing.T) {
 	if len(res.Sync.Incomplete) != 0 {
 		t.Fatalf("first install must be complete, got incompleteness: %v", res.Sync.Incomplete)
 	}
-	if !res.Sync.Resync.Completed || res.Sync.Resync.Uploads != 3 {
-		t.Fatalf("retransmission must replay the 3 freshly synced batches, got %+v", res.Sync.Resync)
+	if !res.Sync.Resync.Completed || res.Sync.Resync.Uploads != 0 || res.Sync.Resync.ReplayReceipts != 0 {
+		t.Fatalf("a first install must not replay the freshly synced batches, got %+v", res.Sync.Resync)
 	}
-	if res.Sync.Resync.ReplayReceipts != 3 {
-		t.Fatalf("the replayed batches must come back as receipts, got %+v", res.Sync.Resync)
+	if res.Sync.Resync.ExcludedAfterSnapshot != 3 {
+		t.Fatalf("the 3 batches synced during this run must be reported as excluded by the snapshot, got %+v", res.Sync.Resync)
 	}
 	if res.Sync.Backlog.Passes != 0 || res.Sync.Backlog.PendingRemaining != 0 {
 		t.Fatalf("3 pending batches drain within the initial bound, got %+v", res.Sync.Backlog)
 	}
 	if !journalExists(stateDir) {
-		t.Fatalf("the completed resync job must leave a journal")
+		t.Fatalf("the completed empty resync job must leave a journal")
+	}
+	if ids := journalBatchIDs(t, stateDir); len(ids) != 0 {
+		t.Fatalf("the restricted first-install job must plan no batch, got %v", ids)
 	}
 	for _, id := range []string{"first-pending-1", "first-pending-2", "first-pending-3"} {
-		if got := mock.ingestCount(id); got != 2 {
-			t.Fatalf("batch %s must be uploaded once by the drain and once by the retransmission, got %d posts", id, got)
+		if got := mock.ingestCount(id); got != 1 {
+			t.Fatalf("batch %s must be uploaded exactly once by the drain and never replayed, got %d posts", id, got)
 		}
 	}
 }
@@ -528,9 +665,10 @@ func TestSyncRetransmissionFailureReportedHonestlyAndResumes(t *testing.T) {
 
 // TestSyncDrainsBacklogBeyondInitialBound verifies that a reconnect
 // backlog larger than one bounded drain is fully drained by extra
-// passes (the 5-batch bound is never presented as success), and that
-// batches drained after the retransmission plan froze are uploaded once
-// by the drain itself and not re-sent.
+// passes (the 5-batch bound is never presented as success). The
+// retransmission stays empty: every batch was pending when connect
+// captured its snapshot, so each is uploaded once by the drain itself
+// and never re-sent.
 func TestSyncDrainsBacklogBeyondInitialBound(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -556,23 +694,75 @@ func TestSyncDrainsBacklogBeyondInitialBound(t *testing.T) {
 	if len(res.Sync.Incomplete) != 0 {
 		t.Fatalf("a fully drained backlog is complete, got %v", res.Sync.Incomplete)
 	}
+	if res.Sync.Backlog.Result.ExportedBatches != 0 || len(res.Sync.Backlog.Result.GrantOutcomes) != 0 {
+		t.Fatalf("device-only backlog must not rescan sources: %+v", res.Sync.Backlog.Result)
+	}
 	if pendingCount(t, stateDir) != 0 {
 		t.Fatalf("the outbox must be fully drained, got %d pending", pendingCount(t, stateDir))
 	}
-	// 7 drain uploads + 5 retransmissions (the plan froze after the
-	// initial pass, before the backlog pass synced the last 2).
-	if got := mock.totalIngests(); got != 12 {
-		t.Fatalf("expected 7 drain + 5 retransmission uploads, got %d", got)
+	// 7 drain uploads; the history phase (which runs after the backlog
+	// drain) replays nothing because the connect snapshot (captured
+	// before the collection) covered no synced batch — the initial pass
+	// synced 5 and the backlog pass 2, and by plan time all 7 exist as
+	// synced batches that postdate the snapshot.
+	if got := mock.totalIngests(); got != 7 {
+		t.Fatalf("expected 7 drain uploads and no replay, got %d", got)
 	}
-	if res.Sync.Resync.ExcludedPending != 2 {
-		t.Fatalf("the frozen plan must report the 2 batches still pending at plan time, got %+v", res.Sync.Resync)
+	if res.Sync.Resync.Uploads != 0 || res.Sync.Resync.ExcludedAfterSnapshot != 7 {
+		t.Fatalf("the plan must report all 7 batches the drain synced as after-snapshot exclusions, got %+v", res.Sync.Resync)
+	}
+	if res.Sync.Resync.ExcludedPending != 0 {
+		t.Fatalf("the backlog drain empties the outbox before the history phase plans, got %+v", res.Sync.Resync)
 	}
 }
 
-// TestSyncPausedDeviceIsIncompleteNotSuccess verifies that a server-side
-// pause is never presented as success: the collection skips, the
-// retransmission phase declines to run, and the run returns
-// ErrSyncIncomplete naming the pause.
+// TestSyncMaxTotalBatchesBoundsInitialAndBacklogUploads verifies the
+// shared-budget semantics of --max-total-batches: the cap counts every
+// real ingest POST of the run (device, account and history queues), the
+// run stops honestly at the cap, and nothing is presented as success.
+func TestSyncMaxTotalBatchesBoundsInitialAndBacklogUploads(t *testing.T) {
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	mock := startSyncToktrailMock(t, "dev-budget-1")
+	cfg := startSyncConfigMock(t, mock.URL, []string{"Codex"}, intPtr(30))
+
+	for i := 1; i <= 7; i++ {
+		id := fmt.Sprintf("budget-pending-%d", i)
+		seedBatch(t, stateDir, homeDir, id, outbox.StatusPending,
+			syncRecord(fmt.Sprintf("budget-key-%d", i), syncTestNow.Add(-time.Duration(i)*time.Hour).Format(time.RFC3339)))
+	}
+
+	res, err := runSyncConnectWithOptions(t, cfg, stateDir, homeDir, strings.Repeat("5", 64), Options{MaxTotalBatches: 6})
+	if err == nil || !errors.Is(err, ErrSyncIncomplete) {
+		t.Fatalf("expected incomplete sync after budget bound, got res=%+v err=%v", res.Sync, err)
+	}
+	if res.Sync.Collection.SyncedBatches != 5 {
+		t.Fatalf("initial collection should use the first 5 budget slots, got %+v", res.Sync.Collection)
+	}
+	if res.Sync.Backlog.Passes != 1 || res.Sync.Backlog.Result.SyncedBatches != 1 || res.Sync.Backlog.PendingRemaining != 1 {
+		t.Fatalf("backlog should drain exactly one remaining budget slot, got %+v", res.Sync.Backlog)
+	}
+	if !strings.Contains(res.Sync.Backlog.Stopped, backlogBudgetStopped) || !res.Sync.BudgetExhausted {
+		t.Fatalf("expected the shared budget stop reason and flag, got %+v", res.Sync.Backlog)
+	}
+	if pending := pendingCount(t, stateDir); pending != 1 {
+		t.Fatalf("expected one pending batch after budget bound, got %d", pending)
+	}
+	// Six fresh drain uploads only: the shared budget caps every queue's
+	// real POSTs, and the history retransmission has nothing to replay —
+	// the snapshot captured no synced batch before this run's collection
+	// started (it still runs and completes as an empty restricted pass).
+	if got := mock.totalIngests(); got != 6 {
+		t.Fatalf("expected 6 drain uploads and no replay, got %d", got)
+	}
+	if res.Sync.Resync.Uploads != 0 || !res.Sync.Resync.Completed {
+		t.Fatalf("the empty-snapshot retransmission must still complete, got %+v", res.Sync.Resync)
+	}
+	if !containsReason(res.Sync.Incomplete, "shared sync POST budget") {
+		t.Fatalf("the budget stop must be named as an incompleteness, got %v", res.Sync.Incomplete)
+	}
+}
+
 func TestSyncPausedDeviceIsIncompleteNotSuccess(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -1075,14 +1265,17 @@ func TestSyncResyncPhaseSkipsWhenStateBusy(t *testing.T) {
 	defer held.Close()
 
 	out := &strings.Builder{}
-	summary, phaseErr := runResyncPhase(context.Background(), stateDir, SyncOptions{
+	summary, phaseErr, budgetStopped := runResyncPhase(context.Background(), stateDir, SyncOptions{
 		StateDir:   stateDir,
 		ServerURL:  mock.URL,
 		HTTPClient: mock.Client(),
 		Now:        func() time.Time { return syncTestNow },
-	}, out, func() time.Time { return syncTestNow })
+	}, nil, out, func() time.Time { return syncTestNow }, nil)
 	if phaseErr != nil {
 		t.Fatalf("a busy lock is a recorded skip, not a hard error, got %v", phaseErr)
+	}
+	if budgetStopped {
+		t.Fatalf("a busy lock is not a budget stop, got %+v", summary)
 	}
 	if summary.Skipped == "" || !strings.Contains(summary.Skipped, "busy") {
 		t.Fatalf("the skip reason must name the busy state, got %+v", summary)
@@ -1133,4 +1326,66 @@ func withLockRetry(t *testing.T, total, delay time.Duration) {
 // lock-contention unit test.
 func collectionOptionsFor(stateDir string) collection.Options {
 	return collection.Options{StateDir: stateDir, ServerURL: "http://127.0.0.1:1"}
+}
+
+// TestSyncInitialLockReleasedOnEarlyValidationFailure pins the handoff
+// safety net's placement: a caller that handed its state lock in gets it
+// back released on EVERY exit — including the early parameter failures
+// that happen before any phase runs (an empty state directory, a
+// negative total). A leak here would leave every later process seeing
+// ErrBusy.
+func TestSyncInitialLockReleasedOnEarlyValidationFailure(t *testing.T) {
+	t.Run("empty state dir", func(t *testing.T) {
+		lockDir := t.TempDir()
+		lock, err := runlock.Acquire(lockDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Sync(context.Background(), SyncOptions{StateDir: "", InitialLock: lock}); err == nil {
+			t.Fatal("an empty state directory must fail validation")
+		}
+		// The handoff must have been released by the safety net.
+		fresh, aErr := runlock.Acquire(lockDir)
+		if aErr != nil {
+			t.Fatalf("the handed-over lock must be released after an early validation failure, got %v", aErr)
+		}
+		_ = fresh.Close()
+	})
+	t.Run("negative total", func(t *testing.T) {
+		stateDir := t.TempDir()
+		lock, err := runlock.Acquire(stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Sync(context.Background(), SyncOptions{StateDir: stateDir, MaxTotalBatches: -1, InitialLock: lock}); err == nil {
+			t.Fatal("a negative max total must fail validation")
+		}
+		fresh, aErr := runlock.Acquire(stateDir)
+		if aErr != nil {
+			t.Fatalf("the handed-over lock must be released after an early validation failure, got %v", aErr)
+		}
+		_ = fresh.Close()
+	})
+	t.Run("dry run never leaks the handoff", func(t *testing.T) {
+		dir := t.TempDir()
+		homeDir := t.TempDir()
+		mock := startSyncToktrailMock(t, "dev-dry-handoff-1")
+		seedBoundState(t, dir, mock.URL, "dev-dry-handoff-1")
+		lock, err := runlock.Acquire(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Sync(context.Background(), SyncOptions{
+			StateDir: dir, ServerURL: mock.URL, HomeDir: homeDir,
+			ResyncDryRun: true, InitialLock: lock,
+			Now: func() time.Time { return syncTestNow },
+		}); err != nil {
+			t.Fatalf("the dry run must plan cleanly, got %v", err)
+		}
+		fresh, aErr := runlock.Acquire(dir)
+		if aErr != nil {
+			t.Fatalf("the dry-run branch must release the handoff, got %v", aErr)
+		}
+		_ = fresh.Close()
+	})
 }

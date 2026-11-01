@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"time"
 
 	"toktrail-collector/internal/local/progress"
@@ -41,6 +42,13 @@ type Options struct {
 	// HistoryFrom is the optional cutoff timestamp. Records with occurredAt
 	// strictly before this timestamp are filtered out of exports.
 	HistoryFrom *time.Time
+	// Context carries an optional cancellation scope into source loaders.
+	// Nil keeps the legacy semantics: loaders that consult it through
+	// ContextOrBackground see context.Background(), so a scan behaves
+	// exactly as it did before cancellation support existed. Loaders check
+	// the context only at coarse boundaries (file discovery, per file,
+	// per line) and return the context error without partial results.
+	Context context.Context
 }
 
 // LoadResult is the raw output of one source loader.

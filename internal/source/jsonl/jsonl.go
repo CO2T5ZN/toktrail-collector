@@ -2,6 +2,7 @@ package jsonl
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -26,6 +27,13 @@ type Line struct {
 }
 
 func Files(path string, opt Options) ([]string, error) {
+	return FilesContext(context.Background(), path, opt)
+}
+
+func FilesContext(ctx context.Context, path string, opt Options) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	clean := strings.TrimSpace(path)
 	info, err := os.Stat(clean)
 	if err != nil {
@@ -36,6 +44,9 @@ func Files(path string, opt Options) ([]string, error) {
 	}
 	var files []string
 	if err := filepath.WalkDir(clean, func(p string, d fs.DirEntry, err error) error {
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return err
 		}
@@ -57,6 +68,13 @@ func Files(path string, opt Options) ([]string, error) {
 }
 
 func WalkLines(path string, fn func(Line) error) error {
+	return WalkLinesContext(context.Background(), path, fn)
+}
+
+func WalkLinesContext(ctx context.Context, path string, fn func(Line) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -65,6 +83,9 @@ func WalkLines(path string, fn func(Line) error) error {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), MaxLineBytes)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -72,6 +93,9 @@ func WalkLines(path string, fn func(Line) error) error {
 		if err := fn(Line{File: path, Number: lineNo, Text: line}); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return scanner.Err()
 }

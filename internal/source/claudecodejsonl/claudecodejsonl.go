@@ -1,6 +1,7 @@
 package claudecodejsonl
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -200,16 +201,22 @@ func (q *claudeCodeQuarantine) report(file string, line int, reason string) {
 // deterministic output. Only assistant message.usage counters are read;
 // every other field stays local. Invalid lines are quarantined and reported
 // instead of aborting the scan, and a message whose snapshots never record
-// a model gets one local diagnostic while still exporting "unknown".
-func loadClaudeCodeMessages(path string) ([]claudeCodeMessage, []adapter.LineIssue, int, error) {
-	paths, err := jsonl.Files(path, jsonl.Options{SkipHiddenFiles: true})
+// a model gets one local diagnostic while still exporting "unknown". The
+// context is checked during discovery, per file, and per line; cancellation
+// returns ctx.Err() with no partial messages, so an interrupted scan never
+// reaches record building or pending-state updates.
+func loadClaudeCodeMessages(ctx context.Context, path string) ([]claudeCodeMessage, []adapter.LineIssue, int, error) {
+	paths, err := jsonl.FilesContext(ctx, path, jsonl.Options{SkipHiddenFiles: true})
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	quarantine := &claudeCodeQuarantine{}
 	final := map[string]*claudeCodeMessage{}
 	for _, file := range paths {
-		if err := loadClaudeCodeJSONLFile(file, final, quarantine); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, 0, err
+		}
+		if err := loadClaudeCodeJSONLFile(ctx, file, final, quarantine); err != nil {
 			return nil, nil, 0, err
 		}
 	}
@@ -274,8 +281,15 @@ func mergeClaudeModelSnapshot(current *claudeCodeMessage, obs claudeCodeObservat
 	}
 }
 
-func loadClaudeCodeJSONLFile(path string, final map[string]*claudeCodeMessage, quarantine *claudeCodeQuarantine) error {
-	return jsonl.WalkLines(path, func(line jsonl.Line) error {
+// loadClaudeCodeJSONLFile folds one session file into the per-message state.
+// Cancellation is NOT a quarantine case: a ctx.Err() from the per-line check
+// aborts the whole scan instead of being counted as a bad line, and the
+// caller discards everything.
+func loadClaudeCodeJSONLFile(ctx context.Context, path string, final map[string]*claudeCodeMessage, quarantine *claudeCodeQuarantine) error {
+	return jsonl.WalkLinesContext(ctx, path, func(line jsonl.Line) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		obs, outcome, reason := parseClaudeCodeLine(line.Text, line.File, line.Number)
 		switch outcome {
 		case claudeLineQuarantine:
@@ -567,7 +581,7 @@ func Load(opt adapter.Options) (adapter.LoadResult, error) {
 	if strings.TrimSpace(opt.StateDir) == "" && strings.TrimSpace(opt.Output) != "" {
 		return adapter.LoadResult{}, fmt.Errorf("claude-code-jsonl export requires a state directory (Set --state-dir / TOKTRAIL_HOME) so usage baselines are not double counted")
 	}
-	messages, issues, quarantined, err := loadClaudeCodeMessages(opt.Input)
+	messages, issues, quarantined, err := loadClaudeCodeMessages(opt.ContextOrBackground(), opt.Input)
 	if err != nil {
 		return adapter.LoadResult{}, err
 	}

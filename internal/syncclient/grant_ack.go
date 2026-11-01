@@ -307,10 +307,7 @@ func ReportGrantAck(ctx context.Context, store statedir.Store, opt Options, req 
 	if serverURL == "" {
 		return GrantAck{}, errors.New("server URL is required")
 	}
-	client := opt.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
+	client := noRedirectClient(opt.HTTPClient)
 	endpoint, err := joinURL(serverURL, "/v1/devices/grant-ack")
 	if err != nil {
 		return GrantAck{}, err
@@ -327,20 +324,25 @@ func ReportGrantAck(ctx context.Context, store statedir.Store, opt Options, req 
 	httpReq.Header.Set("Authorization", "Bearer "+st.DeviceID+"."+st.DeviceSecret)
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return GrantAck{}, fmt.Errorf("grant ack failed: %w", err)
+		// Raw transport text never reaches a human message; the cause
+		// stays matchable through Unwrap.
+		return GrantAck{}, wrapTransportError("grant ack failed", err)
 	}
 	defer resp.Body.Close()
 	var body grantAckResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return GrantAck{}, fmt.Errorf("grant ack failed: status %d: %w", resp.StatusCode, err)
+	if err := json.NewDecoder(capResponseBody(resp.Body)).Decode(&body); err != nil {
+		if errors.Is(err, errResponseBodyTooLarge) {
+			return GrantAck{}, fmt.Errorf("grant ack failed: status %d: response body exceeded the %d MiB safety limit", resp.StatusCode, maxResponseBodyBytes>>20)
+		}
+		return GrantAck{}, fmt.Errorf("grant ack failed: status %d: %w", resp.StatusCode, safeDecodeErrorOf(err))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 			return GrantAck{}, fmt.Errorf("grant ack endpoint not available (HTTP %d); the ack will be retried on the next run", resp.StatusCode)
 		}
-		code, message := "", ""
+		code := ""
 		if body.Error != nil {
-			code, message = body.Error.Code, body.Error.Message
+			code = body.Error.Code
 		}
 		if resp.StatusCode == http.StatusConflict && code == "scope_changed" {
 			return GrantAck{}, fmt.Errorf("%w: the server's consent revision moved past %d before the ack; the applied view may be stale", ErrAckRevisionAdvanced, req.ConsentRevision)
@@ -353,15 +355,13 @@ func ReportGrantAck(ctx context.Context, store statedir.Store, opt Options, req 
 		// (409), and a missing endpoint (404/405) keep their own
 		// classification and never take this path. The sentinel licenses
 		// exactly one explicit legacy-shape retry by the caller; a
-		// payload without the capability fields never produces it.
+		// payload without the capability fields never produces it. The
+		// server's code/message text is never echoed into the sentinel's
+		// description.
 		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) && req.carriesCapabilities() {
-			detail := ""
-			if code != "" || message != "" {
-				detail = fmt.Sprintf(" (%s: %s)", code, message)
-			}
-			return GrantAck{}, fmt.Errorf("%w: HTTP %d%s while the payload carried the optional supportedTools/pendingReasons fields; an older server may reject unknown fields, retrying once with the legacy payload is safe", ErrAckUnknownFields, resp.StatusCode, detail)
+			return GrantAck{}, fmt.Errorf("%w: HTTP %d while the payload carried the optional supportedTools/pendingReasons fields; an older server may reject unknown fields, retrying once with the legacy payload is safe", ErrAckUnknownFields, resp.StatusCode)
 		}
-		return GrantAck{}, classifyIngestError(resp.StatusCode, code, message)
+		return GrantAck{}, classifyIngestError(resp.StatusCode, code)
 	}
 	if body.GrantAck == nil {
 		return GrantAck{}, errors.New("grant ack response missing grantAck")
@@ -381,7 +381,9 @@ func ReportGrantAck(ctx context.Context, store statedir.Store, opt Options, req 
 		echoed = "applied"
 	}
 	if echoed != requested {
-		return GrantAck{}, fmt.Errorf("%w: requested state %q but server confirmed %q; the ack is not recorded and the state is unclear", ErrAckEchoMismatch, requested, echoed)
+		// The echoed state is untrusted server text and is never echoed
+		// back into the message.
+		return GrantAck{}, fmt.Errorf("%w: requested state %q but the server confirmed a different state; the ack is not recorded and the state is unclear", ErrAckEchoMismatch, requested)
 	}
 	return *body.GrantAck, nil
 }

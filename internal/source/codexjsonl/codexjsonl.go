@@ -1,6 +1,7 @@
 package codexjsonl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -65,24 +66,32 @@ type codexEvent struct {
 
 // LoadRecords returns every Codex session record under path. It keeps the
 // historical records-only signature for direct callers; the adapter's Load
-// uses loadRecords so scan also surfaces the local model diagnostics.
+// uses loadRecordsContext so scan also surfaces the local model diagnostics.
 func LoadRecords(path string) ([]adapter.Record, error) {
-	loaded, err := loadRecords(path)
+	loaded, err := loadRecordsContext(context.Background(), path)
 	if err != nil {
 		return nil, err
 	}
 	return loaded.Records, nil
 }
 
-func loadRecords(path string) (adapter.LoadResult, error) {
-	paths, err := jsonl.Files(path, jsonl.Options{})
+// loadRecordsContext scans with cancellation support: the context is checked
+// during file discovery, once per file, and once per line. On cancellation it
+// returns ctx.Err() (matching errors.Is(context.Canceled) or
+// errors.Is(context.DeadlineExceeded)) and no partial result, so a scan cut
+// short by its deadline never commits half of the records.
+func loadRecordsContext(ctx context.Context, path string) (adapter.LoadResult, error) {
+	paths, err := jsonl.FilesContext(ctx, path, jsonl.Options{})
 	if err != nil {
 		return adapter.LoadResult{}, err
 	}
 	var records []adapter.Record
 	log := &codexIssueLog{}
 	for _, file := range paths {
-		fileRecords, err := loadCodexJSONLFile(file, log)
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
+		fileRecords, err := loadCodexJSONLFile(ctx, file, log)
 		if err != nil {
 			return adapter.LoadResult{}, err
 		}
@@ -112,9 +121,12 @@ func loadRecords(path string) (adapter.LoadResult, error) {
 // Unattributed deltas yield one diagnostic each, anchored at the closing
 // token_count line; the reason names the cause (missing model, model
 // switch) but never includes a recorded model value.
-func loadCodexJSONLFile(path string, log *codexIssueLog) ([]adapter.Record, error) {
+func loadCodexJSONLFile(ctx context.Context, path string, log *codexIssueLog) ([]adapter.Record, error) {
 	var events []codexEvent
-	if err := jsonl.WalkLines(path, func(line jsonl.Line) error {
+	if err := jsonl.WalkLinesContext(ctx, path, func(line jsonl.Line) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		raw, err := jsonl.DecodeObject(line.Text)
 		if err != nil {
 			return fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
@@ -379,11 +391,15 @@ func codexDelta(prev, cur codexUsage) (codexUsage, bool) {
 
 func Adapter() adapter.Adapter {
 	return adapter.Adapter{Source: adapter.CodexJSONLSource, Description: "Codex session JSONL", Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-		return loadRecords(opt.Input)
+		return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 	}, FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+		ctx := opt.ContextOrBackground()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(opt.StateDir) == "" {
 			return records, nil
 		}
-		return filterKnownCodexRecords(opt.StateDir, records)
+		return filterKnownCodexRecordsContext(ctx, opt.StateDir, records)
 	}}
 }

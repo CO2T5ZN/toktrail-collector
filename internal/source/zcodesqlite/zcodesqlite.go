@@ -46,9 +46,25 @@ type zcodeObservation struct {
 // ~/.zcode/cli/db/db.sqlite; when a directory is granted, every *.sqlite file
 // in that directory is read so future sharded stores do not require a new
 // grant. Only aggregate token columns are read; prompts, responses, session
-// content, auth state and account data are not queried.
+// content, auth state and account data are not queried. It keeps the
+// historical context-free signature for direct callers; the adapter's Load
+// threads the caller's cancellation scope through
+// adapter.Options.ContextOrBackground into loadRecordsContext.
 func LoadRecords(input string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), input)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// before the scan starts, once per database file and once per assembled
+// record, and readDB derives its per-database deadline from it. On
+// cancellation it returns ctx.Err() (matching errors.Is(context.Canceled) or
+// errors.Is(context.DeadlineExceeded)) and an empty result, so a scan cut
+// short by its deadline never commits partial records.
+func loadRecordsContext(ctx context.Context, input string) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	files, err := sqliteFiles(input)
 	if err != nil {
 		return result, err
@@ -62,11 +78,17 @@ func LoadRecords(input string) (adapter.LoadResult, error) {
 		}
 	}
 	for _, file := range files {
-		obs, err := readDB(file)
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
+		obs, err := readDB(ctx, file)
 		if err != nil {
 			return adapter.LoadResult{}, err
 		}
 		for _, ob := range obs {
+			if err := ctx.Err(); err != nil {
+				return adapter.LoadResult{}, err
+			}
 			rec := zcodeRecord(ob)
 			key := adapter.StringField(rec, "recordKey")
 			if conflicts[key] {
@@ -126,18 +148,23 @@ func sqliteFiles(input string) ([]string, error) {
 	return files, nil
 }
 
-func readDB(path string) ([]zcodeObservation, error) {
+// readDB scans one ZCode SQLite database. It derives the historical
+// 30-second per-database deadline from ctx, so a caller-supplied
+// cancellation or a shorter parent deadline propagates into every query and
+// row below; a plain context.Background() keeps the exact pre-context
+// behavior. Each row is also checked for cancellation before it is parsed.
+func readDB(ctx context.Context, path string) ([]zcodeObservation, error) {
 	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	hasStatus, err := modelUsageHasColumn(ctx, db, "status")
 	if err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	query := `SELECT COALESCE(CAST(id AS TEXT), ''), COALESCE(model_id, ''), COALESCE(started_at, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cache_creation_input_tokens, 0), COALESCE(cache_read_input_tokens, 0) FROM model_usage`
 	if hasStatus {
@@ -146,11 +173,14 @@ func readDB(path string) ([]zcodeObservation, error) {
 	query += ` ORDER BY started_at ASC, id ASC`
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("query ZCode model_usage: %w", err)
+		return nil, contextErr(ctx, fmt.Errorf("query ZCode model_usage: %w", err))
 	}
 	defer rows.Close()
 	var out []zcodeObservation
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var id, model string
 		var startedRaw any
 		var inputRaw, outputRaw, cacheWriteRaw, cacheReadRaw any
@@ -214,9 +244,19 @@ func readDB(path string) ([]zcodeObservation, error) {
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	return out, nil
+}
+
+// contextErr reports the context's own error whenever it is done, so callers
+// can always match cancellation with errors.Is regardless of how the driver
+// wrapped the failure; otherwise it passes the original error through.
+func contextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func modelUsageHasColumn(ctx context.Context, db *sql.DB, column string) (bool, error) {
@@ -360,18 +400,35 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.ZCodeSQLiteSource,
 		Description: "ZCode model_usage SQLite",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
 
-func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full rescans cannot re-export known ZCode records. The context
+// is consulted at coarse boundaries (entry, per outbox batch, per stored
+// record, before the quarantine load, per quarantine entry, per fresh
+// record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -399,6 +456,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.ZCodeSQLiteSource {
 			continue
 		}
@@ -422,16 +482,25 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 			return nil, fmt.Errorf("ZCode history batch identity mismatch")
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == adapter.ZCodeSQLiteSource {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -440,6 +509,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

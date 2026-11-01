@@ -889,14 +889,14 @@ func TestRunSyncPartialAckAdvancesAcceptedMessagesOnly(t *testing.T) {
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
-	if len(out.Batches) != 1 || out.Batches[0].Status != outbox.StatusSynced || out.Batches[0].ReceiptStatus != "partial" || out.Batches[0].AcceptedRecords != 1 || out.Batches[0].RejectedRecords != 1 {
+	if len(out.Batches) != 1 || out.Batches[0].Status != outbox.StatusSynced || out.Batches[0].ReceiptStatus != "partial_error" || out.Batches[0].AcceptedRecords != 1 || out.Batches[0].RejectedRecords != 1 {
 		t.Fatalf("unexpected outbox after partial ACK: %#v", out)
 	}
 	saved, loadErr := store.Load()
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
-	if saved.LastSyncBatchID != batchID || saved.LastSyncStatus != "partial" || saved.LastSyncAcceptedRecords != 1 || saved.LastSyncRejectedRecords != 1 {
+	if saved.LastSyncBatchID != batchID || saved.LastSyncStatus != "partial_error" || saved.LastSyncAcceptedRecords != 1 || saved.LastSyncRejectedRecords != 1 {
 		t.Fatalf("unexpected device state after partial ACK: %#v", saved)
 	}
 }

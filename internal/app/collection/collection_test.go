@@ -357,16 +357,50 @@ func TestRunRefusesConcurrentRunWithoutNetwork(t *testing.T) {
 	}
 }
 
-// No enabled grants means a no-op run for a bound device on a server
-// without the grant protocol: the only network traffic is the grant-sync
-// self fetch (a bound device always refreshes its authorization view so
-// the server can re-enable tools); there is no upload, no drain preflight
-// and no tool-status report.
-func TestRunWithNoGrantsUsesNoNetwork(t *testing.T) {
+// No enabled grants (§6.1): the scan reads nothing (the no-grants
+// semantics), but the device outbox drain still runs — an already-pending
+// batch keeps uploading under the live server consent preflight instead
+// of hiding behind PendingRemaining=0. The run reports the NoGrants fact
+// WITH the drained counts; Skipped stays empty because work was
+// attempted, so no caller can mistake the drained queue for a no-op.
+func TestRunWithNoGrantsStillDrainsPendingBatches(t *testing.T) {
 	stateDir := t.TempDir()
 	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 	writePendingBatch(t, stateDir, "batch-pending-nogrants-1")
+
+	res, err := Run(t.Context(), Options{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.NoGrants || res.Grants != 0 {
+		t.Fatalf("the no-grants fact must be reported, got %#v", res)
+	}
+	if res.Skipped != "" {
+		t.Fatalf("a run that drained work must not carry the no-op skip wording, got %q", res.Skipped)
+	}
+	if res.SyncedBatches != 1 || res.SyncedRecords != 1 || res.PendingRemaining != 0 {
+		t.Fatalf("the pending batch must drain, got %+v", res)
+	}
+	if res.GrantSync.Active {
+		t.Fatalf("old-protocol server must not activate the grant sync, got %#v", res.GrantSync)
+	}
+	if got := server.ingestRequests(); got != 1 {
+		t.Fatalf("the grant-less run must upload the pending batch, got %d ingest requests", got)
+	}
+	if got := server.selfRequests(); got != 2 {
+		t.Fatalf("expected the grant-sync self fetch plus the upload preflight, got %d", got)
+	}
+}
+
+// A grant-less run whose sendable queue is actually EMPTY keeps the
+// historical no-op shape: the only network traffic is the grant-sync self
+// fetch (a bound device always refreshes its authorization view so the
+// server can re-enable tools), and the skip wording is reported.
+func TestRunWithNoGrantsAndEmptyQueueStaysNoOp(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	bindDevice(t, stateDir, server.URL)
 
 	res, err := Run(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
@@ -378,14 +412,66 @@ func TestRunWithNoGrantsUsesNoNetwork(t *testing.T) {
 	if res.Skipped == "" {
 		t.Fatal("expected a skip reason for the no-op run")
 	}
+	if res.SyncedBatches != 0 || res.PendingRemaining != 0 {
+		t.Fatalf("an empty queue must drain nothing, got %+v", res)
+	}
 	if res.GrantSync.Active {
 		t.Fatalf("old-protocol server must not activate the grant sync, got %#v", res.GrantSync)
 	}
 	if n := server.totalRequests(); n != 1 {
-		t.Fatalf("no-grants run must only perform the grant-sync self fetch, got %d requests", n)
+		t.Fatalf("no-grants empty run must only perform the grant-sync self fetch, got %d requests", n)
 	}
 	if got := server.selfRequests(); got != 1 {
 		t.Fatalf("expected exactly the grant-sync self request, got %d", got)
+	}
+}
+
+func TestRunEmitsProgressEventsForScanAndDrain(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	bindDevice(t, stateDir, server.URL)
+	enableIdleGrant(t, stateDir)
+	writePendingBatch(t, stateDir, "batch-pending-progress-1")
+
+	var events []ProgressEvent
+	res, err := Run(t.Context(), Options{
+		StateDir: stateDir,
+		Progress: func(event ProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SyncedBatches != 1 || res.PendingRemaining != 0 {
+		t.Fatalf("expected one drained batch, got %+v", res)
+	}
+	wantEnds := []string{"grant_sync", "source_scan", "drain"}
+	for _, want := range wantEnds {
+		found := false
+		for _, event := range events {
+			if event.Kind == ProgressStageEnd && event.Stage == want {
+				found = true
+				if event.EndedAt.IsZero() || event.Duration < 0 {
+					t.Fatalf("event %s missing timing data: %+v", want, event)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing %s end event in %#v", want, events)
+		}
+	}
+	foundComplete := false
+	for _, event := range events {
+		if event.Kind == ProgressCount && event.Stage == "complete" {
+			foundComplete = true
+			if event.SyncedBatches != 1 || event.PendingRemaining != 0 {
+				t.Fatalf("unexpected complete counts: %+v", event)
+			}
+		}
+	}
+	if !foundComplete {
+		t.Fatalf("missing complete count event in %#v", events)
 	}
 }
 
@@ -509,6 +595,56 @@ func TestRunCollectsExportsAndSyncsEndToEnd(t *testing.T) {
 
 // The drain is bounded: with more pending batches than the batch limit the
 // run stops after the limit and reports the remainder for the next run.
+func TestDrainPendingUploadsOutboxWithoutSourceScanOrGrants(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	bindDevice(t, stateDir, server.URL)
+	writePendingBatch(t, stateDir, "batch-drain-only-1")
+	writePendingBatch(t, stateDir, "batch-drain-only-2")
+
+	var events []ProgressEvent
+	res, err := DrainPending(t.Context(), Options{
+		StateDir:   stateDir,
+		MaxBatches: 10,
+		Progress: func(event ProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExportedBatches != 0 || len(res.GrantOutcomes) != 0 || res.Grants != 0 || res.NoGrants {
+		t.Fatalf("drain-only run must not scan grants or export, got %+v", res)
+	}
+	if res.SyncedBatches != 2 || res.PendingRemaining != 0 || res.DrainStopped != "" {
+		t.Fatalf("expected two pending batches drained, got %+v", res)
+	}
+	if got := server.ingestRequests(); got != 2 {
+		t.Fatalf("expected exactly two ingest uploads, got %d", got)
+	}
+	for _, event := range events {
+		if event.Stage == "source_scan" || event.Stage == "grant_sync" {
+			t.Fatalf("drain-only run emitted scan/grant event: %#v", events)
+		}
+	}
+	foundDrain := false
+	foundComplete := false
+	for _, event := range events {
+		switch {
+		case event.Kind == ProgressStageEnd && event.Stage == "drain":
+			foundDrain = true
+			if event.SyncedBatches != 2 || event.PendingRemaining != 0 {
+				t.Fatalf("unexpected drain counts: %+v", event)
+			}
+		case event.Kind == ProgressCount && event.Stage == "complete":
+			foundComplete = true
+		}
+	}
+	if !foundDrain || !foundComplete {
+		t.Fatalf("missing drain/complete progress events: %#v", events)
+	}
+}
+
 func TestRunDrainIsBounded(t *testing.T) {
 	stateDir := t.TempDir()
 	server := fakeServer(t)
@@ -961,4 +1097,74 @@ func TestRunSkipsUnreadableGrantedInputWithoutNetwork(t *testing.T) {
 	if n := server.totalRequests(); n != 1 {
 		t.Fatalf("run with only an unreadable input must only perform the grant-sync self fetch, got %d requests", n)
 	}
+}
+
+// TestRunLockedRunsUnderCallerHeldLock pins the already-held-lock entry
+// point connect uses to bridge its setup lock into the initial
+// collection round: a valid handed-over lock runs the identical round
+// without acquiring (the caller keeps holding it throughout — an in-round
+// probe must observe ErrBusy — and still owns the release afterwards),
+// while a foreign or closed handle fails closed before any work.
+func TestRunLockedRunsUnderCallerHeldLock(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	bindDevice(t, stateDir, server.URL)
+	writePendingBatch(t, stateDir, "batch-runlocked-1")
+
+	lock, err := runlock.Acquire(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A foreign live lock and a closed handle both fail closed before
+	// any local-state or network work.
+	foreign, err := runlock.Acquire(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunLocked(t.Context(), Options{StateDir: stateDir}, foreign); err == nil {
+		t.Fatal("a foreign lock must fail closed")
+	}
+	_ = foreign.Close()
+	if _, err := RunLocked(t.Context(), Options{StateDir: stateDir}, foreign); err == nil {
+		t.Fatal("a closed lock must fail closed")
+	}
+	if n := server.totalRequests(); n != 0 {
+		t.Fatalf("a rejected handoff must perform no work, got %d requests", n)
+	}
+
+	// The valid handoff runs the round under the caller's lock: the
+	// in-round probe (drain stage start) must see the lock as held.
+	inRoundBusy := false
+	res, err := RunLocked(t.Context(), Options{
+		StateDir: stateDir,
+		Progress: func(event ProgressEvent) {
+			if event.Kind == ProgressStageStart && event.Stage == "drain" {
+				if _, aErr := runlock.Acquire(stateDir); errors.Is(aErr, runlock.ErrBusy) {
+					inRoundBusy = true
+				}
+			}
+		},
+	}, lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SyncedBatches != 1 || res.PendingRemaining != 0 {
+		t.Fatalf("the handed-over round must drain the pending batch, got %+v", res)
+	}
+	if !inRoundBusy {
+		t.Fatal("the caller's lock must still be held inside the round")
+	}
+	// RunLocked must not release the caller's lock.
+	if _, aErr := runlock.Acquire(stateDir); !errors.Is(aErr, runlock.ErrBusy) {
+		t.Fatalf("the caller must still hold the lock after RunLocked returns, got %v", aErr)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := runlock.Acquire(stateDir)
+	if err != nil {
+		t.Fatalf("the released lock must be acquirable again: %v", err)
+	}
+	_ = fresh.Close()
 }

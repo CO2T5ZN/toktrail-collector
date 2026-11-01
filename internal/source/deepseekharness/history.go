@@ -2,6 +2,7 @@ package deepseekharness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -22,7 +23,21 @@ import (
 // overwriting immutable history. (There is deliberately no old-version
 // model upgrade path: with no real users there is nothing to upgrade, and
 // a model difference under a known key is content drift.)
-func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+//
+// The context is consulted at coarse boundaries (entry, per outbox batch,
+// per stored record, before the quarantine load, per quarantine entry,
+// before the override baseline application and once per ledger record
+// inside it, per fresh record); on cancellation it returns ctx.Err()
+// (matchable with errors.Is(err, context.Canceled) or errors.Is(err,
+// context.DeadlineExceeded)) and no partial result — the fresh slice
+// accumulated so far is discarded, so a filter cut short never exports a
+// prefix of the scan. A nil Options.Context reaches here as
+// context.Background() via ContextOrBackground and keeps the exact
+// pre-cancellation behavior.
+func filterKnownDSHRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		dec := json.NewDecoder(bytes.NewReader(raw))
@@ -50,6 +65,9 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 		return nil, err
 	}
 	for _, entry := range outboxLedger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.DeepSeekHarnessSource {
 			continue
 		}
@@ -73,16 +91,25 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 			return nil, fmt.Errorf("DeepSeek Harness history batch identity mismatch")
 		}
 		for _, rec := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(rec); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	store, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range store {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.DeepSeekHarnessSource {
 			continue
 		}
@@ -95,11 +122,22 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 	// overrides supersede the stored payloads for baseline comparison
 	// (the old files stay untouched on disk); a pending override blocks
 	// the whole scan fail-closed until the pass finishes or is abandoned.
-	if err := overrides.ApplyToBaseline(stateDir, adapter.DeepSeekHarnessSource, known); err != nil {
+	// The scope flows into the ledger application: its single-file load
+	// and binding check stay non-interruptible at their file boundaries,
+	// but both per-record ledger scans honor the scope and mutate the
+	// known map only in one shot after every record check passes, so a
+	// cancelled pass never leaves a half-applied baseline.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := overrides.ApplyToBaselineContext(ctx, stateDir, adapter.DeepSeekHarnessSource, known); err != nil {
 		return nil, err
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, rec := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key, _ := rec["recordKey"].(string)
 		canonical, err := json.Marshal(rec)
 		if err != nil {

@@ -11,23 +11,55 @@ package connect
 //     export WAL and quarantine store, and drains a bounded number of
 //     pending batches. Retransmitting history before the authorization
 //     refresh would plan against a stale local grant view.
-//  2. The history retransmission (internal/app/resync) of already-synced
+//  2. Then, in BUDGETED runs (connect, and every drive with a Budget or
+//     a positive MaxTotalBatches), the backlog drain passes while the
+//     NEW queues (device outbox and account source) still hold pending
+//     batches: fresh pending data is the current authorization's own
+//     coverage and must not wait behind the history retransmission,
+//     which only replays what the server already holds (de-duplicated).
+//     Each pass drains BOTH queues under one lock (fair rotation: no
+//     queue starves the other) and keeps passing until the queues are
+//     empty, the budget declines, or a pass makes no progress.
+//  3. The history retransmission (internal/app/resync) of already-synced
 //     outbox batches under an exclusive state lock. resync.Run never
-//     locks itself, so this phase owns the runlock for it. The phase
-//     always runs: on a first install the initial collection's freshly
-//     synced batches are retransmitted once more, which the server
-//     de-duplicates by replay — safe, and it avoids reading the outbox
-//     without the lock just to detect the first-install case.
-//  3. Bounded extra drain passes while batches remain pending. The
-//     initial round drains at most collection.DefaultMaxSyncBatches; a
-//     reconnect that accumulated a backlog must not stop there, and a
-//     sync that cannot fully drain reports incomplete, never success.
+//     locks itself, so this phase owns the runlock for it. When the
+//     caller captured a synced-batch snapshot (connect does, in the
+//     initial collection round after the authorization refresh), the
+//     pass is restricted to it: the batches this run's own collection
+//     uploads are never immediately replayed — on a first install the
+//     pass is simply empty. Without a snapshot (the resync CLI) the pass
+//     keeps the original full-archive semantics, which the server
+//     de-duplicates by replay.
 //
-// Locking: phases 1 and 3 go through collection.Run, which acquires and
-// releases the state lock per pass; phase 2 acquires the lock with a
-// bounded busy retry (a just-installed or pre-existing scheduled task may
-// hold it) and holds it across resync.Run. The caller must NOT hold the
-// state lock.
+// Unbudgeted runs — the explicit resync CLI, which sets neither Budget
+// nor MaxTotalBatches — keep the ORIGINAL phase order instead:
+// initial collection → history retransmission → backlog drain. The CLI's
+// interactive confirmation plan lists the already-synced archive only,
+// and draining the backlog before the retransmission would fold this
+// run's backlog uploads (up to DefaultMaxBacklogPasses ×
+// DefaultMaxSyncBatches batches) into the executed retransmission the
+// user never confirmed. The unbudgeted backlog keeps the historical
+// bounded-pass behavior.
+//
+// Budget: SyncOptions.Budget (or MaxTotalBatches, which builds one) caps
+// the real ingest POST attempts of ALL THREE queues — device, account
+// source and history retransmission — through the shared
+// internal/syncbudget budget the sending layers reserve under right
+// before each POST. A decline is never a failure: the declined batch
+// stays pending, the history job stays resumable, and the run reports
+// ErrSyncIncomplete (SyncResult.BudgetExhausted) instead of success. A
+// nil budget (the resync CLI, and every caller that sets neither field)
+// keeps the unbudgeted behavior exactly as before.
+//
+// Locking: the caller must NOT hold the state lock. Phase 1 goes through
+// collection.Run, which acquires and releases the state lock per pass
+// (retrying while it is busy). Each phase-2 backlog pass acquires the
+// lock ONCE — through the same bounded busy retry — and holds it
+// continuously across the whole pass (device authorization refresh and
+// drain, account-source drain, terminal authorization check; see
+// runBacklogPass), so no other collector process can interleave between
+// a pass's sub-phases. Phase 3 acquires the lock with the bounded busy
+// retry and holds it across resync.Run.
 
 import (
 	"context"
@@ -46,17 +78,62 @@ import (
 	"toktrail-collector/internal/local/runlock"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/registry"
+	"toktrail-collector/internal/syncbudget"
 	"toktrail-collector/internal/syncclient"
+	"toktrail-collector/internal/syncretry"
 )
 
 // DefaultMaxBacklogPasses bounds the extra collection passes after the
-// initial round. Each pass drains up to collection.DefaultMaxSyncBatches
-// device batches (plus the cursor source's own bounded drain), so the
-// default gives a reconnect a reasonable full-drain effort (~50 device
-// batches) while keeping one run finite; whatever remains is reported as
-// incomplete and is continued by re-running connect, the scheduled
-// collection, or the resync CLI.
+// initial round for UNBUDGETED runs (the resync CLI and every caller
+// that passes no budget). Each pass drains up to
+// collection.DefaultMaxSyncBatches device batches (plus the cursor
+// source's own bounded drain), so the default gives a reconnect a
+// reasonable full-drain effort (~50 device batches) while keeping one
+// run finite; whatever remains is reported as incomplete and is
+// continued by re-running connect, the scheduled collection, or the
+// resync CLI. A budgeted run lifts this pass bound (see Sync): the
+// budget's own total and deadline bound the run instead, so the
+// hardcoded 10×5 ceiling cannot stop a run whose budget still allows
+// POSTs.
 const DefaultMaxBacklogPasses = 10
+
+const (
+	// DefaultBudgetTotal is the default run-wide ingest-POST budget
+	// connect.Run gives its sync phase when the caller sets no explicit
+	// total: every real POST of the device, account-source and history
+	// queues reserves one unit of it.
+	DefaultBudgetTotal = 1000
+
+	// DefaultBudgetDeadline is the default time bound of that budget,
+	// measured from the start of connect.Run (the budget's clock and the
+	// deadline are derived from the same injectable Now, so a test's
+	// fixed clock can never accidentally expire the deadline).
+	DefaultBudgetDeadline = 10 * time.Minute
+
+	// budgetQueueDevice is the syncbudget queue name the device outbox
+	// drain reserves under (collection's own wiring); connect consults it
+	// to detect a queue-specific device cap.
+	budgetQueueDevice = "device"
+
+	// budgetQueueCursor is the syncbudget queue name the account-source
+	// (cursor) uploads reserve under (sourcebatch's own wiring); connect
+	// consults it to detect a queue-specific account cap, mirroring the
+	// device-side check.
+	budgetQueueCursor = "cursor"
+
+	// backlogBudgetStopped is the Backlog.Stopped / Resync.Skipped
+	// marker for a stop caused by the shared run budget declining
+	// further attempts. It deliberately matches resync's own stopped
+	// marker text so the two phases report one consistent vocabulary.
+	backlogBudgetStopped = "sync budget exhausted"
+
+	// maxBacklogPassesUnbounded is the pass bound used for budgeted runs
+	// whose caller did not configure one: effectively no pass bound, so
+	// only the budget (total, deadline, queue caps), the drained queues
+	// and the no-progress guard end the loop. A plain large constant
+	// keeps the counter arithmetic honest for every realistic run.
+	maxBacklogPassesUnbounded = 1 << 30
+)
 
 // ErrSyncIncomplete reports that the orchestration finished without
 // covering the current authorization completely. The error message lists
@@ -104,6 +181,82 @@ type SyncOptions struct {
 	// (cursorsync.Options.ForceResync); backlog passes do not.
 	Cursor *cursorsync.Options
 
+	// CursorFreshlyEnabled reports that this run's setup just performed
+	// the first-time account-source enable, whose own first sync already
+	// pulled the full authorized window once and uploaded it. The initial
+	// collection round then runs its cursor phase DRAIN-ONLY
+	// (collection.Options.CursorDrainOnly): the server authorization
+	// preflight and the persisted-queue upload still run, but the round
+	// never reads the Cursor credential and never pulls the upstream a
+	// second time — one first connect, exactly one upstream pull. The
+	// backlog passes continue any queue the enable's bounded first sync
+	// left pending (uploads only, never a pull), and a budget decline
+	// still stops the run honestly. It is only ever set by connect.Run
+	// after a SUCCESSFUL enable whose first sync ran; a reconnect over an
+	// existing permit (never freshly enabled) keeps the full forced round
+	// exactly as before.
+	CursorFreshlyEnabled bool
+
+	// CursorFirstSyncFailed carries the first-time account-source enable's
+	// FIRST-SYNC failure (connect's setup already reported it to the
+	// user): the first sync attempt executed — this command's single
+	// upstream pull is spent (or the round stopped before pulling) — so
+	// the initial collection round runs its cursor phase DRAIN-ONLY and
+	// never pulls a second time in the same command. One upstream pull
+	// per command, success or failure. The failure is reported as an
+	// incompleteness reason (never as success); the permit keeps its
+	// honest state (pending_first_sync with no watermark advance on a
+	// pull failure) and the next run — a connect or the scheduled
+	// collection — retries it. It is only set by connect.Run when the
+	// enable's first sync actually ran and failed (a declined
+	// confirmation, a capability or credential failure before any permit
+	// existed leaves it empty: no permit exists, so the initial round
+	// keeps its historical clean skip).
+	CursorFirstSyncFailed string
+
+	// InitialLock is a state lock the CALLER already holds and hands over
+	// for this run's INITIAL collection round (phase 1): Sync runs that
+	// round through collection.RunLocked under this exact lock instead of
+	// letting collection.Run acquire its own, so connect's setup and its
+	// initial collection become one continuous hold — no window in which
+	// a scheduled collection task could interleave, sync pending batches
+	// under the old authorization and make this run mistake the mutated
+	// state for its own clean coverage.
+	//
+	// Ownership: once passed, Sync owns the release and guarantees it
+	// exactly once on every path — normally right after the initial
+	// collection round ends (success, budget decline, pause, refresh
+	// failure and cancellation alike), so the later phases (backlog
+	// passes, history retransmission) can acquire their own locks; and on
+	// any exit that never reaches that round (validation errors, the
+	// dry-run and override branches — which release before anything that
+	// acquires — and a confirmation abort) through the deferred safety
+	// release. The caller must not close the lock itself once handed
+	// over. Nil (every caller but connect.Run) keeps the self-locking
+	// behavior: phase 1 acquires and releases the lock itself, retrying
+	// while it is busy.
+	InitialLock *runlock.Lock
+
+	// CaptureResyncSnapshot switches the history retransmission's scope
+	// from the caller's static ResyncSnapshot to the snapshot the INITIAL
+	// collection round captures in-lock (collection.Options.
+	// CaptureSyncedBatchIDs): the device outbox's synced-batch ids frozen
+	// after the authorization refresh succeeded and before any source
+	// scanning or upload of this run. It is the §6.3 point — with
+	// InitialLock the capture sits inside the same continuous hold that
+	// started at connect's setup, so nothing can sync batches between the
+	// authorization refresh and the freeze. (One documented ordering
+	// exception: an account source first-enabled in connect's setup
+	// uploads through its own source-batch queue BEFORE this round, under
+	// the enable's own fresh server preflight; it never writes the device
+	// outbox, so it is outside the snapshot's universe by design.)
+	//
+	// It is only meaningful for callers that run the collection phase
+	// (connect); an explicit ResyncSnapshot still takes precedence, and
+	// neither field set (the resync CLI) keeps the full-archive
+	// semantics exactly as before.
+	CaptureResyncSnapshot bool
+
 	// AuthorizedTools lists the tools the driving authorization activated
 	// (connect passes its activated set). It disambiguates the
 	// "no enabled source grants" collection skip: with no authorized
@@ -123,11 +276,31 @@ type SyncOptions struct {
 	// to the hook; returning an error aborts the whole sync with nothing
 	// collected or uploaded. The pre-run plan lists the ALREADY-SYNCED
 	// archive only — batches the collection phase will sync during this
-	// run are not in it, and the executed retransmission re-plans after
-	// collection so they join then. Nil (connect) skips interaction
-	// entirely: the connect link is itself the user's authorization
-	// gesture, and the executed phase prints its plan instead.
+	// run are not in it; without a ResyncSnapshot the executed
+	// retransmission re-plans after collection so they join then, while
+	// a snapshot keeps them excluded (see ResyncSnapshot). Nil (connect)
+	// skips interaction entirely: the connect link is itself the user's
+	// authorization gesture, and the executed phase prints its plan
+	// instead.
 	ResyncConfirm func(resync.Plan) error
+	// ResyncSnapshot restricts the history retransmission to the outbox
+	// batches that were already synced when it was captured. connect's
+	// automatic flow no longer passes one here — it sets
+	// CaptureResyncSnapshot, and the initial collection round captures
+	// the snapshot in-lock after the authorization refresh and before
+	// any of this run's uploads (the §6.3 point) — so the automatic pass
+	// covers exactly the pre-run synced history and never immediately
+	// replays the batches this run's own collection uploads (on a first
+	// install it retransmits nothing). An explicitly passed snapshot
+	// still takes precedence over the captured one.
+	//
+	// nil (the resync CLI and every other caller) keeps the original
+	// full-archive semantics. The snapshot only shapes a NEW
+	// retransmission job: an unfinished journal resumes its frozen plan,
+	// and a consent-scope change re-plans the complete synced history —
+	// both deliberately ignore it. A non-nil snapshot with zero batch
+	// ids means "nothing was synced yet" and is distinct from nil.
+	ResyncSnapshot *resync.SyncedBatchSnapshot
 	// ResyncProgress reports each batch outcome during retransmission.
 	ResyncProgress func(resync.ProgressEvent)
 	// ResyncDryRun plans the retransmission offline: no collection phase,
@@ -156,9 +329,91 @@ type SyncOptions struct {
 	// ResyncOverrideProgress reports each override batch outcome.
 	ResyncOverrideProgress func(resync.OverrideProgressEvent)
 	// MaxBacklogPasses bounds the extra drain passes (defaults to
-	// DefaultMaxBacklogPasses).
+	// DefaultMaxBacklogPasses for unbudgeted runs; a budgeted run that
+	// leaves this unset is bounded by the budget itself instead — see
+	// Budget).
 	MaxBacklogPasses int
+	// MaxTotalBatches optionally caps the total real ingest POST attempts
+	// across ALL THREE queues of the run — the device outbox drain, the
+	// account-source uploads and the history retransmission. When Budget
+	// is nil and this is positive, Sync builds a total-only shared budget
+	// from it. Zero means no total cap. Negative is rejected. The
+	// per-pass bounds (collection/cursorsync MaxBatches) are preserved on
+	// top of it: they bound each pass, the budget bounds the run.
+	MaxTotalBatches int
+	// Budget optionally supplies the shared run budget directly. Every
+	// sending layer of the phases below — the device outbox drain
+	// ("device" queue), the account-source uploads ("cursor" queue) and
+	// the history retransmission ("history" queue) — reserves one unit
+	// under it immediately before its real POST, so the three queues
+	// share one total (and, when configured, one deadline and per-queue
+	// caps). A decline stops the affected phase gracefully: the declined
+	// batch was never POSTed and stays pending, the history job stays
+	// resumable, and the run reports ErrSyncIncomplete (never a hard
+	// failure, never success). It takes precedence over MaxTotalBatches.
+	//
+	// Nil with MaxTotalBatches > 0 builds a total-only budget; nil with
+	// MaxTotalBatches == 0 keeps the run completely unbudgeted — the
+	// explicit resync CLI semantics, exactly as before (bounded backlog
+	// passes, no total cap).
+	Budget *syncbudget.Budget
+	// Retry is the run's single bounded retry policy
+	// (internal/syncretry) for TRANSIENT ingest send failures. connect's
+	// automatic flow wires one policy built against the run's ctx
+	// deadline; the resync CLI leaves it nil and keeps the historical
+	// single-shot semantics. When set it threads — unchanged — into
+	// every sending queue of the run: the device outbox drain
+	// (collection.Options.Retry), the account-source uploads
+	// (cursorsync.Options.Retry, the first-time enable's round included)
+	// and the history retransmission (resync.Options.Retry). The retry
+	// loop stays INSIDE each POST's send (one layer, never wrapped
+	// around a queue or a pass): every attempt resends the same batch ID
+	// with the same immutable bytes, re-runs the fresh self preflight
+	// and the scope/privacy gates, and reserves the shared Budget again
+	// before its real POST — a decline stays a final error that stops
+	// the loop without waiting. Callers must build the policy with an
+	// explicit run deadline (WithRunDeadline, ideally the ctx deadline)
+	// and a non-zero random Jitter.
+	Retry *syncretry.Policy
+	// Progress receives the unified collection progress events: the
+	// collection rounds (initial and backlog passes) emit their stage,
+	// queue-snapshot, per-batch and heartbeat events through their own
+	// emitters; connect adds its own phase markers (backlog, history)
+	// and adapts the history retransmission's per-batch outcomes into
+	// the same stream. Nil keeps the behavior identical. Invocations are
+	// serialized (never concurrent) but may originate from a heartbeat
+	// goroutine.
+	Progress func(collection.ProgressEvent)
 }
+
+// ResyncStopCode classifies how the history retransmission phase ended
+// (plan §6.5's history block). It is a closed enum assigned at every
+// site that sets ResyncSummary.Skipped / NotApplicable / Err, so the
+// stable summary classifies from structure and never matches the
+// message text. The empty value means the phase never recorded an end
+// (it did not run).
+type ResyncStopCode string
+
+const (
+	// ResyncStopCompleted: the phase ran and completed (a dry run with
+	// a plan counts as completing its offline scope).
+	ResyncStopCompleted ResyncStopCode = "completed"
+	// ResyncStopBusy: the state lock stayed busy; nothing ran.
+	ResyncStopBusy ResyncStopCode = "busy"
+	// ResyncStopPaused: the server paused the device; nothing ran.
+	ResyncStopPaused ResyncStopCode = "paused"
+	// ResyncStopBudget: the shared run budget declined the phase's
+	// uploads; the job stays resumable.
+	ResyncStopBudget ResyncStopCode = "budget"
+	// ResyncStopNothingEligible: no synced history matches the current
+	// local grants (an authorization verdict, not a failure).
+	ResyncStopNothingEligible ResyncStopCode = "nothing_eligible"
+	// ResyncStopFailed: the phase failed with a hard error.
+	ResyncStopFailed ResyncStopCode = "failed"
+	// ResyncStopStopped: the job ran but stopped before finishing
+	// (resumable).
+	ResyncStopStopped ResyncStopCode = "stopped"
+)
 
 // ResyncSummary is connect's compact view of one retransmission round.
 // It never claims full coverage: Remaining carries exactly what a resume
@@ -180,6 +435,10 @@ type ResyncSummary struct {
 	NotApplicable string
 	// Err is the phase's hard error, if any.
 	Err string
+	// Stop is the structured twin of Skipped / NotApplicable / Err and
+	// the completion state: a closed ResyncStopCode assigned at every
+	// phase-end site, so the §6.5 summary classifies from structure.
+	Stop ResyncStopCode
 
 	JobID     string
 	Resumed   bool
@@ -203,8 +462,14 @@ type ResyncSummary struct {
 	ExcludedPending     int
 	ExcludedReorganized int
 	ExcludedLocalGrant  int
-	QuarantinedRecords  int
-	Stopped             string
+	// ExcludedAfterSnapshot counts synced batches the retransmission
+	// plan excluded because they were synced after connect captured its
+	// snapshot — the batches this run's own collection uploaded, which
+	// are deliberately not replayed immediately. Zero whenever no
+	// snapshot restricted the pass.
+	ExcludedAfterSnapshot int
+	QuarantinedRecords    int
+	Stopped               string
 }
 
 // BacklogSummary reports the extra drain passes.
@@ -237,13 +502,38 @@ type SyncResult struct {
 	Resync ResyncSummary
 	// Backlog summarizes the extra drain passes.
 	Backlog BacklogSummary
+	// BudgetExhausted is true when the run-wide POST total or deadline
+	// prevents further attempts. A queue-only cap is reported separately
+	// through the backlog stop reason and pending counts.
+	BudgetExhausted bool
 	// Incomplete lists every incompleteness reason, in phase order.
 	Incomplete []string
+	// accountIncomplete is the structural twin of the account-source
+	// completion reasons evaluateIncomplete appends (the accountTools
+	// loop): set exactly when at least one such reason was actually
+	// added, so the §6.5 summary can key its account verdict codes on
+	// the marker plus the cursor round outcome — never on the outcome
+	// alone, which a run whose authorization never owed the account
+	// source holds as its clean steady state. Unexported on purpose:
+	// connect-internal classification state, not contract surface.
+	// Zeroed at the start of every evaluation.
+	accountIncomplete bool
+	// firstSyncIncomplete is the structural twin of the
+	// CursorFirstSyncFailed reason: this run's setup attempted the
+	// first-time account-source enable and its first sync executed
+	// without completing (the permit keeps pending_first_sync and the
+	// collection round ran drain-only). Set exactly when that reason
+	// was added, so the summary never has to guess from the permit's
+	// observed status whether a pending_first_sync permit is this
+	// run's failed first sync or an unrelated leftover. Zeroed at the
+	// start of every evaluation.
+	firstSyncIncomplete bool
 }
 
 // Sync performs the post-authorization sync orchestration: initial
-// collection, history retransmission under an exclusive lock, then
-// bounded backlog drain passes. The caller must not hold the state lock.
+// collection, backlog drain passes over the pending device and
+// account-source queues, then the history retransmission under an
+// exclusive lock. The caller must not hold the state lock.
 //
 // For the resync CLI: drive it with the bound server URL, your
 // interactive ResyncConfirm (Sync invokes it before ANY collection or
@@ -252,7 +542,38 @@ type SyncResult struct {
 // plan (it skips collection — there is no collection dry-run — and never
 // touches the lock or disk). Without ResyncConfirm there is no
 // interaction: connect proceeds under its own authorization gesture.
+// Leaving ResyncSnapshot nil (the CLI does) keeps the explicit pass's
+// original full-archive semantics; connect.Run instead sets
+// CaptureResyncSnapshot (plus InitialLock), so its history phase is
+// restricted to the snapshot the initial collection round captures
+// in-lock after the authorization refresh. Leaving Budget and
+// MaxTotalBatches unset (the CLI does) keeps the run unbudgeted with the
+// historical bounded-pass backlog behavior.
 func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
+	// The setup-lock handoff safety net comes FIRST, before any
+	// validation: a caller that handed its state lock in must get it
+	// back released on EVERY exit — including the early parameter
+	// failures below (an empty state directory, a negative total) —
+	// otherwise the lock would leak and every later process would see
+	// ErrBusy. The one-shot release is normally consumed by the phase-1
+	// wrapper (right after the initial collection round: success, budget
+	// decline, pause, refresh failure and cancellation alike, so the
+	// backlog and history phases can acquire their own locks); the
+	// deferred call below is the net for every exit that never reaches
+	// that round.
+	releaseInitial := func() {}
+	if opt.InitialLock != nil {
+		initialLock := opt.InitialLock
+		initialReleased := false
+		releaseInitial = func() {
+			if !initialReleased {
+				initialReleased = true
+				_ = initialLock.Close()
+			}
+		}
+		defer releaseInitial()
+	}
+
 	stateDir := strings.TrimSpace(opt.StateDir)
 	if stateDir == "" {
 		return SyncResult{}, errors.New("collector state directory is required")
@@ -261,15 +582,41 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	if out == nil {
 		out = io.Discard
 	}
+	// The serialized dispatch for connect's own phase markers and the
+	// history adapter. The collection rounds construct their own
+	// emitters over opt.Progress (serialized by construction); this
+	// wrapper serializes everything connect dispatches BETWEEN rounds.
+	progress := collection.SerialProgress(opt.Progress)
 	now := opt.Now
 	if now == nil {
 		now = time.Now
 	}
 	opt.HTTPClient = newSafeHTTPClient(opt.HTTPClient)
 	opt.StateDir = stateDir
+	if opt.MaxTotalBatches < 0 {
+		return SyncResult{}, errors.New("max total batches must be non-negative")
+	}
+	// Shared run budget: an explicit Budget wins; otherwise a positive
+	// MaxTotalBatches builds a total-only one; otherwise the run is
+	// unbudgeted (the resync CLI semantics).
+	budget := opt.Budget
+	if budget == nil && opt.MaxTotalBatches > 0 {
+		budget = syncbudget.New(syncbudget.WithTotal(opt.MaxTotalBatches))
+	}
+	opt.Budget = budget
+	// A budgeted run is bounded by the budget itself (total, deadline,
+	// per-queue caps), so the historical 10-pass × 5-batch ceiling must
+	// not stop a run whose budget still grants POSTs: the backlog keeps
+	// passing until the queues drain, the budget declines, or a pass
+	// makes no progress. An explicitly configured MaxBacklogPasses always
+	// wins — a caller that asks for a tight pass bound keeps it.
 	maxBacklogPasses := opt.MaxBacklogPasses
 	if maxBacklogPasses <= 0 {
-		maxBacklogPasses = DefaultMaxBacklogPasses
+		if budget != nil {
+			maxBacklogPasses = maxBacklogPassesUnbounded
+		} else {
+			maxBacklogPasses = DefaultMaxBacklogPasses
+		}
 	}
 
 	syncRes := SyncResult{}
@@ -278,18 +625,25 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	// drain mutate state (export, drain, quarantine recovery) and have no
 	// dry-run; the state lock is not even created.
 	if opt.ResyncDryRun {
+		// The handoff (if any) was only meant for the initial
+		// collection round, which never runs here — release it before
+		// planning.
+		releaseInitial()
 		res, err := resync.Run(ctx, resync.Options{
 			StateDir:   stateDir,
 			ServerURL:  opt.ServerURL,
 			HTTPClient: opt.HTTPClient,
 			DryRun:     true,
+			Snapshot:   opt.ResyncSnapshot,
 			Now:        now,
 		})
 		syncRes.Resync = summarizeResync(res, true)
 		if err != nil {
 			syncRes.Resync.Err = err.Error()
+			syncRes.Resync.Stop = ResyncStopFailed
 			return syncRes, fmt.Errorf("history retransmission planning failed: %w", err)
 		}
+		syncRes.Resync.Stop = ResyncStopCompleted
 		fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope NOT verified; execution checks consent before every upload")
 		return syncRes, nil
 	}
@@ -301,6 +655,12 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	// repair completes. Connect's own automatic flow never sets this
 	// mode; it exists solely for the explicitly confirmed CLI gesture.
 	if opt.ResyncReplaceExisting {
+		// The handoff (if any) is released BEFORE this branch's own
+		// lock acquisition — the initial collection round it was meant
+		// for never runs here, and holding it through acquireStateLock
+		// would deadlock the retry budget with a self-inflicted
+		// ErrBusy.
+		releaseInitial()
 		if opt.ResyncDryRun {
 			res, err := resync.RunOverride(ctx, resync.OverrideOptions{
 				StateDir:   stateDir,
@@ -312,8 +672,10 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			syncRes.Resync = summarizeOverride(res, true)
 			if err != nil {
 				syncRes.Resync.Err = err.Error()
+				syncRes.Resync.Stop = ResyncStopFailed
 				return syncRes, fmt.Errorf("override planning failed: %w", err)
 			}
+			syncRes.Resync.Stop = ResyncStopCompleted
 			fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope and server capability NOT verified")
 			return syncRes, nil
 		}
@@ -324,6 +686,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		if err != nil {
 			if errors.Is(err, runlock.ErrBusy) {
 				syncRes.Resync.Skipped = fmt.Sprintf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the override pass was NOT run", stateLockRetryTotal)
+				syncRes.Resync.Stop = ResyncStopBusy
 				fmt.Fprintf(out, "override pass: not run (%s)\n", syncRes.Resync.Skipped)
 				return syncRes, nil
 			}
@@ -347,12 +710,15 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		if overrideErr != nil {
 			if errors.Is(overrideErr, syncclient.ErrDevicePaused) {
 				syncRes.Resync.Skipped = overrideErr.Error()
+				syncRes.Resync.Stop = ResyncStopPaused
 				fmt.Fprintf(out, "override pass: skipped (device paused)\n")
 				return syncRes, nil
 			}
 			syncRes.Resync.Err = overrideErr.Error()
+			syncRes.Resync.Stop = ResyncStopFailed
 			return syncRes, fmt.Errorf("override pass failed: %w", overrideErr)
 		}
+		syncRes.Resync.Stop = ResyncStopCompleted
 		fmt.Fprintf(out, "override pass: complete (uploads=%d replaced=%d inserted=%d confirmedKeys=%d)\n", res.Uploads, res.ReplacedRecords, res.InsertedRecords, res.ConfirmedKeys)
 		fmt.Fprintln(out, "normal collection resumes on the next ordinary sync or scheduled run")
 		return syncRes, nil
@@ -372,12 +738,14 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			ServerURL:  opt.ServerURL,
 			HTTPClient: opt.HTTPClient,
 			DryRun:     true,
+			Snapshot:   opt.ResyncSnapshot,
 			Now:        now,
 		})
 		if planErr != nil {
 			if !errResyncNothingEligible(planErr) {
 				syncRes.Resync = summarizeResync(planRes, true)
 				syncRes.Resync.Err = planErr.Error()
+				syncRes.Resync.Stop = ResyncStopFailed
 				return syncRes, fmt.Errorf("history retransmission planning failed: %w", planErr)
 			}
 			fmt.Fprintln(out, "plan note: no synced history is eligible under the current local grants; source scanning may still upload usage")
@@ -389,54 +757,158 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		}
 	}
 
-	// Phase 1: initial collection round.
+	// Phase 1: initial collection round. The pass bound stays the
+	// per-pass DefaultMaxSyncBatches (lock granularity); the shared
+	// budget — not a pre-min of the pass bound — enforces any total,
+	// declining mid-drain without losing the drained part. A run whose
+	// setup just performed the first-time cursor enable runs the round's
+	// cursor phase drain-only (no second upstream pull); every other
+	// run — a reconnect, the resync CLI — keeps the full cursor round.
 	fmt.Fprintf(out, "running initial collection...\n")
 	collectOpts := collection.Options{
-		StateDir:         stateDir,
-		ServerURL:        opt.ServerURL,
-		MaxBatches:       collection.DefaultMaxSyncBatches,
-		HTTPClient:       opt.HTTPClient,
-		Now:              now,
-		HomeDir:          opt.HomeDir,
-		CollectorVersion: opt.CollectorVersion,
-		Cursor:           cursorOptionsForCollection(opt, true),
+		StateDir:              stateDir,
+		ServerURL:             opt.ServerURL,
+		MaxBatches:            collection.DefaultMaxSyncBatches,
+		HTTPClient:            opt.HTTPClient,
+		Now:                   now,
+		HomeDir:               opt.HomeDir,
+		CollectorVersion:      opt.CollectorVersion,
+		Budget:                budget,
+		Retry:                 opt.Retry,
+		Cursor:                cursorOptionsForCollection(opt, true),
+		CursorDrainOnly:       opt.CursorFreshlyEnabled || opt.CursorFirstSyncFailed != "",
+		CaptureSyncedBatchIDs: opt.CaptureResyncSnapshot,
+		Progress:              opt.Progress,
 	}
-	collectRes, err := runCollectionPass(ctx, collectOpts)
+	if collectOpts.Cursor != nil {
+		collectOpts.Cursor.Budget = budget
+	}
+	var collectRes collection.Result
+	var collectErr error
+	if opt.InitialLock != nil {
+		// The continuous hold: the initial round runs under the
+		// handed-over setup lock (no releasing gap between connect's
+		// setup and this round — a scheduled task cannot interleave).
+		// The wrapper releases the handoff exactly when the round ends —
+		// success, budget decline, pause, refresh failure and
+		// cancellation alike — so the backlog and history phases below
+		// acquire their own locks. No busy retry here: the lock is held
+		// by construction, and a nested acquire would be a bug.
+		collectRes, collectErr = func() (collection.Result, error) {
+			defer releaseInitial()
+			return collection.RunLocked(ctx, collectOpts, opt.InitialLock)
+		}()
+	} else {
+		collectRes, collectErr = runCollectionPass(ctx, collectOpts)
+	}
 	syncRes.Collection = collectRes
-	if err != nil {
-		return syncRes, fmt.Errorf("initial collection failed: %w", err)
+	if collectErr != nil {
+		if budgetDeclined(collectErr) {
+			// The shared budget declined the next POST mid-round: the
+			// drained part stands, the declined batch stays pending, and
+			// the run continues to the backlog/history phases so they can
+			// report their own honest state under the same budget (a
+			// queue-only decline may even leave room for them).
+			if budgetTotalOrDeadlineDeclined(collectErr) {
+				syncRes.BudgetExhausted = true
+			}
+			fmt.Fprintf(out, "initial collection: stopped at the shared sync budget (the drained part stands, the rest stays pending): %v\n", collectErr)
+		} else {
+			return syncRes, fmt.Errorf("initial collection failed: %w", collectErr)
+		}
 	}
 	printCollectionRound(out, "initial collection", collectRes)
 
-	var runErr error
-
-	// Phase 2: history retransmission under the exclusive state lock. It
-	// always runs — on a first install the freshly synced batches are
-	// retransmitted once more and replay-deduplicated, which is safe and
-	// avoids an unlocked outbox read just to detect the case.
-	if collectRes.GrantSync.Paused {
-		// Pause is a server state, not a run failure — collection treats
-		// it as a skip, and so does this phase. The completeness
-		// evaluation still reports it.
-		syncRes.Resync.Skipped = "server reports collection paused for this device; history retransmission not attempted"
-		fmt.Fprintf(out, "history retransmission: skipped (device paused)\n")
-	} else {
-		summary, hardErr := runResyncPhase(ctx, stateDir, opt, out, now)
-		syncRes.Resync = summary
-		if hardErr != nil {
-			syncRes.Resync.Err = hardErr.Error()
-			runErr = fmt.Errorf("history retransmission failed: %w", hardErr)
-			// Keep going: the backlog drain below is independent, and
-			// fresh pending data must not wait on a history failure. The
-			// error is returned after the remaining phases have reported.
-		}
+	// The history retransmission's scope: the caller's explicit snapshot
+	// wins; a capture-flagged run (connect) uses the §6.3 snapshot the
+	// initial collection round froze in-lock — after the authorization
+	// refresh, before any of this run's uploads (with InitialLock that
+	// capture sits inside the same continuous hold that started at
+	// connect's setup). Nil (the resync CLI and every other caller)
+	// keeps the original full-archive semantics.
+	resyncSnapshot := opt.ResyncSnapshot
+	if resyncSnapshot == nil && opt.CaptureResyncSnapshot {
+		resyncSnapshot = resync.NewSyncedBatchSnapshot(collectRes.SyncedBatchIDs)
 	}
 
-	// Phase 3: backlog drain. The initial round drains at most
-	// DefaultMaxSyncBatches; a reconnect backlog needs more.
-	syncRes, backlogErr := drainBacklog(ctx, syncRes, collectOpts, out, maxBacklogPasses)
-	if backlogErr != nil && runErr == nil {
-		runErr = backlogErr
+	var runErr error
+
+	// Phase order. A BUDGETED run (connect, and every direct drive with
+	// a Budget or a positive MaxTotalBatches) drains the NEW queues
+	// FIRST: pending device and account-source batches are the current
+	// authorization's fresh data and must not wait behind the history
+	// replay. An UNBUDGETED run — the explicit resync CLI and every
+	// caller that sets neither field — keeps the ORIGINAL order (history
+	// retransmission BEFORE the backlog drain): its interactive
+	// confirmation plan lists the already-synced archive only, and
+	// draining the backlog first would fold this run's backlog uploads
+	// (up to DefaultMaxBacklogPasses × DefaultMaxSyncBatches batches)
+	// into the executed retransmission the user never confirmed. In both
+	// orders the initial collection round runs first and its own uploads
+	// do join the executed plan (the documented confirm semantics).
+	runBacklogDrain := func() {
+		// Phase: backlog drain. Each pass drains both queues under one
+		// lock (fair rotation); on a budgeted run the loop keeps passing
+		// until the queues are empty or the budget declines.
+		stageStarted := emitProgressStageStart(progress, "backlog")
+		var backlogErr error
+		syncRes, backlogErr = drainBacklog(ctx, syncRes, collectOpts, out, maxBacklogPasses, budget)
+		emitProgressStageEnd(progress, "backlog", stageStarted)
+		if backlogErr != nil && runErr == nil {
+			runErr = backlogErr
+		}
+	}
+	runHistoryRetransmission := func() {
+		// Phase: history retransmission under the exclusive state lock.
+		// With a snapshot (connect — captured by the initial collection
+		// round after the authorization refresh) the pass is restricted
+		// to the batches already synced before this run's collection — a
+		// first install retransmits nothing; without one (the resync
+		// CLI) the pass replays the complete synced archive, which the
+		// server de-duplicates. Either way the phase runs: the snapshot
+		// was captured under the run's own continuous lock, so no
+		// unlocked outbox read is needed to detect the first-install
+		// case.
+		historyStageStarted := emitProgressStageStart(progress, "history")
+		defer emitProgressStageEnd(progress, "history", historyStageStarted)
+		switch {
+		case collectRes.GrantSync.Paused:
+			// Pause is a server state, not a run failure — collection
+			// treats it as a skip, and so does this phase. The
+			// completeness evaluation still reports it.
+			syncRes.Resync.Skipped = "server reports collection paused for this device; history retransmission not attempted"
+			syncRes.Resync.Stop = ResyncStopPaused
+			fmt.Fprintf(out, "history retransmission: skipped (device paused)\n")
+		case historyBlockedByBudget(syncRes, resyncSnapshot, budget):
+			// The shared budget can no longer grant ANY history POST
+			// (the run-wide total is spent, or a total/deadline decline
+			// already surfaced in an earlier phase) and the phase has
+			// targets to cover. Skip it BEFORE any lock, plan or
+			// preflight: nothing could be sent, and the honesty contract
+			// is served by the incompleteness report, not by a doomed
+			// preflight round trip.
+			syncRes.Resync.Skipped = "the run's shared sync budget was exhausted before the history retransmission; re-run connect or toktrail resync --all to resume it under a fresh budget"
+			syncRes.Resync.Stop = ResyncStopBudget
+			syncRes.BudgetExhausted = true
+			fmt.Fprintf(out, "history retransmission: not run (the shared sync budget is exhausted; nothing was sent or lost)\n")
+		default:
+			summary, hardErr, budgetStopped := runResyncPhase(ctx, stateDir, opt, resyncSnapshot, out, now, progress)
+			syncRes.Resync = summary
+			if budgetStopped {
+				syncRes.BudgetExhausted = true
+			}
+			if hardErr != nil {
+				syncRes.Resync.Err = hardErr.Error()
+				runErr = fmt.Errorf("history retransmission failed: %w", hardErr)
+			}
+		}
+	}
+	if budget == nil {
+		runHistoryRetransmission()
+		runBacklogDrain()
+	} else {
+		runBacklogDrain()
+		runHistoryRetransmission()
 	}
 
 	// Completeness: an authorization that was not fully covered is
@@ -481,10 +953,35 @@ func checkHistoryOwnership(stateDir string) error {
 // lock. A busy lock after the retry budget and a server-side pause are
 // reported through ResyncSummary.Skipped (the completeness evaluation
 // turns them into an incomplete result); an authorization-driven "nothing
-// eligible" outcome is reported through NotApplicable; every other
-// failure is a hard error returned as-is for the caller to wrap.
-func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, out io.Writer, now func() time.Time) (ResyncSummary, error) {
-	summary := ResyncSummary{}
+// eligible" outcome is reported through NotApplicable; a decline of the
+// shared run budget is a graceful stop (budgetStopped=true, the journal
+// stays resumable); every other failure is a hard error returned as-is
+// for the caller to wrap.
+func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snapshot *resync.SyncedBatchSnapshot, out io.Writer, now func() time.Time, progress func(collection.ProgressEvent)) (summary ResyncSummary, hardErr error, budgetStopped bool) {
+	summary = ResyncSummary{}
+
+	// The history phase's own emitter: the retransmission can be long,
+	// and no collection round is alive at this point (the backlog
+	// passes have finished), so its ticker never overlaps a round's. A
+	// nil progress keeps everything unwired.
+	var emitter *collection.ProgressEmitter
+	resyncProgress := progressResyncOrDefault(opt.ResyncProgress, out)
+	if progress != nil {
+		emitter = collection.NewProgressEmitter(ctx, progress, collection.DefaultProgressHeartbeat)
+		defer emitter.Stop()
+		emitter.EnterStage("history")
+		base := resyncProgress
+		resyncProgress = func(ev resync.ProgressEvent) {
+			// The historical human output stays byte-for-byte; the
+			// unified stream gets the adapted batch event alongside.
+			// The done outcome's counts are aggregates over the
+			// parent's stored receipts (earlier rounds included), so
+			// they are NEVER folded into this round's processing rate —
+			// the history phase reports no rate of its own.
+			base(ev)
+			emitter.Dispatch(historyBatchEvent(ev))
+		}
+	}
 
 	// resync.Run never locks; this phase owns the exclusive state lock.
 	// A scheduled collection task may hold it right after connect
@@ -493,18 +990,22 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, out i
 	if err != nil {
 		if errors.Is(err, runlock.ErrBusy) {
 			summary.Skipped = fmt.Sprintf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the history was NOT retransmitted", stateLockRetryTotal)
+			summary.Stop = ResyncStopBusy
 			fmt.Fprintf(out, "history retransmission: not run (%s)\n", summary.Skipped)
-			return summary, nil
+			return summary, nil, false
 		}
-		return summary, fmt.Errorf("acquire state lock for history retransmission: %w", err)
+		return summary, fmt.Errorf("acquire state lock for history retransmission: %w", err), false
 	}
 	res, resyncErr := resync.Run(ctx, resync.Options{
 		StateDir:   stateDir,
 		ServerURL:  opt.ServerURL,
 		HTTPClient: opt.HTTPClient,
 		MaxBatches: opt.ResyncMaxBatches,
+		Budget:     opt.Budget,
+		Retry:      opt.Retry,
+		Snapshot:   snapshot,
 		Confirm:    confirmResyncOrDefault(opt, out),
-		Progress:   progressResyncOrDefault(opt.ResyncProgress, out),
+		Progress:   resyncProgress,
 		Now:        now,
 	})
 	_ = lock.Close()
@@ -518,11 +1019,21 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, out i
 	// revision at zero, which the completeness evaluation reports as
 	// unconfirmed — never as success.
 	if summary.ConsentRevision <= 0 && (resyncErr == nil || errResyncNothingEligible(resyncErr)) {
-		if self, err := syncclient.FetchDeviceSelf(ctx, statedir.New(stateDir), syncclient.Options{
-			ServerURL:  opt.ServerURL,
-			HTTPClient: opt.HTTPClient,
-		}); err == nil {
-			summary.ConsentRevision = self.ConsentRevision
+		// Durable authorization-attempt accounting precedes this
+		// authenticated self GET, mirroring the grant sync, the sync
+		// preflight and resync's own authorization check. If the
+		// accounting write fails, ZERO HTTP happens: the confirmation is
+		// best-effort by design, so the run keeps its honest unconfirmed
+		// revision (reported as an incompleteness, never as success) and
+		// the next run re-attempts it — nothing is mutated, so the
+		// failure is fully recoverable.
+		if _, aErr := outbox.New(stateDir).RecordPreflightAttempt(now().UTC()); aErr == nil {
+			if self, err := syncclient.FetchDeviceSelf(ctx, statedir.New(stateDir), syncclient.Options{
+				ServerURL:  opt.ServerURL,
+				HTTPClient: opt.HTTPClient,
+			}); err == nil {
+				summary.ConsentRevision = self.ConsentRevision
+			}
 		}
 	}
 	if resyncErr != nil {
@@ -530,8 +1041,9 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, out i
 			// Pause mirrors collection's semantics: a server state, not
 			// a run failure. Nothing was sent; the job stays resumable.
 			summary.Skipped = resyncErr.Error()
+			summary.Stop = ResyncStopPaused
 			fmt.Fprintf(out, "history retransmission: skipped (device paused)\n")
-			return summary, nil
+			return summary, nil, false
 		}
 		if errResyncNothingEligible(resyncErr) {
 			// No synced batch matches the currently enabled local grants.
@@ -539,13 +1051,33 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, out i
 			// an authorization verdict (sources deliberately disabled or
 			// narrowed), not a failure: report it, do not alarm.
 			summary.NotApplicable = resyncErr.Error()
+			summary.Stop = ResyncStopNothingEligible
 			fmt.Fprintf(out, "history retransmission: nothing eligible under the current authorization (%v)\n", resyncErr)
-			return summary, nil
+			return summary, nil, false
 		}
-		return summary, resyncErr
+		if budgetDeclined(resyncErr) {
+			// The shared run budget declined the next history POST after
+			// its authorization preflight but before the POST itself:
+			// nothing was submitted, the declined target was NOT marked
+			// failed, and the journal keeps the job resumable (resync's
+			// own stop contract). A budget stop is an honest incomplete,
+			// never a hard run failure.
+			summary.Stop = ResyncStopBudget
+			fmt.Fprintf(out, "history retransmission: stopped at the shared sync budget (the job stays resumable; nothing was marked failed)\n")
+			return summary, nil, true
+		}
+		summary.Stop = ResyncStopFailed
+		return summary, resyncErr, false
+	}
+	// A clean round that did not finish its plan is a resumable stop,
+	// not a completion (resync's own stop contract).
+	if summary.Completed {
+		summary.Stop = ResyncStopCompleted
+	} else {
+		summary.Stop = ResyncStopStopped
 	}
 	printResyncSummary(out, summary)
-	return summary, nil
+	return summary, nil, false
 }
 
 // errResyncNothingEligible matches the stable wordings resync uses when
@@ -565,41 +1097,310 @@ func errResyncNothingEligible(err error) bool {
 		strings.Contains(msg, "no local source grants are configured")
 }
 
-// drainBacklog runs extra collection passes while device or cursor
-// batches remain pending, and records the outcome on syncRes.
+// budgetDeclined reports whether err is a decline of the shared run
+// budget — the run-wide total, a queue's own cap, or the budget's own
+// deadline ran out BEFORE an ingest POST was made (the sending layers
+// reserve right before the POST and return the sentinel on a decline).
+// It mirrors resync's own budgetDecline classification. A canceled
+// caller context is deliberately NOT a decline: it keeps the original
+// failure semantics instead of being dressed up as a budget stop.
+func budgetDeclined(err error) bool {
+	return errors.Is(err, syncbudget.ErrTotalExhausted) ||
+		errors.Is(err, syncbudget.ErrQueueExhausted) ||
+		errors.Is(err, syncbudget.ErrDeadlineExceeded)
+}
+
+// budgetTotalOrDeadlineDeclined reports whether the decline leaves no
+// room for ANY queue: the run-wide total is spent, or the budget's own
+// deadline is past (Reserve checks it before every grant, so a passed
+// deadline declines every later attempt too). A queue-only decline does
+// not: the other queues may still post.
+func budgetTotalOrDeadlineDeclined(err error) bool {
+	return errors.Is(err, syncbudget.ErrTotalExhausted) ||
+		errors.Is(err, syncbudget.ErrDeadlineExceeded)
+}
+
+// deviceQueueSpent reports whether the device outbox queue already spent
+// a configured per-queue cap of its own (the account and history queues
+// are unaffected by it). A budget without a device queue cap — the
+// default — never reports true.
+func deviceQueueSpent(budget *syncbudget.Budget) bool {
+	remaining, capped := budget.QueueRemaining(budgetQueueDevice)
+	return capped && remaining <= 0
+}
+
+// cursorQueueSpent is deviceQueueSpent's mirror for the account-source
+// ("cursor") queue: true only when that queue spent a configured
+// per-queue cap of its own, which the device and history queues are
+// unaffected by. A budget without a cursor queue cap never reports true.
+func cursorQueueSpent(budget *syncbudget.Budget) bool {
+	remaining, capped := budget.QueueRemaining(budgetQueueCursor)
+	return capped && remaining <= 0
+}
+
+// historyBlockedByBudget reports whether the history retransmission
+// phase must be skipped because the shared budget can no longer grant
+// ANY history POST, and the phase actually has targets to cover. It is
+// true only when both hold:
 //
-// The passes reuse the initial round's collection wiring EXCEPT the
-// forced cursor round: ForceResync is a one-round recovery semantic (a
-// full-window pull that re-emits unchanged events at fresh revisions),
-// and repeating it every pass would re-pull and re-emit the whole cursor
-// history each time, so a large cursor backlog could never converge.
-// The cursor wiring is therefore cloned with the force off on entry.
-func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collection.Options, out io.Writer, maxPasses int) (SyncResult, error) {
+//   - the run-wide total is spent or a total/deadline decline already
+//     surfaced in an earlier phase (a queue-only decline of the device or
+//     account queue leaves the history queue its room, and an
+//     unconfirmed deadline is left to the phase itself, which stops
+//     gracefully on its first declined target); and
+//   - the phase has possible targets: a caller snapshot with batch ids
+//     (or no snapshot at all, meaning the full synced archive). An empty
+//     connect snapshot — a first install — plans nothing and completes
+//     offline, so it runs and completes honestly rather than being
+//     reported as not-run.
+//
+// Skipping is what keeps a budget-exhausted run from burning a lock
+// acquisition, a job plan and an authorization preflight on a POST that
+// the budget has already declined.
+func historyBlockedByBudget(syncRes SyncResult, snapshot *resync.SyncedBatchSnapshot, budget *syncbudget.Budget) bool {
+	if budget == nil {
+		return false
+	}
+	blocked := syncRes.BudgetExhausted
+	if !blocked {
+		if remaining, ok := budget.Remaining(); ok && remaining <= 0 {
+			blocked = true
+		}
+	}
+	if !blocked {
+		return false
+	}
+	return snapshot == nil || len(snapshot.BatchIDs) > 0
+}
+
+// runBacklogPass runs ONE backlog drain pass under a single exclusive state
+// lock, acquired through the shared bounded busy retry: while another
+// collector process (typically the scheduled task) holds the lock, the pass
+// waits and retries instead of failing the drain; past the retry budget it
+// returns runlock.ErrBusy having performed no work, which drainBacklog
+// reports as the pass's failure exactly like a failed drain.
+//
+// The lock is held CONTINUOUSLY across the pass's three sub-phases (see
+// runBacklogPassLocked): the device authorization refresh and drain, the
+// account-source drain, and the terminal authorization check. One lock for
+// all three is the point: with per-sub-phase locking, a scheduled collection
+// could interleave between them — mutating the outbox and the grant view the
+// terminal check compares against — so the pass would either work on stale
+// state or fail with spurious lock contention. The locked entry points never
+// take the runlock themselves (the flock is per open file description, so a
+// nested acquire would fail with ErrBusy); they verify the handed-over lock
+// handle instead (runlock.Lock.Validate).
+func runBacklogPass(ctx context.Context, collectOpts collection.Options, cursorPending int, skipDevice, skipCursor bool) (collection.Result, error) {
+	// One emitter for the WHOLE pass (device drain, account drain and
+	// the terminal authorization check): the collection rounds inside
+	// reuse it through WithProgressEmitter, so no two heartbeat tickers
+	// ever overlap and this single deferred Stop owns the goroutine. A
+	// nil Progress keeps the pass completely unwired.
+	if collectOpts.Progress != nil {
+		emitter := collection.NewProgressEmitter(ctx, collectOpts.Progress, collection.DefaultProgressHeartbeat)
+		defer emitter.Stop()
+		collectOpts = collectOpts.WithProgressEmitter(emitter)
+		if collectOpts.Cursor != nil {
+			// The backlog's account drain cannot correlate events to
+			// entries positionally, so its provenance label is unknown.
+			cursor := *collectOpts.Cursor
+			cursor.Progress = collection.CursorProgressEvents(emitter, collection.OriginUnknown)
+			collectOpts.Cursor = &cursor
+		}
+	}
+	lock, err := acquireStateLock(ctx, collectOpts.StateDir)
+	if err != nil {
+		if errors.Is(err, runlock.ErrBusy) {
+			// Past the retry budget: no work was performed. The pass
+			// stays a hard failure (the initial collection pass treats
+			// an exhausted budget the same way); the pending counts the
+			// caller already holds remain the honest state.
+			return collection.Result{}, fmt.Errorf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the backlog pass was NOT run: %w", stateLockRetryTotal, err)
+		}
+		// A cancelled context or a hard lock failure.
+		return collection.Result{}, err
+	}
+	defer lock.Close()
+	return runBacklogPassLocked(ctx, collectOpts, cursorPending, skipDevice, skipCursor, lock)
+}
+
+// runBacklogPassLocked is runBacklogPass's already-held-lock path: the whole
+// pass — device drain, account drain, terminal authorization check — under
+// the caller's lock. It drains persisted device and account queues without
+// rescanning source files or pulling account history; authorization is
+// refreshed around each sub-phase and account-source fence checks still run
+// before uploads.
+func runBacklogPassLocked(ctx context.Context, collectOpts collection.Options, cursorPending int, skipDevice, skipCursor bool, lock *runlock.Lock) (collection.Result, error) {
+	collectOpts.RefreshDrainGrants = true
+	collectOpts.SkipDeviceDrain = skipDevice
+	res, err := collection.DrainPendingLocked(ctx, collectOpts, lock)
+	if err != nil || cursorPending == 0 || skipCursor {
+		// skipCursor: the account queue already spent its own budget
+		// cap, so this pass deliberately drains the device queue only —
+		// the caller keeps the known cursor pending count (this result
+		// carries no cursor recount to adopt).
+		return res, err
+	}
+	if res.GrantSync.Paused {
+		res.Cursor.PendingRemaining = cursorPending
+		res.Cursor.Skipped = "server reports collection paused"
+		return res, nil
+	}
+	if collectOpts.Cursor == nil {
+		res.Cursor.PendingRemaining = cursorPending
+		return res, errors.New("cursor backlog exists but cursor options are unavailable")
+	}
+	cursor, err := cursorsync.DrainPendingLocked(ctx, *collectOpts.Cursor, cursorsync.Gate{AllowedTools: res.GrantSync.AllowedTools}, lock)
+	if cursor.Skipped != "" && cursor.PendingRemaining == 0 {
+		cursor.PendingRemaining = cursorPending
+	}
+	res.Cursor = cursor
+	if err != nil {
+		return res, err
+	}
+	checkOpts := collectOpts
+	checkOpts.SkipDeviceDrain = true
+	checked, err := collection.DrainPendingLocked(ctx, checkOpts, lock)
+	if err != nil {
+		return res, err
+	}
+	// The terminal check's verdict is passed through structurally: a
+	// mid-drain pause stays a pause (batches stay queued), only an
+	// actual revision or active-state drift is a scope change.
+	if res.GrantSync.Active && (!checked.GrantSync.Active || res.GrantSync.ConsentRevision != checked.GrantSync.ConsentRevision) {
+		res.DrainStopped = "server authorization changed during account backlog drain; a new collection is required"
+		res.DrainStop = collection.DrainStopScope
+	} else if checked.DrainStopped != "" {
+		res.DrainStopped = checked.DrainStopped
+		res.DrainStop = checked.DrainStop
+	}
+	res.GrantSync = checked.GrantSync
+	res.PendingRemaining = checked.PendingRemaining
+	res.PendingCounted = checked.PendingCounted
+	return res, nil
+}
+
+// drainBacklog runs the backlog drain passes over the two NEW queues —
+// the device outbox and the account source — until they are empty or a
+// bound stops the loop. Each pass drains BOTH queues under one state
+// lock (see runBacklogPass), so the queues rotate fairly: neither can
+// starve the other while the other still holds batches. On a budgeted
+// run (budget != nil and no explicit pass bound) the loop is bounded
+// only by the budget and the no-progress guard — it drains the queues to
+// empty instead of stopping at the historical pass bound. A budget
+// decline from a pass is a graceful stop, never a failure: the declined
+// batch was never POSTed and stays pending, and the loop records why it
+// stopped for the completeness evaluation.
+func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collection.Options, out io.Writer, maxPasses int, budget *syncbudget.Budget) (SyncResult, error) {
 	if collectOpts.Cursor != nil {
 		cursor := *collectOpts.Cursor
 		cursor.ForceResync = false
 		collectOpts.Cursor = &cursor
 	}
+	// The backlog passes drain BOTH queues without pulling anything by
+	// construction (runBacklogPassLocked drives cursorsync's drain-only
+	// path directly), so the initial round's drain-only marker must not
+	// ride along and suggest a collection.Run cursor phase here.
+	collectOpts.CursorDrainOnly = false
 	var passErr error
 	pending := syncRes.Collection.PendingRemaining
 	cursorPending := syncRes.Collection.Cursor.PendingRemaining
+	// A queue that already spent its OWN budget cap cannot post; skip
+	// its drain so the OTHER queue still advances (once the other queue
+	// is empty too, the loop head below stops). Fairness is symmetric:
+	// a spent device cap must not starve the account queue, and a spent
+	// account (cursor) cap must not starve the device queue.
+	skipDevice := deviceQueueSpent(budget)
+	skipCursor := false
 	for pending > 0 || cursorPending > 0 {
+		if skipDevice && cursorPending == 0 {
+			syncRes.Backlog.Stopped = "the device queue's own sync budget cap is exhausted"
+			break
+		}
+		if skipCursor && pending == 0 {
+			syncRes.Backlog.Stopped = "the cursor queue's own sync budget cap is exhausted"
+			break
+		}
+		if skipDevice && skipCursor {
+			// Both queues spent their own caps while the run-wide
+			// budget still has room: nothing is drainable this run.
+			syncRes.Backlog.Stopped = "both queues' own sync budget caps are exhausted"
+			break
+		}
 		if syncRes.Backlog.Passes >= maxPasses {
 			syncRes.Backlog.Stopped = fmt.Sprintf("backlog pass bound (%d) reached", maxPasses)
 			break
 		}
+		if n, ok := budget.Remaining(); ok && n <= 0 {
+			// The run-wide total is spent: no queue may POST anything,
+			// so no pass is run at all — the pending counts this run
+			// already holds are the honest state.
+			syncRes.Backlog.Stopped = backlogBudgetStopped
+			syncRes.BudgetExhausted = true
+			break
+		}
 		fmt.Fprintf(out, "draining backlog (pendingBatches=%d pendingCursorBatches=%d)...\n", pending, cursorPending)
-		passRes, err := runCollectionPass(ctx, collectOpts)
+		passRes, err := runBacklogPass(ctx, collectOpts, cursorPending, skipDevice, skipCursor)
+		if cursorPending == 0 && syncRes.Backlog.Passes == 0 {
+			passRes.Cursor.Ran = syncRes.Collection.Cursor.Ran
+			passRes.Cursor.Skipped = syncRes.Collection.Cursor.Skipped
+			passRes.Cursor.Status = syncRes.Collection.Cursor.Status
+			passRes.Cursor.Note = syncRes.Collection.Cursor.Note
+		}
 		syncRes.Backlog.Passes++
 		accumulateCollection(&syncRes.Backlog.Result, passRes)
 		if err != nil {
+			if budgetDeclined(err) {
+				// Graceful budget stop. The declining sub-phase already
+				// recounted its own queue (the declined batch stays
+				// pending); the other queue's count is only adopted when
+				// its sub-phase actually ran this pass.
+				pending = passRes.PendingRemaining
+				if passRes.Cursor.Ran || passRes.Cursor.Skipped != "" || passRes.Cursor.PendingRemaining > 0 {
+					cursorPending = passRes.Cursor.PendingRemaining
+				}
+				if !skipDevice && errors.Is(err, syncbudget.ErrQueueExhausted) && cursorPending > 0 && deviceQueueSpent(budget) {
+					// Only the DEVICE queue hit its own cap while the
+					// run-wide budget still has room: keep draining the
+					// account queue with the device drain skipped. This
+					// continuation happens at most once — a later decline
+					// (the account queue's own cap, the total, the
+					// deadline) breaks below, so a capped account queue
+					// can never spin the loop.
+					skipDevice = true
+					continue
+				}
+				if !skipCursor && errors.Is(err, syncbudget.ErrQueueExhausted) && pending > 0 && cursorQueueSpent(budget) {
+					// The MIRROR case: only the CURSOR (account) queue
+					// hit its own cap while the run-wide budget still has
+					// room and the device queue still holds batches: keep
+					// draining the device queue with the cursor drain
+					// skipped. Like the device-side continuation this
+					// happens at most once — a later decline (the device
+					// queue's own cap, the total, the deadline) breaks
+					// below, so neither queue can starve the other or
+					// spin the loop.
+					skipCursor = true
+					continue
+				}
+				if errors.Is(err, syncbudget.ErrQueueExhausted) && cursorQueueSpent(budget) {
+					syncRes.Backlog.Stopped = "the cursor queue's own sync budget cap is exhausted"
+				} else if errors.Is(err, syncbudget.ErrQueueExhausted) && deviceQueueSpent(budget) {
+					syncRes.Backlog.Stopped = "the device queue's own sync budget cap is exhausted"
+				} else {
+					syncRes.Backlog.Stopped = backlogBudgetStopped
+				}
+				if budgetTotalOrDeadlineDeclined(err) {
+					syncRes.BudgetExhausted = true
+				}
+				break
+			}
 			syncRes.Backlog.Err = err.Error()
 			passErr = fmt.Errorf("backlog drain failed: %w", err)
 			break
 		}
 		printCollectionRound(out, fmt.Sprintf("backlog pass %d", syncRes.Backlog.Passes), passRes)
-		if passRes.PendingRemaining == pending && passRes.Cursor.PendingRemaining == cursorPending &&
-			passRes.SyncedBatches == 0 && passRes.Cursor.SyncedBatches == 0 {
+		if !backlogPassMadeProgress(passRes, pending, cursorPending, skipCursor) {
 			// No batch moved and nothing was drained: paused, restricted,
 			// or otherwise stuck. Stop instead of spinning; the
 			// completeness evaluation reports it.
@@ -607,7 +1408,13 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 			break
 		}
 		pending = passRes.PendingRemaining
-		cursorPending = passRes.Cursor.PendingRemaining
+		if !skipCursor || passRes.Cursor.Ran || passRes.Cursor.Skipped != "" || passRes.Cursor.PendingRemaining > 0 {
+			// A skip-cursor pass never runs the cursor sub-phase, so its
+			// zeroed cursor result must not erase the known pending
+			// count; adopt the recount only when the sub-phase ran (or
+			// reported something).
+			cursorPending = passRes.Cursor.PendingRemaining
+		}
 	}
 	syncRes.Backlog.PendingRemaining = pending
 	syncRes.Backlog.CursorPendingRemaining = cursorPending
@@ -623,6 +1430,11 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 		}
 	}
 	return syncRes, passErr
+}
+
+func backlogPassMadeProgress(pass collection.Result, devicePending, cursorPending int, skipCursor bool) bool {
+	cursorUnchanged := skipCursor || pass.Cursor.PendingRemaining == cursorPending
+	return pass.PendingRemaining != devicePending || !cursorUnchanged || pass.SyncedBatches != 0 || pass.Cursor.SyncedBatches != 0
 }
 
 // evaluateIncomplete lists every reason the current authorization was not
@@ -641,6 +1453,10 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 			reasons = append(reasons, reason)
 		}
 	}
+	// Zero the structural twin flags this evaluation owns: a stale
+	// marker from an earlier evaluation must never leak into the next.
+	syncRes.accountIncomplete = false
+	syncRes.firstSyncIncomplete = false
 
 	// Source grants: every skip except a healthy empty scan is a failure
 	// outcome collection reports only through GrantOutcomes.Skipped.
@@ -652,14 +1468,30 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 		}
 	}
 
+	// An authorized source the grant sync could not cover (its default
+	// input is missing on this device) must not read as success: the
+	// authorization names it, but nothing on this device collected it.
+	// User-disabled and unsupported tools are no-concern states. Either
+	// round's grant view counts (the backlog passes refresh it).
+	if concerns := collection.PendingCoverageConcerns(syncRes.Collection.GrantSync.Pending) +
+		collection.PendingCoverageConcerns(syncRes.Backlog.Result.GrantSync.Pending); concerns > 0 {
+		add("%d authorized source(s) are not covered on this device (their default input is missing); the next run retries them", concerns)
+	}
+
 	// Whole-run skips: pause is a server state that must not look like
 	// success; a missing grant set is only normal when the authorization
-	// activated no local tool.
+	// activated no local tool. A no-grants round that drained the
+	// sendable queue (§6.1) has an empty Skipped — the drained counts
+	// speak — so the reason text falls back to a fixed wording.
 	c := syncRes.Collection
 	if c.GrantSync.Paused {
 		add("collection paused by the server: %s", c.Skipped)
 	} else if c.NoGrants && hasAuthorizedLocalTool(opt.AuthorizedTools) {
-		add("no enabled source grants despite authorized tools: %s", c.Skipped)
+		if c.Skipped != "" {
+			add("no enabled source grants despite authorized tools: %s", c.Skipped)
+		} else {
+			add("no enabled source grants despite authorized tools; the device outbox was drained but no local source is scanning")
+		}
 	}
 
 	// Final drain state (the last pass's numbers).
@@ -672,6 +1504,14 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 	}
 	if final.DrainStopped != "" {
 		add("drain stopped early: %s", final.DrainStopped)
+	}
+
+	// A budget stop is its own named incompleteness: the queues above
+	// already carry their honest pending counts, and this reason states
+	// WHY the run stopped covering them — the shared budget, not a
+	// failure — and that nothing was lost.
+	if syncRes.BudgetExhausted {
+		add("the run's shared sync POST budget declined further uploads before the authorization was fully covered; nothing was lost — pending batches stay queued and the history job stays resumable — re-run connect or let the scheduled collection continue under a fresh budget")
 	}
 
 	// Account sources named by the authorization must have completed a
@@ -690,6 +1530,7 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 		cursorRoundExpected(opt.StateDir, final.Cursor.Ran, final.GrantSync.AllowedTools) {
 		accountTools = append(append([]string(nil), accountTools...), cursorsource.ToolName)
 	}
+	accountReasonsBefore := len(reasons)
 	for _, tool := range accountTools {
 		cur := final.Cursor
 		switch {
@@ -702,6 +1543,23 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 		case cur.PendingRemaining > 0:
 			add("account source %s has %d batch(es) still pending", tool, cur.PendingRemaining)
 		}
+	}
+	// The account-source loop actually appended at least one
+	// completion reason: record the structural twin the §6.5 summary
+	// keys its account verdict codes on.
+	syncRes.accountIncomplete = len(reasons) > accountReasonsBefore
+
+	// A first-time enable whose first sync failed inside this run's
+	// setup (CursorFirstSyncFailed): the command already spent its
+	// single upstream pull — or stopped right before it — and the
+	// initial round ran drain-only over the permit, so a clean cursor
+	// round above must NOT read as success. The failure is its own
+	// incompleteness reason; the permit and its queue keep their state
+	// and the next run (connect or the scheduled collection) continues
+	// the source.
+	if opt.CursorFirstSyncFailed != "" {
+		syncRes.firstSyncIncomplete = true
+		add("account source %s did not complete its first sync in this run's setup: %s; the permit and its queue keep their state and the next run continues them", cursorsource.ToolName, opt.CursorFirstSyncFailed)
 	}
 
 	// A cursor round that skipped rows without a stable upstream event id
@@ -877,7 +1735,14 @@ func acquireStateLock(ctx context.Context, stateDir string) (*runlock.Lock, erro
 // round. The first (initial) round forces one full-range recovery pull;
 // backlog rounds must not force again — the forced round re-emits
 // unchanged events at a fresh revision, which is a recovery semantic, not
-// something to repeat every pass.
+// something to repeat every pass. A run whose setup just performed the
+// first-time enable (CursorFreshlyEnabled) runs the initial round's
+// cursor phase drain-only instead (SyncOptions.CursorFreshlyEnabled
+// drives collection.Options.CursorDrainOnly), so the enable's own first
+// sync stays the run's single upstream pull; the ForceResync flag is
+// then moot for that round but stays cleared for clarity. A failed
+// enable — or a reconnect over an existing permit — never sets the
+// marker and keeps the forced full round below exactly as before.
 func cursorOptionsForCollection(opt SyncOptions, force bool) *cursorsync.Options {
 	if opt.Cursor == nil {
 		return nil
@@ -887,25 +1752,34 @@ func cursorOptionsForCollection(opt SyncOptions, force bool) *cursorsync.Options
 	c.ServerURL = opt.ServerURL
 	c.HTTPClient = opt.HTTPClient
 	c.Out = opt.Out
-	c.ForceResync = force
+	c.ForceResync = force && !opt.CursorFreshlyEnabled
+	// One run, one retry policy: the account-source uploads retry under
+	// the same bounded policy (and the same run deadline) as the device
+	// and history queues. An explicitly wired Cursor.Retry still wins so
+	// a specialized caller keeps control.
+	if c.Retry == nil {
+		c.Retry = opt.Retry
+	}
 	return &c
 }
 
-// countSyncedBatches counts the outbox entries already marked synced. It
-// must only be called while holding the state lock (connect's setup phase
-// does) — the outbox is process-shared state.
-func countSyncedBatches(stateDir string) (int, error) {
+// syncedBatchIDs lists the outbox entries already marked synced, in outbox
+// order. It must only be called while holding the state lock (connect's
+// setup phase does) — the outbox is process-shared state. The result is
+// always a usable slice (empty, never nil, when nothing is synced) so the
+// snapshot built from it keeps the empty-set semantics distinct from nil.
+func syncedBatchIDs(stateDir string) ([]string, error) {
 	out, err := outbox.New(stateDir).Load()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	n := 0
+	ids := make([]string, 0, len(out.Batches))
 	for _, b := range out.Batches {
 		if b.Status == outbox.StatusSynced {
-			n++
+			ids = append(ids, b.BatchID)
 		}
 	}
-	return n, nil
+	return ids, nil
 }
 
 // confirmResyncOrDefault builds the confirm hook for the EXECUTED
@@ -972,7 +1846,7 @@ func summarizeOverride(res resync.OverrideResult, ran bool) ResyncSummary {
 func printResyncPlan(out io.Writer, plan resync.Plan) {
 	fmt.Fprintf(out, "resync target: server=%s device=%s\n", plan.ServerURL, plan.DeviceID)
 	fmt.Fprintf(out, "plan: batches=%d records=%d resumed=%t alreadyDone=%d\n", len(plan.Batches), plan.PlannedRecords, plan.Resumed, plan.DoneInJob)
-	fmt.Fprintf(out, "excluded: pendingBatches=%d reorganizedParents=%d localGrantBatches=%d quarantineRecords=%d\n", plan.ExcludedPending, plan.ExcludedReorganized, len(plan.ExcludedLocalGrant), plan.QuarantinedRecords)
+	fmt.Fprintf(out, "excluded: pendingBatches=%d reorganizedParents=%d localGrantBatches=%d afterSnapshotBatches=%d quarantineRecords=%d\n", plan.ExcludedPending, plan.ExcludedReorganized, len(plan.ExcludedLocalGrant), plan.ExcludedAfterSnapshot, plan.QuarantinedRecords)
 	fmt.Fprintln(out, plan.CoverageNote)
 	fmt.Fprintln(out, "De-duplication applies to the current device only; this phase never creates a device or clears progress.")
 }
@@ -997,6 +1871,7 @@ func summarizeResync(res resync.Result, ran bool) ResyncSummary {
 		ExcludedPending:          res.Plan.ExcludedPending,
 		ExcludedReorganized:      res.Plan.ExcludedReorganized,
 		ExcludedLocalGrant:       len(res.Plan.ExcludedLocalGrant),
+		ExcludedAfterSnapshot:    res.Plan.ExcludedAfterSnapshot,
 		QuarantinedRecords:       res.Plan.QuarantinedRecords,
 		Stopped:                  res.Stopped,
 	}
@@ -1018,14 +1893,22 @@ func printResyncSummary(out io.Writer, summary ResyncSummary) {
 	if summary.Blocked > 0 || summary.SkippedOutOfScopeRecords > 0 {
 		fmt.Fprintf(out, "history retransmission: some history was not retransmitted because it is outside the current authorization; original archives remain unchanged.\n")
 	}
+	if summary.ExcludedAfterSnapshot > 0 {
+		fmt.Fprintf(out, "history retransmission: %d batch(es) synced during this run were not replayed (they were just uploaded by this run's collection); a later connect or an explicit toktrail resync --all covers them.\n", summary.ExcludedAfterSnapshot)
+	}
 }
 
 // printCollectionRound prints one collection round's summary with the
-// label the phase reports under.
+// label the phase reports under. A no-grants round that actually drained
+// the sendable queue (§6.1) reports the no-grants fact AND its counts —
+// never a bare "skipped" that hides uploaded or still-pending batches.
 func printCollectionRound(out io.Writer, label string, res collection.Result) {
 	if res.NoGrants {
-		fmt.Fprintf(out, "%s: no enabled source grants; skipped\n", label)
-		return
+		if res.SyncedBatches == 0 && res.PendingRemaining == 0 {
+			fmt.Fprintf(out, "%s: no enabled source grants; skipped\n", label)
+			return
+		}
+		fmt.Fprintf(out, "%s: no enabled source grants; drained the device outbox only\n", label)
 	}
 	fmt.Fprintf(out, "%s: exportedBatches=%d exportedRecords=%d syncedBatches=%d syncedRecords=%d\n",
 		label, res.ExportedBatches, res.ExportedRecords, res.SyncedBatches, res.SyncedRecords)
@@ -1048,10 +1931,13 @@ func accumulateCollection(dst *collection.Result, pass collection.Result) {
 	dst.ExportedRecords += pass.ExportedRecords
 	dst.SyncedBatches += pass.SyncedBatches
 	dst.SyncedRecords += pass.SyncedRecords
+	dst.AttemptedBatches += pass.AttemptedBatches
 	dst.Recovered += pass.Recovered
 	dst.Quarantined = pass.Quarantined
 	dst.PendingRemaining = pass.PendingRemaining
+	dst.PendingCounted = pass.PendingCounted
 	dst.DrainStopped = pass.DrainStopped
+	dst.DrainStop = pass.DrainStop
 	dst.NoGrants = dst.NoGrants || pass.NoGrants
 	if pass.Skipped != "" {
 		dst.Skipped = pass.Skipped
@@ -1070,9 +1956,17 @@ func accumulateCollection(dst *collection.Result, pass collection.Result) {
 	dst.Cursor.SyncedBatches += pass.Cursor.SyncedBatches
 	dst.Cursor.SyncedRecords += pass.Cursor.SyncedRecords
 	dst.Cursor.Ran = dst.Cursor.Ran || pass.Cursor.Ran
-	dst.Cursor.Skipped = pass.Cursor.Skipped
-	dst.Cursor.Status = pass.Cursor.Status
-	dst.Cursor.Note = pass.Cursor.Note
-	dst.Cursor.PendingRemaining = pass.Cursor.PendingRemaining
+	if pass.Cursor.Ran || pass.Cursor.Skipped != "" || pass.Cursor.Status != "" {
+		dst.Cursor.Skipped = pass.Cursor.Skipped
+		dst.Cursor.Status = pass.Cursor.Status
+		dst.Cursor.Note = pass.Cursor.Note
+	}
+	if pass.Cursor.Ran || pass.Cursor.Skipped != "" || pass.Cursor.Status != "" || pass.Cursor.PendingRemaining > 0 {
+		// A pass that skipped the cursor sub-phase (its queue's own
+		// budget cap is spent) carries a zeroed cursor result; it must
+		// not erase the accumulated pending count of the skipped queue.
+		dst.Cursor.PendingRemaining = pass.Cursor.PendingRemaining
+		dst.Cursor.PendingCounted = pass.Cursor.PendingCounted
+	}
 	dst.Cursor.FirstSyncCompleted = dst.Cursor.FirstSyncCompleted || pass.Cursor.FirstSyncCompleted
 }

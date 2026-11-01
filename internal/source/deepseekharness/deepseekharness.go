@@ -92,6 +92,7 @@ package deepseekharness
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,13 +134,17 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.DeepSeekHarnessSource,
 		Description: "DeepSeek Harness session JSONL (per-attempt deltas)",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownDSHRecords(opt.StateDir, records)
+			return filterKnownDSHRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
@@ -150,20 +155,35 @@ func Adapter() adapter.Adapter {
 // with the same stable keys; export-time deduplication happens in
 // FilterForExport. opt.Limit is intentionally not applied here — the
 // pipeline applies its own preview limits, and a partial scan would have no
-// mark to resume from.
+// mark to resume from. It keeps the historical uncancellable signature for
+// direct callers; the adapter's Load passes its cancellation scope through
+// loadRecordsContext.
 func LoadRecords(root string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), root)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// during file discovery, once per session file, and once per event line. On
+// cancellation it returns ctx.Err() (matchable with errors.Is(err,
+// context.Canceled) or errors.Is(err, context.DeadlineExceeded)) and no
+// partial result — records, issues, and quarantine counts accumulated so far
+// are discarded, so a scan cut short never exports half of a session.
+func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, error) {
 	res := adapter.LoadResult{}
 	clean := strings.TrimSpace(root)
 	if clean == "" {
 		return res, errors.New("missing input path")
 	}
-	files, err := collectSessionFiles(clean)
+	files, err := collectSessionFiles(ctx, clean)
 	if err != nil {
 		return res, err
 	}
 	seen := map[string]bool{}
 	for _, path := range files {
-		records, issues, quarantined, err := loadSessionFile(path)
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
+		records, issues, quarantined, err := loadSessionFile(ctx, path)
 		if err != nil {
 			return adapter.LoadResult{}, err
 		}
@@ -208,8 +228,13 @@ func appendIssues(dst, src []adapter.LineIssue) []adapter.LineIssue {
 
 // collectSessionFiles walks the sessions root and returns the newest
 // canonical session file per session directory, sorted by path. A missing
-// root is a normal not-installed state and yields no files, no error.
-func collectSessionFiles(root string) ([]string, error) {
+// root is a normal not-installed state and yields no files, no error. The
+// context is checked before the root is resolved and once per walked
+// directory entry, mirroring jsonl.FilesContext's coarse boundaries.
+func collectSessionFiles(ctx context.Context, root string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(root); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -219,6 +244,9 @@ func collectSessionFiles(root string) ([]string, error) {
 	best := map[string]string{}
 	var dirs []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return err
 		}
@@ -437,8 +465,10 @@ type turnLifecycle struct {
 // loadSessionFile scans one canonical session file and returns its records.
 // The whole file is read even when errors appear mid-stream: malformed lines
 // become issues, and a mid-file read error keeps the records parsed so far
-// (the scan is stateless and retries on the next run).
-func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, error) {
+// (the scan is stateless and retries on the next run). Cancellation is
+// neither: a ctx.Err() from the per-line check aborts the whole scan with
+// the bare context error so the caller discards everything.
+func loadSessionFile(ctx context.Context, path string) ([]adapter.Record, []adapter.LineIssue, int, error) {
 	var issues []adapter.LineIssue
 	quarantined := 0
 	addIssue := func(line int, reason string) {
@@ -518,6 +548,9 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 	lineNo := 1
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, 0, err
+		}
 		line, ok, err := ls.next()
 		if err != nil {
 			// Keep what parsed so far; the next run retries the file.

@@ -16,6 +16,7 @@ import (
 
 	"toktrail-collector/internal/cursor/protocol"
 	"toktrail-collector/internal/local/cursoroutbox"
+	"toktrail-collector/internal/syncbudget"
 )
 
 // Synthetic placeholders only: no real device, secret, source or server
@@ -717,5 +718,181 @@ func TestJoinURL(t *testing.T) {
 	}
 	if _, err := joinURL("  ", "/p"); err == nil {
 		t.Error("expected an error for an empty server URL")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Shared run budget (syncbudget) wiring
+// ---------------------------------------------------------------------------
+
+// newBudgetServer accepts one source-batch ingest POST at a time and
+// counts them; nothing else is served.
+func newBudgetServer(t *testing.T, posts *atomic.Int64) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		writeJSON(w, http.StatusAccepted, serverReceipt(testBatchID, "accepted", 1, 0, testReceivedAt, false, nil))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// A declined budget must prevent the ingest POST entirely and spend
+// nothing; the decline is the budget's own sentinel, never a transport
+// error. The reservation rides the "cursor" queue: a cap on another queue
+// leaves cursor uploads untouched.
+func TestPostBatchSharedBudgetDeclinePreventsPost(t *testing.T) {
+	encoded := mustEncode(t, testBatch(testBatchID, 1))
+	cases := []struct {
+		name    string
+		budget  *syncbudget.Budget
+		wantErr error
+	}{
+		{"total exhausted", syncbudget.New(syncbudget.WithTotal(0)), syncbudget.ErrTotalExhausted},
+		{"cursor queue exhausted", syncbudget.New(syncbudget.WithQueueCap("cursor", 0)), syncbudget.ErrQueueExhausted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts atomic.Int64
+			server := newBudgetServer(t, &posts)
+			opt := testOptions(server.URL)
+			opt.Budget = tc.budget
+			_, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("expected %v, got %v", tc.wantErr, err)
+			}
+			if posts.Load() != 0 {
+				t.Fatalf("a declined budget must not POST, posts=%d", posts.Load())
+			}
+			if tc.budget.Used() != 0 || tc.budget.QueueUsed("cursor") != 0 {
+				t.Fatalf("a declined reservation must spend nothing: used=%d cursor=%d", tc.budget.Used(), tc.budget.QueueUsed("cursor"))
+			}
+		})
+	}
+	t.Run("another queue's cap does not bind cursor", func(t *testing.T) {
+		var posts atomic.Int64
+		server := newBudgetServer(t, &posts)
+		opt := testOptions(server.URL)
+		opt.Budget = syncbudget.New(syncbudget.WithQueueCap("device", 0))
+		if _, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent); err != nil {
+			t.Fatalf("a device-queue cap must not decline a cursor upload: %v", err)
+		}
+		if posts.Load() != 1 {
+			t.Fatalf("expected exactly one POST, posts=%d", posts.Load())
+		}
+	})
+}
+
+// One granted attempt uploads once and is spent for good; the next
+// upload under the same budget declines without a POST. A nil Budget
+// keeps the unconditional upload behavior.
+func TestPostBatchSharedBudgetGrantsOnePostThenDeclines(t *testing.T) {
+	encoded := mustEncode(t, testBatch(testBatchID, 1))
+	var posts atomic.Int64
+	server := newBudgetServer(t, &posts)
+	opt := testOptions(server.URL)
+	opt.Budget = syncbudget.New(syncbudget.WithTotal(1))
+
+	if _, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent); err != nil {
+		t.Fatalf("the granted attempt must upload: %v", err)
+	}
+	if posts.Load() != 1 || opt.Budget.Used() != 1 || opt.Budget.QueueUsed("cursor") != 1 {
+		t.Fatalf("granted attempt accounting: posts=%d used=%d cursor=%d", posts.Load(), opt.Budget.Used(), opt.Budget.QueueUsed("cursor"))
+	}
+
+	_, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent)
+	if !errors.Is(err, syncbudget.ErrTotalExhausted) {
+		t.Fatalf("expected the spent budget to decline, got %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("a declined retry must not POST, posts=%d", posts.Load())
+	}
+
+	// Nil Budget: the unconditional upload behavior is unchanged.
+	opt.Budget = nil
+	if _, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent); err != nil {
+		t.Fatalf("a nil budget must keep uploading: %v", err)
+	}
+	if posts.Load() != 2 {
+		t.Fatalf("expected the nil-budget upload, posts=%d", posts.Load())
+	}
+}
+
+// The reservation happens immediately before the real POST, after every
+// local validation: a batch refused locally never spends budget.
+func TestPostBatchSharedBudgetNotSpentOnLocalRefusals(t *testing.T) {
+	var posts atomic.Int64
+	server := newBudgetServer(t, &posts)
+	opt := testOptions(server.URL)
+	opt.Budget = syncbudget.New(syncbudget.WithTotal(0))
+
+	foreign := testBatch(testBatchID, 1)
+	foreign.SourceInstanceID = "src-inst-someone-else"
+	if _, err := PostBatch(t.Context(), opt, mustEncode(t, foreign), testFence, testConsent); err == nil {
+		t.Fatal("expected a batch belonging to another source to be refused")
+	} else if errors.Is(err, syncbudget.ErrTotalExhausted) {
+		t.Fatalf("the local refusal must surface, not the budget decline: %v", err)
+	}
+	if posts.Load() != 0 || opt.Budget.Used() != 0 {
+		t.Fatalf("a locally refused batch must not POST or spend budget: posts=%d used=%d", posts.Load(), opt.Budget.Used())
+	}
+}
+
+// A POST that fails after the reservation is not refunded: the attempt
+// stays spent and the next upload under the same budget declines without
+// another POST.
+func TestPostBatchSharedBudgetSpentWhenPostFails(t *testing.T) {
+	encoded := mustEncode(t, testBatch(testBatchID, 1))
+	var posts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "unavailable", "message": marker}})
+	}))
+	defer server.Close()
+	opt := testOptions(server.URL)
+	opt.Budget = syncbudget.New(syncbudget.WithTotal(1))
+
+	if _, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent); err == nil || errors.Is(err, syncbudget.ErrTotalExhausted) {
+		t.Fatalf("the failed POST must surface as an upload failure, not a budget decline: %v", err)
+	}
+	if posts.Load() != 1 || opt.Budget.Used() != 1 {
+		t.Fatalf("a failed POST must still spend its reserved attempt: posts=%d used=%d", posts.Load(), opt.Budget.Used())
+	}
+
+	_, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent)
+	if !errors.Is(err, syncbudget.ErrTotalExhausted) {
+		t.Fatalf("the spent attempt must not be refunded, got %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("the declined retry must not POST again, posts=%d", posts.Load())
+	}
+}
+
+// An ordinary transport failure — here a client timeout, whose Go error
+// chain carries context.DeadlineExceeded — must never be mistaken for
+// the budget's own ErrDeadlineExceeded decline: only a real budget
+// deadline stop reads as one, so network timeouts keep surfacing as
+// plain upload failures (they still spend their reserved attempt).
+func TestPostBatchClientTimeoutIsNotABudgetDeadline(t *testing.T) {
+	encoded := mustEncode(t, testBatch(testBatchID, 1))
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer server.Close()
+	opt := testOptions(server.URL)
+	opt.HTTPClient = &http.Client{Timeout: 80 * time.Millisecond}
+	opt.Budget = syncbudget.New(syncbudget.WithTotal(1))
+
+	_, err := PostBatch(t.Context(), opt, encoded, testFence, testConsent)
+	close(release)
+	if err == nil {
+		t.Fatal("expected the hung server to time out")
+	}
+	if errors.Is(err, syncbudget.ErrDeadlineExceeded) || errors.Is(err, syncbudget.ErrTotalExhausted) || errors.Is(err, syncbudget.ErrQueueExhausted) {
+		t.Fatalf("a client timeout must not be misread as a budget decline: %v", err)
+	}
+	if opt.Budget.Used() != 1 {
+		t.Fatalf("the timed-out POST must still spend its reserved attempt, used=%d", opt.Budget.Used())
 	}
 }

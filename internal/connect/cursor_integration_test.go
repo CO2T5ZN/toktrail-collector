@@ -152,6 +152,12 @@ type cursorToktrailMock struct {
 	devicePosts   int
 	enableAuth    []string
 	enableBodies  []string
+	// flakeFirstSrcBatch fails the FIRST cursor source-batch POST with a
+	// retryable 503 (allowlisted transient code) so retry-wiring tests
+	// can observe a 503→200 resend through the first-enable round.
+	flakeFirstSrcBatch bool
+	// srcBatchBodies captures the raw body of every source-batch POST.
+	srcBatchBodies [][]byte
 }
 
 func startCursorToktrailMock(t *testing.T) *cursorToktrailMock {
@@ -225,17 +231,33 @@ func startCursorToktrailMock(t *testing.T) *cursorToktrailMock {
 			m.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"source": src})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/ingest/source-batches":
+			raw, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Errorf("invalid source-batch body: %v", readErr)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			var batch struct {
 				BatchID string            `json:"batchId"`
 				Records []json.RawMessage `json:"records"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			if err := json.Unmarshal(raw, &batch); err != nil {
 				t.Errorf("invalid source-batch body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
 			}
 			m.mu.Lock()
+			flake := m.flakeFirstSrcBatch && len(m.srcBatchBodies) == 0
 			m.srcBatchPosts++
-			m.srcRecords += len(batch.Records)
+			m.srcBatchBodies = append(m.srcBatchBodies, append([]byte(nil), raw...))
+			if !flake {
+				m.srcRecords += len(batch.Records)
+			}
 			m.mu.Unlock()
+			if flake {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"code": "service_unavailable", "message": "synthetic transient failure"}})
+				return
+			}
 			writeJSON(w, http.StatusAccepted, map[string]any{"batch": map[string]any{
 				"batchId":         batch.BatchID,
 				"status":          "accepted",
@@ -413,27 +435,28 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	// The enable used the injected authentication (no separate login
 	// step): the credential was read and verified through the fakes, and
 	// the synthetic usage was pulled and uploaded as a source batch.
-	// The initial collection's cursor round runs a FORCED full-range
-	// recovery pull (cursorsync.Options.ForceResync, set by connect's
-	// sync phase for reinstall recovery): the two cached events are
-	// re-emitted at fresh revisions and uploaded once more, so the server
-	// sees two source-batch posts totaling four records. That replay is
-	// idempotent by design (the fresh revision dominates), and the
-	// informational Note it leaves is not a failure.
-	if got := authFake.fetches.Load(); got < 1 {
-		t.Fatalf("the integrated enable must read the (injected) credential, got %d reads", got)
+	// Exactly TWO credential reads, both inside the enable itself (the
+	// pre-enable account verification and the first sync's verification);
+	// the initial collection's cursor round runs drain-only over the
+	// freshly enabled source (it refreshes the authorization and uploads
+	// whatever the enable's bounded first sync left pending, but never
+	// reads the credential and never pulls the upstream again), so the
+	// enable's first sync is the run's ONLY upstream pull and only its
+	// batch (2 records) is ever uploaded.
+	if got := authFake.fetches.Load(); got != 2 {
+		t.Fatalf("credential reads = %d, want exactly 2 (both inside the enable; the initial round is drain-only)", got)
 	}
-	if got := pullFake.calls.Load(); got < 1 {
-		t.Fatalf("the integrated enable must pull usage, got %d pulls", got)
+	if got := pullFake.calls.Load(); got != 1 {
+		t.Fatalf("upstream pulls = %d, want exactly 1 (the enable's full-window first sync; the initial round is drain-only)", got)
 	}
-	if srcPosts != 2 || srcRecords != 4 {
-		t.Fatalf("source-batch uploads = %d posts / %d records, want 2 posts / 4 records (first sync + forced recovery re-emission)", srcPosts, srcRecords)
+	if srcPosts != 1 || srcRecords != 2 {
+		t.Fatalf("source-batch uploads = %d posts / %d records, want 1 post / 2 records (the enable's first sync only; no forced re-emission)", srcPosts, srcRecords)
 	}
-	if res.PeriodicResult.Cursor.ReemittedRecords != 2 {
-		t.Fatalf("the forced cursor round must re-emit the 2 cached events, got %+v", res.PeriodicResult.Cursor)
+	if res.PeriodicResult.Cursor.ReemittedRecords != 0 {
+		t.Fatalf("the initial cursor round must not re-emit after a fresh enable, got %+v", res.PeriodicResult.Cursor)
 	}
 	if res.PeriodicResult.Cursor.Skipped != "" || !res.PeriodicResult.Cursor.Ran {
-		t.Fatalf("the forced cursor round completed and must not be skipped, got %+v", res.PeriodicResult.Cursor)
+		t.Fatalf("the initial cursor round completed and must not be skipped, got %+v", res.PeriodicResult.Cursor)
 	}
 
 	// No local grant is fabricated for the account-level source: the
@@ -455,7 +478,7 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	if !res.PeriodicResult.Cursor.Ran {
 		t.Fatalf("the initial collection must run the cursor sync, got %+v", res.PeriodicResult.Cursor)
 	}
-	if !strings.Contains(out, "enabled (sourceInstanceId="+cursorTestSourceID) {
+	if !strings.Contains(out, "enabled (source configured, state=active)") {
 		t.Fatalf("output must report the integrated enable, got:\n%s", out)
 	}
 	if !strings.Contains(out, "initial collection: cursor") {

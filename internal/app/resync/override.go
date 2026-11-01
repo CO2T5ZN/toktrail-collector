@@ -138,7 +138,7 @@ func RunOverride(ctx context.Context, opt OverrideOptions) (OverrideResult, erro
 		}
 	}
 
-	plan, frozenDelta, err := planOverride(stateDir, st, serverURL, ledger)
+	plan, frozenDelta, err := planOverrideContext(ctx, stateDir, st, serverURL, ledger)
 	if err != nil {
 		return OverrideResult{}, err
 	}
@@ -643,19 +643,37 @@ type overrideGrant struct {
 // performs no network access and writes nothing. The returned delta is
 // the FROZEN plan: execution re-classifies it against the ledger only
 // and never re-scans, so nothing the user did not confirm can be sent.
+//
+// This no-context entry point keeps the historical offline-planning
+// behavior for existing callers: the scan runs under
+// context.Background() and is uncancellable, exactly as before the
+// context threading existed. Cancellable callers (RunOverride) use
+// planOverrideContext.
 func planOverride(stateDir string, st statedir.DeviceState, serverURL string, ledger overrides.Ledger) (OverridePlan, []overrideDelta, error) {
+	return planOverrideContext(context.Background(), stateDir, st, serverURL, ledger)
+}
+
+// planOverrideContext is planOverride with the pass's cancellation scope:
+// the current scan honors ctx at every grant and record boundary, and a
+// cancelled or expired scope fails the whole planning closed (never a
+// partial plan, never a per-grant skip) with an error matching
+// errors.Is(err, context.Canceled) / errors.Is(err, context.DeadlineExceeded).
+// Planning stays read-only: a cancellation here returns before the
+// dry-run/confirmation gates, so nothing is uploaded, nothing is
+// ledgered, and no plan or WAL fragment is committed.
+func planOverrideContext(ctx context.Context, stateDir string, st statedir.DeviceState, serverURL string, ledger overrides.Ledger) (OverridePlan, []overrideDelta, error) {
 	plan := OverridePlan{
 		DeviceID:   st.DeviceID,
 		ServerURL:  serverURL,
 		StateDir:   stateDir,
 		LedgerPath: overrides.New(stateDir).Path(),
-		Warning: "same-key conflicts are resolved in favor of the current scanned record; records the server rejects keep their attempt pending and are NOT confirmed; pending attempts are uploaded frozen before any new round; records the current scan no longer produces are left untouched",
+		Warning:    "same-key conflicts are resolved in favor of the current scanned record; records the server rejects keep their attempt pending and are NOT confirmed; pending attempts are uploaded frozen before any new round; records the current scan no longer produces are left untouched",
 	}
 	granted, err := overrideGrants(stateDir, &plan)
 	if err != nil {
 		return plan, nil, err
 	}
-	delta, err := classifyOverrideScan(stateDir, granted, ledger, &plan)
+	delta, err := classifyOverrideScanContext(ctx, stateDir, granted, ledger, &plan)
 	if err != nil {
 		return plan, nil, err
 	}
@@ -708,7 +726,25 @@ func overrideGrants(stateDir string, plan *OverridePlan) ([]overrideGrant, error
 // classification, filling the plan's per-source summaries. Pending
 // attempts are accounted per (source, input): a source with several
 // granted inputs never mixes one input's attempts into another's plan.
+//
+// This no-context entry point keeps the historical uncancellable scan
+// for existing offline-planning callers; RunOverride plans through
+// classifyOverrideScanContext instead.
 func classifyOverrideScan(stateDir string, granted []overrideGrant, ledger overrides.Ledger, plan *OverridePlan) ([]overrideDelta, error) {
+	return classifyOverrideScanContext(context.Background(), stateDir, granted, ledger, plan)
+}
+
+// classifyOverrideScanContext is classifyOverrideScan carrying the pass's
+// cancellation scope. The scope is honored at three boundaries: before
+// each grant's scan, inside the source loader (adapter.Options.Context
+// reaches registry.LoadRecordsForSource, so the loader's own per-file and
+// per-line checks observe the same scope), and at every record of the
+// classification loop. A cancelled or expired scope fails the WHOLE
+// classification closed — the error wraps ctx.Err() with %w so callers
+// match it with errors.Is(err, context.Canceled) or
+// errors.Is(err, context.DeadlineExceeded) — and is never swallowed as a
+// per-grant skip that would let later grants scan anyway.
+func classifyOverrideScanContext(ctx context.Context, stateDir string, granted []overrideGrant, ledger overrides.Ledger, plan *OverridePlan) ([]overrideDelta, error) {
 	delta := make([]overrideDelta, 0)
 	// scannedIn tracks, per (source \0 input), the keys this pass
 	// actually scanned — the per-input pending bookkeeping below uses it
@@ -723,6 +759,9 @@ func classifyOverrideScan(stateDir string, granted []overrideGrant, ledger overr
 	seenContent := map[string][]byte{}
 	seenOwner := map[string]string{}
 	for _, g := range granted {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("override scan cancelled before scanning %s at %s: %w", g.Source, g.Input, err)
+		}
 		sp := OverrideSourcePlan{Source: g.Source, Input: g.Input}
 		baseline, err := sourceStoredBaseline(stateDir, g.Source)
 		if err != nil {
@@ -732,6 +771,7 @@ func classifyOverrideScan(stateDir string, granted []overrideGrant, ledger overr
 			Source:   g.Source,
 			Input:    g.Input,
 			StateDir: stateDir,
+			Context:  ctx,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("cannot scan the current %s records at %s: %w", g.Source, g.Input, err)
@@ -742,6 +782,9 @@ func classifyOverrideScan(stateDir string, granted []overrideGrant, ledger overr
 		scanned := map[string]bool{}
 		scannedIn[grantKey] = scanned
 		for _, rec := range loaded.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("override scan cancelled while classifying %s records at %s: %w", g.Source, g.Input, err)
+			}
 			key, _ := rec["recordKey"].(string)
 			canonical, err := overrides.CanonicalRecord(rec)
 			if err != nil {

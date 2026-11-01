@@ -32,6 +32,10 @@ type PreparedExport struct {
 
 func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	opt = withDefaults(opt)
+	ctx := opt.ContextOrBackground()
+	if err := ctx.Err(); err != nil {
+		return PreparedExport{}, err
+	}
 	if err := p.validateInput(opt); err != nil {
 		return PreparedExport{}, err
 	}
@@ -54,6 +58,9 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if err != nil {
 		return PreparedExport{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return PreparedExport{}, err
+	}
 	records := loaded.Records
 	plugin, _ := p.registry.Lookup(opt.Source)
 	if plugin.FilterForExport != nil {
@@ -67,8 +74,14 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if err != nil {
 		return PreparedExport{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return PreparedExport{}, err
+	}
 	valid := make([]adapter.Record, 0, len(records))
 	for idx, record := range records {
+		if err := ctx.Err(); err != nil {
+			return PreparedExport{}, err
+		}
 		if err := adapter.ValidateRecord(record); err != nil {
 			return PreparedExport{}, fmt.Errorf("record %d invalid: %w", idx, err)
 		}
@@ -83,6 +96,9 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	}
 	payload, err := json.MarshalIndent(adapter.Batch{BatchID: batchID, Records: valid}, "", "  ")
 	if err != nil {
+		return PreparedExport{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return PreparedExport{}, err
 	}
 	return PreparedExport{BatchID: batchID, Output: opt.Output, Records: len(valid), Payload: append(payload, '\n'), MessageUpdates: messageUpdates}, nil

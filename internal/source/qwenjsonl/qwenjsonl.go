@@ -2,6 +2,7 @@ package qwenjsonl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -41,10 +42,22 @@ type qwenObservation struct {
 // system/ui_telemetry records whose systemPayload.uiEvent event.name is
 // qwen-code.api_response. Assistant usageMetadata records are used only as a
 // per-file fallback for older layouts that do not contain api_response
-// telemetry; reading both would double count the main model call.
+// telemetry; reading both would double count the main model call. It keeps the
+// historical uncancellable signature for direct callers; the adapter's Load
+// passes its cancellation scope through loadRecordsContext.
 func LoadRecords(root string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), root)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// during file discovery, once per file, and once per line. On cancellation it
+// returns ctx.Err() (matchable with errors.Is(err, context.Canceled) or
+// errors.Is(err, context.DeadlineExceeded)) and no partial result — records,
+// issues, and quarantine counts accumulated so far are discarded, so a scan
+// cut short never exports half of the Qwen usage.
+func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
-	files, err := jsonl.Files(root, jsonl.Options{SkipHiddenFiles: true})
+	files, err := jsonl.FilesContext(ctx, root, jsonl.Options{SkipHiddenFiles: true})
 	if err != nil {
 		return result, err
 	}
@@ -81,6 +94,9 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 		records[key] = rec
 	}
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
 		if !strings.EqualFold(filepath.Ext(file), ".jsonl") {
 			issue(file, 0, "non-JSONL input skipped")
 			continue
@@ -100,7 +116,10 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 			obs  qwenObservation
 			line int
 		}
-		if err := jsonl.WalkLines(file, func(line jsonl.Line) error {
+		if err := jsonl.WalkLinesContext(ctx, file, func(line jsonl.Line) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			row, err := jsonl.DecodeObject(line.Text)
 			if err != nil {
 				issue(line.File, line.Number, "invalid JSON")
@@ -367,18 +386,35 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.QwenJSONLSource,
 		Description: "Qwen Code / Qwen CLI api_response JSONL",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
 
-func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full rescans cannot re-export known Qwen records. The context
+// is consulted at coarse boundaries (entry, per outbox batch, per stored
+// record, before the quarantine load, per quarantine entry, per fresh
+// record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -406,6 +442,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.QwenJSONLSource {
 			continue
 		}
@@ -429,16 +468,25 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 			return nil, fmt.Errorf("Qwen history batch identity mismatch")
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == adapter.QwenJSONLSource {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -447,6 +495,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

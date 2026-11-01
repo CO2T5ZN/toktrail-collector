@@ -42,6 +42,7 @@ package overrides
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -370,8 +371,16 @@ func CanonicalRecord(rec map[string]any) ([]byte, error) {
 }
 
 // ApplyToBaseline folds the override ledger into one source's known-key
-// baseline (the canonical content map the source history filters build
-// from the outbox and quarantine store):
+// baseline without a cancellation scope. It is the legacy entry point and
+// behaves exactly like ApplyToBaselineContext(context.Background(), ...),
+// so pre-context callers keep their historical uncancellable behavior.
+func ApplyToBaseline(stateDir, source string, known map[string][]byte) error {
+	return ApplyToBaselineContext(context.Background(), stateDir, source, known)
+}
+
+// ApplyToBaselineContext folds the override ledger into one source's
+// known-key baseline (the canonical content map the source history
+// filters build from the outbox and quarantine store):
 //
 //   - The ledger's device/server binding is verified against the
 //     currently bound device first; a mismatch fails closed instead of
@@ -388,9 +397,24 @@ func CanonicalRecord(rec map[string]any) ([]byte, error) {
 //     drift fails closed instead of silently overwriting history. The
 //     old stored payloads are not modified on disk.
 //
+// Cancellation: the scope is checked at entry and once per ledger record
+// in both per-record scans (the pending-source scan and the
+// confirmed-entry scan). The single-file ledger load and the binding
+// check stay non-interruptible at their file boundaries — they either
+// run to completion or never start. Supersessions are staged in a
+// private map and applied to known in one shot only after every record
+// has passed its check, so a cancelled pass returns ctx.Err()
+// (matchable with errors.Is(err, context.Canceled) or errors.Is(err,
+// context.DeadlineExceeded)) and leaves the caller's known map exactly
+// as it was. Nothing here writes the ledger or any other persistent
+// state.
+//
 // A missing ledger is a no-op. A corrupt ledger fails closed through
 // Load.
-func ApplyToBaseline(stateDir, source string, known map[string][]byte) error {
+func ApplyToBaselineContext(ctx context.Context, stateDir, source string, known map[string][]byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	store := New(stateDir)
 	ledger, has, err := store.Load()
 	if err != nil {
@@ -402,10 +426,31 @@ func ApplyToBaseline(stateDir, source string, known map[string][]byte) error {
 	if err := ledger.BindingError(stateDir); err != nil {
 		return err
 	}
-	if pending := ledger.PendingForSource(source); len(pending) > 0 {
-		return fmt.Errorf("an override pass is incomplete for source %s: %d record(s) are pending acknowledgment and block normal collection; re-run toktrail resync --all --replace-existing to finish the repair, or remove %s only if you accept abandoning the override", source, len(pending), store.Path())
+	// Pending scan: count this source's in-flight attempts record by
+	// record, honoring the scope at each step, so a pass cancelled
+	// mid-scan fails with the scope error instead of running the whole
+	// ledger.
+	pending := 0
+	for _, e := range ledger.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if e.Status == StatusPending && e.Source == source {
+			pending++
+		}
 	}
+	if pending > 0 {
+		return fmt.Errorf("an override pass is incomplete for source %s: %d record(s) are pending acknowledgment and block normal collection; re-run toktrail resync --all --replace-existing to finish the repair, or remove %s only if you accept abandoning the override", source, pending, store.Path())
+	}
+	// Confirmed entries supersede the stored payloads, but only in one
+	// shot: stage every canonical record first so a cancellation (or a
+	// corrupt record) anywhere in the scan leaves the caller's known map
+	// untouched instead of half-applied.
+	staged := make(map[string][]byte, len(ledger.Entries))
 	for key, entry := range ledger.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if entry.Source != source || entry.Status != StatusConfirmed {
 			continue
 		}
@@ -413,6 +458,9 @@ func ApplyToBaseline(stateDir, source string, known map[string][]byte) error {
 		if err != nil {
 			return fmt.Errorf("override ledger record %s is not valid JSON: %w", key, err)
 		}
+		staged[key] = canonical
+	}
+	for key, canonical := range staged {
 		known[key] = canonical
 	}
 	return nil

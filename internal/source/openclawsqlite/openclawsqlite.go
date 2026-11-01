@@ -47,9 +47,25 @@ type openClawObservation struct {
 // reads transcript_events.event_json rows. Prompt/response content in other
 // event fields is ignored; only usage/model/time/session identity fields are
 // copied into TokTrail records. Rows stored only in compressed event_zstd form
-// are not decoded in this first version.
+// are not decoded in this first version. It keeps the historical context-free
+// signature for direct callers; the adapter's Load threads the caller's
+// cancellation scope through adapter.Options.ContextOrBackground into
+// loadRecordsContext.
 func LoadRecords(input string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), input)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// before the scan starts, once per database file and once per assembled
+// record, and readDB derives its per-database deadline from it. On
+// cancellation it returns ctx.Err() (matching errors.Is(context.Canceled) or
+// errors.Is(context.DeadlineExceeded)) and an empty result, so a scan cut
+// short by its deadline never commits partial records.
+func loadRecordsContext(ctx context.Context, input string) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	files, err := sqliteFiles(input)
 	if err != nil {
 		return result, err
@@ -63,7 +79,10 @@ func LoadRecords(input string) (adapter.LoadResult, error) {
 		}
 	}
 	for _, file := range files {
-		obs, skippedCompressed, err := readDB(file)
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
+		obs, skippedCompressed, err := readDB(ctx, file)
 		if err != nil {
 			return adapter.LoadResult{}, err
 		}
@@ -71,6 +90,9 @@ func LoadRecords(input string) (adapter.LoadResult, error) {
 			issue(file, fmt.Sprintf("%d compressed transcript_events rows skipped", skippedCompressed))
 		}
 		for _, ob := range obs {
+			if err := ctx.Err(); err != nil {
+				return adapter.LoadResult{}, err
+			}
 			rec := openClawRecord(ob)
 			key := adapter.StringField(rec, "recordKey")
 			if conflicts[key] {
@@ -131,17 +153,22 @@ func sqliteFiles(input string) ([]string, error) {
 	return files, nil
 }
 
-func readDB(path string) ([]openClawObservation, int, error) {
+// readDB scans one OpenClaw transcript database. It derives the historical
+// 30-second per-database deadline from ctx, so a caller-supplied
+// cancellation or a shorter parent deadline propagates into every query and
+// row below; a plain context.Background() keeps the exact pre-context
+// behavior. Each row is also checked for cancellation before it is parsed.
+func readDB(ctx context.Context, path string) ([]openClawObservation, int, error) {
 	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
 	if err != nil {
 		return nil, 0, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if ok, err := hasTable(ctx, db, "transcript_events"); err != nil {
-		return nil, 0, err
+		return nil, 0, contextErr(ctx, err)
 	} else if !ok {
 		return nil, 0, fmt.Errorf("OpenClaw DB missing transcript_events table")
 	}
@@ -151,11 +178,14 @@ func readDB(path string) ([]openClawObservation, int, error) {
 	}
 	rows, err := db.QueryContext(ctx, `SELECT rowid, COALESCE(session_id, ''), COALESCE(created_at, 0), event_json FROM transcript_events WHERE event_json IS NOT NULL ORDER BY rowid ASC`)
 	if err != nil {
-		return nil, skipped, fmt.Errorf("query OpenClaw transcript_events: %w", err)
+		return nil, skipped, contextErr(ctx, fmt.Errorf("query OpenClaw transcript_events: %w", err))
 	}
 	defer rows.Close()
 	var out []openClawObservation
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, skipped, err
+		}
 		var rowID int64
 		var sessionID string
 		var createdRaw any
@@ -176,9 +206,19 @@ func readDB(path string) ([]openClawObservation, int, error) {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, skipped, err
+		return nil, skipped, contextErr(ctx, err)
 	}
 	return out, skipped, nil
+}
+
+// contextErr reports the context's own error whenever it is done, so callers
+// can always match cancellation with errors.Is regardless of how the driver
+// wrapped the failure; otherwise it passes the original error through.
+func contextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func parseEvent(path string, rowID int64, sessionID string, createdRaw any, text string) (openClawObservation, bool, error) {
@@ -409,18 +449,35 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.OpenClawSQLiteSource,
 		Description: "OpenClaw transcript_events SQLite",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
 
-func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full rescans cannot re-export known OpenClaw records. The
+// context is consulted at coarse boundaries (entry, per outbox batch, per
+// stored record, before the quarantine load, per quarantine entry, per
+// fresh record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -448,6 +505,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.OpenClawSQLiteSource {
 			continue
 		}
@@ -471,16 +531,25 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 			return nil, fmt.Errorf("OpenClaw history batch identity mismatch")
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == adapter.OpenClawSQLiteSource {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -489,6 +558,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

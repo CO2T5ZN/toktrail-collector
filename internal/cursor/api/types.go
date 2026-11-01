@@ -138,6 +138,9 @@ type UsageSummary struct {
 // outside int64 returns an error. The reference skips malformed rows
 // leniently; TokTrail fails the fetch instead so corrupt data is never
 // silently dropped or zeroed. An absent token count stays nil (unknown).
+// Error messages carry fixed field names and categories only: they never
+// echo the row, a field value, or a preview of either — response content
+// is untrusted and must not travel into logs or stderr through errors.
 func ParseUsageEvent(raw json.RawMessage) (UsageEvent, error) {
 	var e UsageEvent
 	trimmed := bytes.TrimSpace(raw)
@@ -257,6 +260,13 @@ func strictTokenCounts(raw json.RawMessage) ([4]*int64, error) {
 // strictTokenCount decodes one token count: absent/null → nil; an integer
 // number or integer string → its value; anything else (wrong type,
 // fraction, negative, overflow) → an error.
+//
+// Error privacy: the message carries only the fixed field name and the
+// problem category. The raw JSON fragment and the offending string value
+// are never echoed — a malicious or compromised response can plant the
+// session token or conversation text in any field, and those values must
+// not travel into logs or stderr through the error. No preview and no
+// truncation either: a truncated secret is still a secret.
 func strictTokenCount(field string, raw json.RawMessage) (*int64, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
@@ -266,28 +276,28 @@ func strictTokenCount(field string, raw json.RawMessage) (*int64, error) {
 	case '"':
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, fmt.Errorf("cursor api: %s must be a string or integer, got %s", field, raw)
+			return nil, fmt.Errorf("cursor api: %s must be a string or integer", field)
 		}
 		v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("cursor api: %s must be an integer, got %q", field, s)
+			return nil, fmt.Errorf("cursor api: %s must be an integer", field)
 		}
 		n = v
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		var num json.Number
 		if err := json.Unmarshal(raw, &num); err != nil {
-			return nil, fmt.Errorf("cursor api: %s must be an integer, got %s", field, raw)
+			return nil, fmt.Errorf("cursor api: %s must be a string or integer", field)
 		}
 		v, err := strconv.ParseInt(num.String(), 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("cursor api: %s must be an integer within int64, got %s", field, num.String())
+			return nil, fmt.Errorf("cursor api: %s must be an integer within int64", field)
 		}
 		n = v
 	default:
-		return nil, fmt.Errorf("cursor api: %s must be a string or integer, got %s", field, raw)
+		return nil, fmt.Errorf("cursor api: %s must be a string or integer", field)
 	}
 	if n < 0 {
-		return nil, fmt.Errorf("cursor api: %s must not be negative, got %d", field, n)
+		return nil, fmt.Errorf("cursor api: %s must not be negative", field)
 	}
 	return &n, nil
 }
@@ -295,6 +305,10 @@ func strictTokenCount(field string, raw json.RawMessage) (*int64, error) {
 // strictTimestampMS decodes the required event timestamp: Unix
 // milliseconds as an integer string or number, or an RFC 3339 string.
 // Missing, non-positive, fractional, or overflowing values error.
+//
+// Error privacy: same contract as strictTokenCount — fixed field name
+// and category only, never the raw fragment or the offending string
+// (which is untrusted response text).
 func strictTimestampMS(raw json.RawMessage) (int64, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return 0, errors.New("cursor api: timestamp is required")
@@ -304,14 +318,14 @@ func strictTimestampMS(raw json.RawMessage) (int64, error) {
 	case '"':
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return 0, fmt.Errorf("cursor api: timestamp must be a string or integer, got %s", raw)
+			return 0, errors.New("cursor api: timestamp must be a string or integer")
 		}
 		s = strings.TrimSpace(s)
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			t, terr := time.Parse(time.RFC3339, s)
 			if terr != nil {
-				return 0, fmt.Errorf("cursor api: timestamp must be Unix milliseconds or RFC 3339, got %q", s)
+				return 0, errors.New("cursor api: timestamp must be Unix milliseconds or RFC 3339")
 			}
 			v = t.UnixMilli()
 		}
@@ -319,31 +333,33 @@ func strictTimestampMS(raw json.RawMessage) (int64, error) {
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		var num json.Number
 		if err := json.Unmarshal(raw, &num); err != nil {
-			return 0, fmt.Errorf("cursor api: timestamp must be an integer, got %s", raw)
+			return 0, errors.New("cursor api: timestamp must be an integer")
 		}
 		v, err := strconv.ParseInt(num.String(), 10, 64)
 		if err != nil {
-			return 0, fmt.Errorf("cursor api: timestamp must be an integer within int64, got %s", num.String())
+			return 0, errors.New("cursor api: timestamp must be an integer within int64")
 		}
 		n = v
 	default:
-		return 0, fmt.Errorf("cursor api: timestamp must be a string or integer, got %s", raw)
+		return 0, errors.New("cursor api: timestamp must be a string or integer")
 	}
 	if n <= 0 {
-		return 0, fmt.Errorf("cursor api: timestamp must be positive, got %d", n)
+		return 0, errors.New("cursor api: timestamp must be positive")
 	}
 	return n, nil
 }
 
 // strictString decodes a string field: absent or null yields "", a present
-// non-string is an error. The result is trimmed.
+// non-string is an error. The result is trimmed. The error carries only
+// the fixed field name and category — never the raw fragment, which is
+// untrusted response text.
 func strictString(field string, raw json.RawMessage) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", fmt.Errorf("cursor api: %s must be a string, got %s", field, raw)
+		return "", fmt.Errorf("cursor api: %s must be a string", field)
 	}
 	return strings.TrimSpace(s), nil
 }

@@ -45,14 +45,30 @@ type hermesObservation struct {
 // Hermes home directory or state.db file. It prefers the per-model
 // session_model_usage table and falls back to the sessions summary table for
 // older schemas. It does not query messages, FTS content, memories, gateway
-// routes, credentials, or prompt/response bodies.
+// routes, credentials, or prompt/response bodies. It keeps the historical
+// context-free signature for direct callers; the adapter's Load threads the
+// caller's cancellation scope through adapter.Options.ContextOrBackground
+// into loadRecordsContext.
 func LoadRecords(input string) (adapter.LoadResult, error) {
+	return loadRecordsContext(context.Background(), input)
+}
+
+// loadRecordsContext scans with cancellation support: the context is checked
+// before the scan starts and once per assembled record, and readDB derives
+// its per-database deadline from it. On cancellation it returns ctx.Err()
+// (matching errors.Is(context.Canceled) or errors.Is(context.DeadlineExceeded))
+// and an empty result, so a scan cut short by its deadline never commits
+// partial records.
+func loadRecordsContext(ctx context.Context, input string) (adapter.LoadResult, error) {
 	var result adapter.LoadResult
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	path, err := stateDBPath(input)
 	if err != nil {
 		return result, err
 	}
-	obs, err := readDB(path)
+	obs, err := readDB(ctx, path)
 	if err != nil {
 		return adapter.LoadResult{}, err
 	}
@@ -65,6 +81,9 @@ func LoadRecords(input string) (adapter.LoadResult, error) {
 		}
 	}
 	for _, ob := range obs {
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
 		rec := hermesRecord(ob)
 		key := adapter.StringField(rec, "recordKey")
 		if conflicts[key] {
@@ -108,25 +127,29 @@ func stateDBPath(input string) (string, error) {
 	return "", fmt.Errorf("Hermes input file %q must be state.db or a .db SQLite database", clean)
 }
 
-func readDB(path string) ([]hermesObservation, error) {
+// readDB scans one Hermes state database. It derives the historical 30-second
+// per-database deadline from ctx, so a caller-supplied cancellation or a
+// shorter parent deadline propagates into every query and row below; a plain
+// context.Background() keeps the exact pre-context behavior.
+func readDB(ctx context.Context, path string) ([]hermesObservation, error) {
 	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	hasPerModel, err := hasTable(ctx, db, "session_model_usage")
 	if err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	if hasPerModel {
 		return readSessionModelUsage(ctx, db, path)
 	}
 	hasSessions, err := hasTable(ctx, db, "sessions")
 	if err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	if hasSessions {
 		return readSessions(ctx, db, path)
@@ -138,11 +161,14 @@ func readSessionModelUsage(ctx context.Context, db *sql.DB, path string) ([]herm
 	query := `SELECT COALESCE(smu.session_id, ''), COALESCE(smu.model, ''), COALESCE(s.started_at, 0), COALESCE(smu.input_tokens, 0), COALESCE(smu.output_tokens, 0), COALESCE(smu.cache_read_tokens, 0), COALESCE(smu.cache_write_tokens, 0) FROM session_model_usage smu LEFT JOIN sessions s ON s.id = smu.session_id ORDER BY COALESCE(s.started_at, 0), smu.session_id, smu.model`
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("query Hermes session_model_usage: %w", err)
+		return nil, contextErr(ctx, fmt.Errorf("query Hermes session_model_usage: %w", err))
 	}
 	defer rows.Close()
 	var out []hermesObservation
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ob, ok, err := scanHermesRow(rows, path, "session_model_usage")
 		if err != nil {
 			return nil, err
@@ -152,20 +178,33 @@ func readSessionModelUsage(ctx context.Context, db *sql.DB, path string) ([]herm
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	return out, nil
+}
+
+// contextErr reports the context's own error whenever it is done, so callers
+// can always match cancellation with errors.Is regardless of how the driver
+// wrapped the failure; otherwise it passes the original error through.
+func contextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func readSessions(ctx context.Context, db *sql.DB, path string) ([]hermesObservation, error) {
 	query := `SELECT COALESCE(id, ''), COALESCE(model, ''), COALESCE(started_at, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0) FROM sessions ORDER BY started_at ASC, id ASC`
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("query Hermes sessions: %w", err)
+		return nil, contextErr(ctx, fmt.Errorf("query Hermes sessions: %w", err))
 	}
 	defer rows.Close()
 	var out []hermesObservation
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ob, ok, err := scanHermesRow(rows, path, "sessions")
 		if err != nil {
 			return nil, err
@@ -175,7 +214,7 @@ func readSessions(ctx context.Context, db *sql.DB, path string) ([]hermesObserva
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, contextErr(ctx, err)
 	}
 	return out, nil
 }
@@ -361,18 +400,35 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.HermesSQLiteSource,
 		Description: "Hermes Agent state.db SQLite",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return LoadRecords(opt.Input)
+			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
+			ctx := opt.ContextOrBackground()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.TrimSpace(opt.StateDir) == "" {
 				return records, nil
 			}
-			return filterKnownRecords(opt.StateDir, records)
+			return filterKnownRecordsContext(ctx, opt.StateDir, records)
 		},
 	}
 }
 
-func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+// filterKnownRecordsContext checks immutable outbox and quarantine records,
+// so repeated full rescans cannot re-export known Hermes records. The
+// context is consulted at coarse boundaries (entry, per outbox batch, per
+// stored record, before the quarantine load, per quarantine entry, per
+// fresh record); on cancellation it returns ctx.Err() (matchable with
+// errors.Is(err, context.Canceled) or errors.Is(err, context.DeadlineExceeded))
+// and no partial result — the fresh slice accumulated so far is discarded, so
+// a filter cut short never exports a prefix of the scan. A nil
+// Options.Context reaches here as context.Background() via
+// ContextOrBackground and keeps the exact pre-cancellation behavior.
+func filterKnownRecordsContext(ctx context.Context, stateDir string, records []adapter.Record) ([]adapter.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -400,6 +456,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 		return nil, err
 	}
 	for _, entry := range ledger.Batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source != adapter.HermesSQLiteSource {
 			continue
 		}
@@ -423,16 +482,25 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 			return nil, fmt.Errorf("Hermes history batch identity mismatch")
 		}
 		for _, record := range batch.Records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if err := remember(record); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	entries, err := quarantine.New(stateDir).Load()
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Source == adapter.HermesSQLiteSource {
 			if err := remember(entry.Record); err != nil {
 				return nil, err
@@ -441,6 +509,9 @@ func filterKnownRecords(stateDir string, records []adapter.Record) ([]adapter.Re
 	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := adapter.StringField(record, "recordKey")
 		canonical, err := json.Marshal(record)
 		if err != nil {

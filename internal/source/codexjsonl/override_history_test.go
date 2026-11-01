@@ -1,6 +1,7 @@
 package codexjsonl
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -63,17 +64,17 @@ func TestCodexHistoryHonorsOverrideBaseline(t *testing.T) {
 
 	// Confirmed override is the baseline: the CURRENT scan drops even
 	// though it differs from the stored archived payload.
-	got, err := filterKnownCodexRecords(dir, []adapter.Record{current})
+	got, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{current})
 	if err != nil || len(got) != 0 {
 		t.Fatalf("current scan must drop against the confirmed override: %v %v", got, err)
 	}
 	// The superseded archived payload is NOT "already synced" anymore.
-	got, err = filterKnownCodexRecords(dir, []adapter.Record{old})
+	got, err = filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{old})
 	if err == nil || len(got) != 0 {
 		t.Fatalf("the superseded archived payload must fail closed as a new drift, got %v %v", got, err)
 	}
 	// A further drift fails closed with the override pointer.
-	if _, err := filterKnownCodexRecords(dir, []adapter.Record{future}); err == nil || !strings.Contains(err.Error(), "replace-existing") {
+	if _, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{future}); err == nil || !strings.Contains(err.Error(), "replace-existing") {
 		t.Fatalf("a drift past the override must point at the override pass: %v", err)
 	}
 	_ = canonicalFuture
@@ -88,7 +89,7 @@ func TestCodexHistoryHonorsOverrideBaseline(t *testing.T) {
 	if err := overrides.New(dir).Save(ledger); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := filterKnownCodexRecords(dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "pending") {
+	if _, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "pending") {
 		t.Fatalf("a pending override must block the scan: %v", err)
 	}
 
@@ -103,7 +104,7 @@ func TestCodexHistoryHonorsOverrideBaseline(t *testing.T) {
 	if err := overrides.New(dir).Save(ledger); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := filterKnownCodexRecords(dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "device") {
+	if _, err := filterKnownCodexRecordsContext(context.Background(), dir, []adapter.Record{current}); err == nil || !strings.Contains(err.Error(), "device") {
 		t.Fatalf("a foreign ledger binding must fail closed: %v", err)
 	}
 }

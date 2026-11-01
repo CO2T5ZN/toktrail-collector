@@ -270,14 +270,23 @@ func startCursorFakeServer(t *testing.T) *cursorFakeServer {
 				NextRevision:     7,
 			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/ingest/batches":
-			// Cursor records must never ride the device batch path.
+			// Cursor records must never ride the device batch path;
+			// count it so tests can fail on the accidental call. The
+			// receipt is valid so a legitimate device backlog (a
+			// cursor-only device still drains its device outbox, §6.1)
+			// can be exercised through this server.
+			var body struct {
+				BatchID string            `json:"batchId"`
+				Records []json.RawMessage `json:"records"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
 			s.mu.Lock()
 			s.devicePosts++
 			s.mu.Unlock()
 			writeJSON(w, http.StatusAccepted, map[string]any{"batch": map[string]any{
-				"batchId":         "unexpected-device-batch",
+				"batchId":         body.BatchID,
 				"status":          "accepted",
-				"acceptedRecords": 0,
+				"acceptedRecords": len(body.Records),
 				"rejectedRecords": 0,
 				"replay":          false,
 				"receivedAt":      cursorTestNow.Format(time.RFC3339),
@@ -725,5 +734,132 @@ func TestPeriodicCursorFenceStopNotReportedAsSuccess(t *testing.T) {
 	}
 	if res.NoGrants {
 		t.Fatalf("a permitted cursor source keeps the run off the NoGrants path even when stopped")
+	}
+}
+
+// TestPeriodicCursorDrainOnlyRoundNeverPulls verifies the drain-only
+// cursor round (Options.CursorDrainOnly): with an active permit and a
+// pending cursor batch, the round still executes under the same runlock
+// and server preflight and uploads the persisted batch, but it never
+// reads the Cursor credential and never pulls upstream usage — the round
+// shape connect's first-enable flow uses for its initial collection
+// round, so the enable's first sync stays the only upstream pull.
+func TestPeriodicCursorDrainOnlyRoundNeverPulls(t *testing.T) {
+	stateDir := t.TempDir()
+	server := startCursorFakeServer(t)
+	bindCursorDevice(t, stateDir, server.URL)
+	writeCursorPermit(t, stateDir)
+	seedCursorPendingBatch(t, stateDir, "cursor-drainonly-1", 2)
+
+	pull := &fakeCursorPull{events: cursorFixtureEvents()}
+	authFake := &fakeCursorAuth{}
+	res, err := Run(t.Context(), Options{
+		StateDir:        stateDir,
+		ServerURL:       server.URL,
+		HTTPClient:      server.Client(),
+		HomeDir:         t.TempDir(),
+		Now:             func() time.Time { return cursorTestNow },
+		CursorDrainOnly: true,
+		Cursor: &cursorsync.Options{
+			StateDir:   stateDir,
+			ServerURL:  server.URL,
+			HTTPClient: server.Client(),
+			Auth:       authFake,
+			Verify:     fakeCursorVerify,
+			Pull:       pull.Pull,
+			Now:        func() time.Time { return cursorTestNow },
+		},
+	})
+	if err != nil {
+		t.Fatalf("a fully drained drain-only round must succeed, got %v", err)
+	}
+	// The round ran and drained the persisted queue honestly.
+	if !res.Cursor.Ran || res.Cursor.Skipped != "" || res.Cursor.Note != "" {
+		t.Fatalf("the drain-only round must run cleanly, got %+v", res.Cursor)
+	}
+	if res.Cursor.SyncedBatches != 1 || res.Cursor.SyncedRecords != 2 || res.Cursor.PendingRemaining != 0 {
+		t.Fatalf("the pending cursor batch must drain, got %+v", res.Cursor)
+	}
+	// No credential read and no upstream pull — the two operations that
+	// distinguish the drain-only round from the full round.
+	if pull.calls != 0 {
+		t.Fatalf("a drain-only round must never pull upstream usage, got %d pulls", pull.calls)
+	}
+	if authFake.fetches != 0 {
+		t.Fatalf("a drain-only round must never read the cursor credential, got %d reads", authFake.fetches)
+	}
+	enablePosts, srcPosts, srcRecords, devicePosts := server.counters()
+	if enablePosts != 0 || srcPosts != 1 || srcRecords != 2 || devicePosts != 0 {
+		t.Fatalf("exactly the persisted batch may upload (and never via the device path), got enable=%d src=%d records=%d device=%d",
+			enablePosts, srcPosts, srcRecords, devicePosts)
+	}
+	if n := cursorPendingCount(t, stateDir); n != 0 {
+		t.Fatalf("nothing may stay pending, got %d", n)
+	}
+	// A fully drained round still reports the honest tool-status receipt.
+	if got := server.reportedToolStatuses(); len(got) != 1 || got[0] != (toolStatusReport{Tool: "Cursor", Status: "synced"}) {
+		t.Fatalf("tool-status receipts = %#v, want exactly [Cursor synced]", got)
+	}
+}
+
+// TestPeriodicCursorOnlyDeviceStillDrainsDeviceBacklog pins the §6.1
+// cursor-only arm: a device with an active cursor permit and NO local
+// file grants still drains its pending DEVICE outbox batches (they are
+// the current authorization's already-materialized queue, and sending
+// stays gated by the live server consent preflight). The run reports the
+// drained counts — never a NoGrants no-op hiding PendingRemaining=0 —
+// while the cursor round proceeds as usual.
+func TestPeriodicCursorOnlyDeviceStillDrainsDeviceBacklog(t *testing.T) {
+	stateDir := t.TempDir()
+	server := startCursorFakeServer(t)
+	// Unrestricted scope: the pending device batch's tool is allowed by
+	// the live authorization, so the §6.1 drain may legitimately upload
+	// it (a scope that withholds it would quarantine it honestly — a
+	// different, already-covered behavior).
+	server.setView(t, cursorFakeView{tools: nil, revision: 41})
+	bindCursorDevice(t, stateDir, server.URL)
+	writeCursorPermit(t, stateDir)
+	writePendingBatch(t, stateDir, "cursor-only-device-pending-1")
+
+	pull := &fakeCursorPull{}
+	authFake := &fakeCursorAuth{}
+	res, err := Run(t.Context(), Options{
+		StateDir:   stateDir,
+		ServerURL:  server.URL,
+		HTTPClient: server.Client(),
+		HomeDir:    t.TempDir(),
+		Now:        func() time.Time { return cursorTestNow },
+		Cursor: &cursorsync.Options{
+			StateDir:   stateDir,
+			ServerURL:  server.URL,
+			HTTPClient: server.Client(),
+			Auth:       authFake,
+			Verify:     fakeCursorVerify,
+			Pull:       pull.Pull,
+			Now:        func() time.Time { return cursorTestNow },
+		},
+	})
+	if err != nil {
+		t.Fatalf("the cursor-only run must succeed, got %v", err)
+	}
+	if res.NoGrants {
+		t.Fatalf("a cursor-only device with a live permit must not report NoGrants, got %+v", res)
+	}
+	if res.Skipped != "" {
+		t.Fatalf("a run that drained work must not read as a no-op, got %q", res.Skipped)
+	}
+	if res.SyncedBatches != 1 || res.SyncedRecords != 1 || res.PendingRemaining != 0 {
+		t.Fatalf("the pending device batch must drain, got %+v", res)
+	}
+	// The cursor round ran as usual (one pull of the overlap window, no
+	// cursor batches pending), and the device batch rode the device
+	// endpoint exactly once.
+	if !res.Cursor.Ran || res.Cursor.Skipped != "" {
+		t.Fatalf("the cursor round must run cleanly, got %+v", res.Cursor)
+	}
+	enablePosts, srcPosts, _, devicePosts := server.counters()
+	if enablePosts != 0 || srcPosts != 0 || devicePosts != 1 {
+		t.Fatalf("exactly one device upload and no cursor traffic expected, got enable=%d src=%d device=%d",
+			enablePosts, srcPosts, devicePosts)
 	}
 }

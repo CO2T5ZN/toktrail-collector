@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -135,4 +136,105 @@ func TestKilledProcessReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopened.Close()
+}
+
+// TestValidateLiveLock verifies the positive contract: a lock acquired
+// for a directory validates against exactly that directory.
+func TestValidateLiveLock(t *testing.T) {
+	dir := t.TempDir()
+	other := t.TempDir()
+	lock, err := Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := lock.Validate(dir); err != nil {
+		t.Fatalf("a live lock for this directory must validate: %v", err)
+	}
+	// The same lock must NOT validate against a different directory,
+	// even one whose lock file exists.
+	otherLock, err := Acquire(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherLock.Close()
+	if err := lock.Validate(other); err == nil {
+		t.Fatal("a lock for another directory must not validate")
+	}
+}
+
+// TestValidateNilLock verifies the fail-closed contract for a nil handle.
+func TestValidateNilLock(t *testing.T) {
+	var lock *Lock
+	if err := lock.Validate(t.TempDir()); err == nil {
+		t.Fatal("a nil lock must not validate")
+	}
+}
+
+// TestValidateClosedLockFailsEvenWhenAnotherHolderOccupies pins the hole
+// a lock-contention probe cannot close: after the caller releases its
+// lock, Validate must keep failing EVEN WHEN another holder now occupies
+// the directory (busy content alone must never read as "the caller holds
+// the lock"). A copied Lock value whose original was closed fails the
+// same way through its stale file handle.
+func TestValidateClosedLockFailsEvenWhenAnotherHolderOccupies(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleCopy := *lock
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Another holder now occupies the directory's lock.
+	other, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("re-acquire after release: %v", err)
+	}
+	defer other.Close()
+
+	if err := lock.Validate(dir); err == nil {
+		t.Fatal("a closed lock must not validate, even with another holder occupying the directory")
+	}
+	if err := staleCopy.Validate(dir); err == nil {
+		t.Fatal("a copied lock value whose original was closed must not validate")
+	}
+	// The live holder of the same directory still validates.
+	if err := other.Validate(dir); err != nil {
+		t.Fatalf("the occupying holder must validate: %v", err)
+	}
+}
+
+// TestValidateReplacedLockFileFails covers the replaced-inode case: when
+// the lock file is deleted and recreated while a handle stays open, the
+// stale flock no longer serializes against new acquirers, so Validate
+// must refuse the handle. (Not runnable on Windows: an open byte-range
+// locked file cannot be deleted there.)
+func TestValidateReplacedLockFileFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("deleting an open locked file is not possible on Windows")
+	}
+	dir := t.TempDir()
+	lock, err := Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := os.Remove(filepath.Join(dir, ".collector.lock")); err != nil {
+		t.Fatal(err)
+	}
+	// A new acquirer creates a fresh lock file at the same path and
+	// locks it; the stale handle's flock is on the unlinked inode.
+	fresh, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("acquire the replacement lock file: %v", err)
+	}
+	defer fresh.Close()
+	if err := lock.Validate(dir); err == nil {
+		t.Fatal("a lock whose file was replaced under it must not validate")
+	}
+	if err := fresh.Validate(dir); err != nil {
+		t.Fatalf("the replacement lock must validate: %v", err)
+	}
 }

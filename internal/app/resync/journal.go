@@ -100,7 +100,8 @@ type jobBatch struct {
 // job's accumulated done/skip decisions were made under. An incomplete
 // job whose recorded scope no longer matches the fresh live scope must
 // not treat those decisions as completing the current authorization: the
-// run re-plans the complete synced history instead (see
+// run re-plans instead, within the job's frozen snapshot universe when
+// it has one and over the complete synced history otherwise (see
 // reconcileJobScope). Journals written before this field existed
 // (schema 1) carry no snapshot; their baseline is derived from the
 // per-batch scope revision stamps.
@@ -118,6 +119,11 @@ type jobExclusions struct {
 	Pending     int      `json:"pending,omitempty"`
 	Reorganized int      `json:"reorganized,omitempty"`
 	LocalGrant  []string `json:"localGrant,omitempty"`
+	// AfterSnapshot counts synced batches excluded because they were
+	// synced AFTER the restricting snapshot was captured — for connect's
+	// snapshot-restricted automatic pass, the batches that very run's
+	// own collection uploaded. Always zero for unrestricted jobs.
+	AfterSnapshot int `json:"afterSnapshot,omitempty"`
 }
 
 // job is one resync pass: a frozen snapshot of the synced outbox leaves at
@@ -142,6 +148,22 @@ type job struct {
 	Scope          *jobScope     `json:"scope,omitempty"`
 	Batches        []jobBatch    `json:"batches"`
 	OverrideUpload []jobUpload   `json:"overrideUploads,omitempty"`
+	// Snapshot is the frozen batch-id universe this job's plan — and
+	// every re-plan of it — is restricted to: the outbox batches that
+	// were already synced when the caller captured its snapshot, BEFORE
+	// the local grants were applied, so entries the grants excluded at
+	// plan time stay in the universe and rejoin a re-plan once a widened
+	// authorization allows them again. The universe is preserved
+	// verbatim across resume and re-plan: batches synced after the
+	// capture (most commonly the same run's collection uploads) can
+	// never join this job lineage.
+	//
+	// nil means the job is unrestricted — the explicit resync pass, and
+	// legacy journals written before the field existed — so its plans
+	// and re-plans cover the complete synced history, exactly as before.
+	// A non-nil Snapshot with zero BatchIDs records a first install
+	// (nothing was synced at capture time) and stays distinct from nil.
+	Snapshot *SyncedBatchSnapshot `json:"snapshot,omitempty"`
 }
 
 func (j job) completed() bool { return j.CompletedAt != nil }
