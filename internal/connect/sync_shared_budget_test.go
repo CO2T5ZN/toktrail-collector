@@ -54,44 +54,10 @@ func budgetCursorWiring(pull *cursorBacklogPull, maxBatches int) *cursorsync.Opt
 //     precedes the first history POST in the global order;
 //   - the run is complete — no incompleteness, nothing pending.
 func TestConnectDefaultBudgetDrains174BatchesAcrossQueues(t *testing.T) {
-	stateDir := t.TempDir()
-	homeDir := t.TempDir()
-	mock := startCursorBacklogMock(t)
-	cfg := startSyncConfigMock(t, mock.URL, []string{"Codex", "Cursor"}, intPtr(90))
-
-	// A bound state that already carries this link's receipt, so connect
-	// skips the bind (the cursor mock serves no bind endpoint) and runs
-	// the reconnect path: identity matches the config mock (app-sync /
-	// sub-sync) while /self serves the cursor mock's device and account
-	// source.
-	ticket := strings.Repeat("8", 64)
-	st := statedir.DeviceState{
-		DeviceID:           cursorBacklogDevice,
-		DeviceSecret:       strings.Repeat("a", 64),
-		ServerURL:          mock.URL,
-		ApplicationID:      "app-sync",
-		ExternalSubjectID:  "sub-sync",
-		ConsentRevision:    5,
-		UploadAuthorized:   true,
-		ConnectReceiptHash: computeReceiptFingerprint(ticket, cfg.URL+"/api/collector/connect"),
-	}
-	if err := statedir.New(stateDir).Save(st); err != nil {
-		t.Fatalf("write bound state: %v", err)
-	}
-	seedCursorBacklogPermit(t, stateDir, cursorsource.StatusActive)
-	seedCodexSessionsGrant(t, stateDir, homeDir)
-	for i := 1; i <= 24; i++ {
-		seedDeviceBacklogBatchStatus(t, stateDir, homeDir, fmt.Sprintf("hist-synced-%d", i), fmt.Sprintf("hist-key-%d", i), outbox.StatusSynced)
-	}
-	for i := 1; i <= 120; i++ {
-		seedDeviceBacklogBatch(t, stateDir, homeDir, fmt.Sprintf("dev-pending-%d", i), fmt.Sprintf("dev-key-%d", i))
-	}
-	for i := 1; i <= 30; i++ {
-		seedCursorBacklogBatch(t, stateDir, fmt.Sprintf("cur-pending-%d", i), 1)
-	}
+	stateDir, homeDir, mock, cfg := seed174Scenario(t)
 	pull := &cursorBacklogPull{}
 
-	res, err := runSyncConnectWithOptions(t, cfg, stateDir, homeDir, strings.Repeat("8", 64), Options{
+	res, err, humanOut := runSyncConnectWithOutput(t, cfg, stateDir, homeDir, strings.Repeat("8", 64), Options{
 		Cursor: budgetCursorWiring(pull, 5),
 	})
 	if err != nil {
@@ -156,6 +122,122 @@ func TestConnectDefaultBudgetDrains174BatchesAcrossQueues(t *testing.T) {
 		t.Fatalf("the account queue must advance between device batches of the same passes (rotation), deviceLead=%d cursorFollow=%d deviceLate=%d", deviceLead, cursorFollow, deviceLate)
 	}
 	_ = cursorLate
+
+	// Concise display volume: 174 real POSTs across 23 backlog passes
+	// must NOT become 23 "backlog pass N" lines or any per-batch line.
+	// The regular complete output (excluding the heartbeat lines, the
+	// authorization-interaction lines and any error/incomplete lines)
+	// stays within ten lines: the phase outcomes, the one-line plan with
+	// its coverage note, and the boundary note - never a second verbose
+	// log wearing a concise costume.
+	regular := 0
+	for _, line := range strings.Split(strings.TrimSpace(humanOut), "\n") {
+		if line == "" || strings.HasPrefix(line, "tool \"") || strings.HasPrefix(line, "still working") || strings.HasPrefix(line, "Still working") {
+			// The account-source permit status is authorization
+			// interaction; the heartbeat lines are the progress signal;
+			// neither counts against the concise budget.
+			continue
+		}
+		regular++
+	}
+	if regular > 10 {
+		t.Fatalf("the regular complete output must stay within ten lines over a 174-batch drain, got %d:\n%s", regular, humanOut)
+	}
+	for _, banned := range []string{
+		"backlog pass", "history batch:", "dev-pending-", "hist-synced-", "cur-pending-",
+		"exportedBatches=", "syncedBatches=", "passes=", "submitted=",
+		"running initial collection...", "draining backlog...", "retransmitting history...",
+	} {
+		if strings.Contains(humanOut, banned) {
+			t.Fatalf("the concise default must never carry %q, got:\n%s", banned, humanOut)
+		}
+	}
+	for _, want := range []string{
+		"connected to server; device already bound",
+		"Collecting local usage...", "backlog: drained",
+		"History replay covers this device only, and only the batches already synced before this run",
+	} {
+		if !strings.Contains(humanOut, want) {
+			t.Fatalf("the concise default must carry the brief line %q, got:\n%s", want, humanOut)
+		}
+	}
+	if strings.Contains(humanOut, "initial collection: finished") {
+		t.Fatalf("the healthy round outcome belongs to the final summary (or --verbose), got:\n%s", humanOut)
+	}
+	if strings.Contains(humanOut, "resync covers the device outbox") {
+		t.Fatalf("the long coverage note must stay behind --verbose, got:\n%s", humanOut)
+	}
+}
+
+// TestConnectVerboseBudget174BatchesShowsPerPassDetail: --verbose adds
+// the per-pass collection rounds and the per-batch history lines (no
+// batch ids) over the same 174-batch scenario.
+func TestConnectVerboseBudget174BatchesShowsPerPassDetail(t *testing.T) {
+	stateDir, homeDir, mock, cfg := seed174Scenario(t)
+	pull := &cursorBacklogPull{}
+
+	res, err, humanOut := runSyncConnectWithOutput(t, cfg, stateDir, homeDir, strings.Repeat("8", 64), Options{
+		Cursor:  budgetCursorWiring(pull, 5),
+		Verbose: true,
+	})
+	if err != nil {
+		t.Fatalf("the verbose 174-batch reconnect must complete: %v (incomplete=%v)", err, res.Sync.Incomplete)
+	}
+	if !strings.Contains(humanOut, "backlog pass 1:") || !strings.Contains(humanOut, "backlog pass 23:") {
+		t.Fatalf("verbose must show the per-pass rounds, got:\n%s", humanOut)
+	}
+	if !strings.Contains(humanOut, "history batch: done") {
+		t.Fatalf("verbose must show the per-batch history lines, got:\n%s", humanOut)
+	}
+	for _, banned := range []string{"dev-pending-1", "hist-synced-1", "cur-pending-1"} {
+		if strings.Contains(humanOut, banned) {
+			t.Fatalf("no mode may echo a batch id, got %q in:\n%s", banned, humanOut)
+		}
+	}
+	_ = mock
+}
+
+// seed174Scenario builds the full 174-batch reconnect scenario (120
+// pending device batches, 30 pending account batches, 24 synced
+// history batches) with fresh state directories.
+func seed174Scenario(t *testing.T) (stateDir, homeDir string, mock *cursorBacklogMock, cfg *syncConfigMock) {
+	t.Helper()
+	stateDir = t.TempDir()
+	homeDir = t.TempDir()
+	mock = startCursorBacklogMock(t)
+	cfg = startSyncConfigMock(t, mock.URL, []string{"Codex", "Cursor"}, intPtr(90))
+
+	// A bound state that already carries this link's receipt, so connect
+	// skips the bind (the cursor mock serves no bind endpoint) and runs
+	// the reconnect path: identity matches the config mock (app-sync /
+	// sub-sync) while /self serves the cursor mock's device and account
+	// source.
+	ticket := strings.Repeat("8", 64)
+	st := statedir.DeviceState{
+		DeviceID:           cursorBacklogDevice,
+		DeviceSecret:       strings.Repeat("a", 64),
+		ServerURL:          mock.URL,
+		ApplicationID:      "app-sync",
+		ExternalSubjectID:  "sub-sync",
+		ConsentRevision:    5,
+		UploadAuthorized:   true,
+		ConnectReceiptHash: computeReceiptFingerprint(ticket, cfg.URL+"/api/collector/connect"),
+	}
+	if err := statedir.New(stateDir).Save(st); err != nil {
+		t.Fatalf("write bound state: %v", err)
+	}
+	seedCursorBacklogPermit(t, stateDir, cursorsource.StatusActive)
+	seedCodexSessionsGrant(t, stateDir, homeDir)
+	for i := 1; i <= 24; i++ {
+		seedDeviceBacklogBatchStatus(t, stateDir, homeDir, fmt.Sprintf("hist-synced-%d", i), fmt.Sprintf("hist-key-%d", i), outbox.StatusSynced)
+	}
+	for i := 1; i <= 120; i++ {
+		seedDeviceBacklogBatch(t, stateDir, homeDir, fmt.Sprintf("dev-pending-%d", i), fmt.Sprintf("dev-key-%d", i))
+	}
+	for i := 1; i <= 30; i++ {
+		seedCursorBacklogBatch(t, stateDir, fmt.Sprintf("cur-pending-%d", i), 1)
+	}
+	return stateDir, homeDir, mock, cfg
 }
 
 // TestSyncBudgetDeadlineStopsAllQueuesHonestly verifies the budget

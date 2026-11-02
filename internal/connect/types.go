@@ -23,7 +23,17 @@ type Options struct {
 	SchedulerRunner scheduler.Runner // Optional scheduler runner override for testing
 	DryRun          bool             // Optional dry run for scheduler installation
 	Now             func() time.Time // Injectable clock for deterministic tests
-	Out             io.Writer        // Destination for progress output (defaults to io.Discard)
+	// Out is the destination for progress output (defaults to
+	// io.Discard).
+	Out io.Writer
+	// Verbose switches the human display layer to its detailed mode:
+	// per-tool probe lines (with local directories), per-batch and
+	// per-pass lines join the concise phase output. It never re-adds a
+	// secret: the connect/server URL, tickets, credentials and
+	// server-controlled free text (unknown tool names, raw errors) stay
+	// unprinted in every mode; only registry-canonical tool names and
+	// closed-set reason phrases are ever shown.
+	Verbose bool
 	// MaxTotalBatches optionally caps the total real ingest POST attempts
 	// of connect's sync phase across ALL queues — the device outbox
 	// drain, the account-source uploads and the history retransmission —

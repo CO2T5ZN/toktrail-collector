@@ -99,6 +99,14 @@ Common commands:
 - `toktrail service` installs or uninstalls the user-level scheduled task.
 - `toktrail privacy` and `toktrail doctor` provide local diagnostics.
 
+### Output and verbosity
+
+- `connect`, `periodic`, and `resync` print concise English progress by default. Long-running phases emit a periodic human-readable status line; interactive confirmations are always shown in full.
+- `--verbose` adds detail for the current run only. It changes what is printed, never what is authorized, scanned, uploaded, or confirmed: authorization, sync behavior, budget handling, and exit codes are identical with and without it.
+- `connect` and `periodic` keep `--json` (exactly one stable result object on stdout; human text moves to stderr) and `--progress-json` (collection progress events as JSON Lines on stderr). Stderr is not pure JSONL: it may also carry human text and interactive prompts, so consumers must identify event lines by the top-level `"type":"collection_progress"` field. These machine interfaces are documented by their schemas and tests; their formats do not change with `--verbose`.
+- Human-readable text — default output and `--verbose` output alike — is not a machine interface. It may be reworded between releases; scripts should consume `--json` / `--progress-json` instead of parsing human lines.
+- Before sharing command output or logs, check them for local metadata (paths, device or account identifiers, batch ids, server URLs) and prefer the redacted `--json` summary.
+
 ## Quick start for local development
 
 Build and inspect the CLI:

@@ -90,8 +90,14 @@ type PullFunc func(ctx context.Context, sessionToken string, from, to time.Time)
 type ConfirmFunc func(notice string, out io.Writer) (bool, error)
 
 // EnableNotice is the first-time confirmation notice (account scope,
-// credential reading, and the upload boundary).
-const EnableNotice = "TokTrail 将在本机读取 Cursor 桌面登录凭据，并直接向 Cursor 查询该账号的用量；仅上传脱敏后的用量记录（不包含 Cursor 登录凭据、邮箱或对话内容）。统计范围为整个 Cursor 账号（可能包含其他电脑上的使用）。"
+// sanitized uploads). The four consent facts it states are contractual:
+// the local read of the Cursor desktop login credentials, the direct
+// usage query against the account, the sanitized-only upload (never
+// credentials, email addresses or conversation content), and the
+// whole-account scope (usage from other computers may be included).
+// "Sanitized" is deliberate wording: it promises redaction, not
+// anonymity.
+const EnableNotice = "TokTrail will read the Cursor desktop login credentials on this machine and query this account's usage directly from Cursor; only sanitized usage records are uploaded (never Cursor login credentials, email addresses, or conversation content). The statistics cover the entire Cursor account (usage from other computers may be included)."
 
 // Options configures one sync or enable run.
 type Options struct {
@@ -1677,7 +1683,7 @@ func Enable(ctx context.Context, opt Options, confirm ConfirmFunc) (EnableResult
 	// Re-confirmation is required only when the account actually changed
 	// (switch pause). The same account reactivates without a new prompt.
 	if !sameAccount {
-		fmt.Fprintln(out, "检测到桌面登录切换到了另一个 Cursor 账号。")
+		fmt.Fprintln(out, "The Cursor desktop login has switched to a different account.")
 		if confirm == nil {
 			confirm = DefaultConfirm
 		}
@@ -1872,7 +1878,7 @@ func Logout(opt Options, purge bool) (removedLicense, purgedCache bool, err erro
 // explicit yes/y confirms.
 func DefaultConfirm(notice string, out io.Writer) (bool, error) {
 	fmt.Fprintln(out, notice)
-	fmt.Fprint(out, "确认在本机启用 Cursor 用量采集？[y/N] ")
+	fmt.Fprint(out, "Enable Cursor usage collection on this machine? [y/N] ")
 	line, err := readBoundedLine(os.Stdin, 64)
 	if err != nil {
 		return false, fmt.Errorf("no interactive input available: %w", err)

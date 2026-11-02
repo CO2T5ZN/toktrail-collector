@@ -89,8 +89,14 @@ func TestPeriodicJSONCompleteSingleObject(t *testing.T) {
 	if counts["syncedBatches"] != float64(3) || counts["pendingBatches"] != float64(0) {
 		t.Fatalf("unexpected counts: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "syncedBatches=3 syncedRecords=3") {
-		t.Fatalf("the historical human summary must move to stderr, got:\n%s", stderr.String())
+	// The default (non-verbose) human stream carries the concise
+	// one-line summary (the detailed counters are --verbose); the JSON
+	// counts above keep the machine coverage.
+	if !strings.Contains(stderr.String(), "Complete: 3 records confirmed in 3 batches") {
+		t.Fatalf("the concise human summary must move to stderr, got:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "syncedBatches=3") {
+		t.Fatalf("the machine counters must stay behind --verbose, got:\n%s", stderr.String())
 	}
 }
 
@@ -120,8 +126,18 @@ func TestPeriodicJSONBudgetExhaustedIncomplete(t *testing.T) {
 	if counts["pendingBatches"] != float64(2) {
 		t.Fatalf("the declined batches must be counted as pending: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "incomplete: the --max-total-batches 1 shared upload budget is exhausted") {
-		t.Fatalf("the historical incomplete text must move to stderr, got:\n%s", stderr.String())
+	// The default human stream carries the concise one-line summary:
+	// the Incomplete status word and the observed pending count (the
+	// verbose budget wording and the error text live on --verbose and
+	// main's unified failure line respectively).
+	if !strings.Contains(stderr.String(), "Incomplete:") {
+		t.Fatalf("the concise incomplete status must move to stderr, got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "2 batches pending") {
+		t.Fatalf("the concise summary must state the observed pending count, got:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "incomplete: the --max-total-batches") {
+		t.Fatalf("the verbose budget wording must stay behind --verbose, got:\n%s", stderr.String())
 	}
 }
 
@@ -187,8 +203,14 @@ func TestPeriodicDefaultModeKeepsHumanStdout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the drained run must succeed: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "syncedBatches=3 syncedRecords=3") {
-		t.Fatalf("the default mode must keep the human summary on stdout, got:\n%s", stdout.String())
+	// The default (non-verbose) human output is the concise one-line
+	// summary on stdout - the natural record count, never the machine
+	// counters (those are --verbose) and never JSON.
+	if !strings.Contains(stdout.String(), "3 records confirmed in 3 batches") {
+		t.Fatalf("the default mode must keep the natural summary on stdout, got:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "syncedBatches=") {
+		t.Fatalf("the machine counters must stay behind --verbose in the default mode, got:\n%s", stdout.String())
 	}
 	if strings.HasPrefix(stdout.String(), "{") {
 		t.Fatalf("the default mode must not emit JSON on stdout: %s", stdout.String())
@@ -321,7 +343,7 @@ func TestConnectJSONCompleteRun(t *testing.T) {
 	if scheduler["installed"] != true {
 		t.Fatalf("the scheduler section must report the installation: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "connected to") || !strings.Contains(stderr.String(), "bound device") {
+	if !strings.Contains(stderr.String(), "connected to") || !strings.Contains(stderr.String(), "device bound") {
 		t.Fatalf("the human setup log must move to stderr, got:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "connected to") {
@@ -359,8 +381,14 @@ func TestConnectJSONBudgetExhausted(t *testing.T) {
 	if counts["syncedBatches"] != float64(2) || counts["pendingBatches"] != float64(1) {
 		t.Fatalf("unexpected counts: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "incomplete:") {
-		t.Fatalf("the human incompleteness report must move to stderr, got:\n%s", stderr.String())
+	// The concise human verdict and the observed pending boundary move to
+	// stderr; the closed-code detail is --verbose (the JSON carries the
+	// machine verdict above).
+	if !strings.Contains(stderr.String(), "Connect result: incomplete; the server confirmed 2 batch(es) (2 record(s)).") {
+		t.Fatalf("the human incompleteness verdict with its facts must move to stderr, got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Device: 1 batch(es) remain pending.") {
+		t.Fatalf("the human pending boundary must move to stderr, got:\n%s", stderr.String())
 	}
 }
 
@@ -450,13 +478,13 @@ func TestConnectJSONPromptStaysInteractiveAndOffStdout(t *testing.T) {
 		t.Fatalf("stopReason = %v, want fatal_error: %s", decoded["stop_reason"], stdout.String())
 	}
 	// The prompt (and its decline) live on the human stream.
-	if !strings.Contains(stderr.String(), "Cursor 桌面登录凭据") {
+	if !strings.Contains(stderr.String(), "Cursor desktop login credentials") {
 		t.Fatalf("the interactive confirmation notice must move to stderr, got:\n%s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "not enabled") {
 		t.Fatalf("the decline guidance must move to stderr, got:\n%s", stderr.String())
 	}
-	if strings.Contains(stdout.String(), "Cursor 桌面登录凭据") || strings.Contains(stdout.String(), "not enabled") {
+	if strings.Contains(stdout.String(), "Cursor desktop login credentials") || strings.Contains(stdout.String(), "not enabled") {
 		t.Fatalf("stdout must carry only the JSON object: %s", stdout.String())
 	}
 }
@@ -512,8 +540,11 @@ func TestPeriodicJSONGrantFaultIsIncompleteNonZero(t *testing.T) {
 	if !found {
 		t.Fatalf("the faulting source must carry export_failed: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "incomplete:") {
-		t.Fatalf("the human stream must carry the incomplete line: %s", stderr.String())
+	// The default human stream carries the concise one-line summary: the
+	// Incomplete status word names the faulted source behind its closed
+	// phrase (the detailed grant lines are --verbose).
+	if !strings.Contains(stderr.String(), "Incomplete:") || !strings.Contains(stderr.String(), "did not complete") {
+		t.Fatalf("the concise human summary must name the faulted source: %s", stderr.String())
 	}
 }
 
@@ -1035,10 +1066,17 @@ func TestPeriodicJSONNeverInstalledAuthorizedSourceStaysComplete(t *testing.T) {
 	if strings.Contains(stderr.String(), "incomplete:") {
 		t.Fatalf("no incomplete line is owed for a never-installed tool: %s", stderr.String())
 	}
-	// The human stream keeps the historical pending line with its full
-	// reason text (by design), so the restriction is never silent.
-	if !strings.Contains(stderr.String(), "grantSync: pending Claude Code: default directory not found:") {
-		t.Fatalf("the grantSync pending line must keep reporting the restriction: %s", stderr.String())
+	// The default human stream carries the concise one-line summary; the
+	// never-installed source keeps the complete verdict on it. The
+	// restriction's detail (the grantSync pending line with its withheld
+	// marker) is --verbose output now, and its closed category stays
+	// asserted in the JSON scope section above - so it is never silent
+	// and never leaks unvetted text in any mode.
+	if !strings.Contains(stderr.String(), "Complete:") {
+		t.Fatalf("the concise human summary must state the complete verdict: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "grantSync: pending") {
+		t.Fatalf("the grantSync detail lines must stay behind --verbose: %s", stderr.String())
 	}
 }
 

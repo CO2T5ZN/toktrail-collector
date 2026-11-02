@@ -286,6 +286,7 @@ func TestRunPeriodicDefaultDrainsBeyondLegacyBound(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -321,6 +322,7 @@ func TestRunPeriodicDefaultDrainsBeyondLegacyBound(t *testing.T) {
 			"--server", server.URL,
 			"--drain-only",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -366,6 +368,7 @@ func TestRunPeriodicDefaultFairRotationDualQueue(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err != nil {
@@ -424,6 +427,7 @@ func TestRunPeriodicExplicitMaxBatchesNotTruncatedByDefaultTotal(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--max-batches", "200",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err != nil {
@@ -455,6 +459,7 @@ func TestRunPeriodicTotalBudgetExhaustionAndEmptyQueues(t *testing.T) {
 			"--server", server.URL,
 			"--max-total-batches", "3",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err == nil {
@@ -481,6 +486,7 @@ func TestRunPeriodicTotalBudgetExhaustionAndEmptyQueues(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out2, err := capturePeriodicStdout(t, func() error { return runPeriodic(args2) })
 		if err != nil {
@@ -506,6 +512,7 @@ func TestRunPeriodicTotalBudgetExhaustionAndEmptyQueues(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err == nil {
@@ -540,6 +547,7 @@ func TestRunPeriodicTotalBudgetExhaustionAndEmptyQueues(t *testing.T) {
 			"--state-dir", freshDir,
 			"--server", freshServer.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -587,6 +595,7 @@ func TestRunPeriodicPausedQueueKeepsPendingNoSpin(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -595,7 +604,7 @@ func TestRunPeriodicPausedQueueKeepsPendingNoSpin(t *testing.T) {
 	if !strings.Contains(err.Error(), "periodic incomplete") || !strings.Contains(err.Error(), "paused with 1 batch(es) still pending") {
 		t.Fatalf("the incomplete exit must name the paused account queue, got %v", err)
 	}
-	if !strings.Contains(out, "incomplete: the account cursor source is paused with 1 batch(es) still pending; the next run continues") {
+	if !strings.Contains(out, "incomplete: the account cursor source is paused with 1 batch(es) still pending; remaining work stays pending") {
 		t.Fatalf("expected the paused-account incomplete report, stdout:\n%s", out)
 	}
 	if !strings.Contains(out, "cursor sync: outcome=paused pending=1") {
@@ -604,7 +613,7 @@ func TestRunPeriodicPausedQueueKeepsPendingNoSpin(t *testing.T) {
 	if !strings.Contains(out, "syncedBatches=0 syncedRecords=0") {
 		t.Fatalf("the paused device queue must upload nothing, stdout:\n%s", out)
 	}
-	if !strings.Contains(out, "pendingRemaining=2 (the run stopped before the queues were empty; the next run continues)") {
+	if !strings.Contains(out, "pendingRemaining=2 (the run stopped before the queues were empty; remaining work stays pending)") {
 		t.Fatalf("the device pending must be preserved with the fair-mode remainder report, stdout:\n%s", out)
 	}
 	if !strings.Contains(out, "cursor sync: exportedBatches=0 syncedBatches=1 syncedRecords=1 pendingRemaining=1") {

@@ -112,6 +112,7 @@ func TestRunPeriodicCursorPullFailureIsIncomplete(t *testing.T) {
 		"--server", server.URL,
 		"--sync-timeout", "30s",
 		"--progress-json",
+		"--verbose",
 	}
 	out, stderr, err := capturePeriodicStdoutAndStderr(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -121,7 +122,10 @@ func TestRunPeriodicCursorPullFailureIsIncomplete(t *testing.T) {
 		!strings.Contains(err.Error(), "cursor usage pull failed") {
 		t.Fatalf("the incomplete exit must name the failed account pull, got %v", err)
 	}
-	if !strings.Contains(out, "incomplete: the account cursor source failed: cursor usage pull failed (watermark not advanced): synthetic upstream outage; the next run continues") {
+	// The verbose human line carries the STRUCTURED reason only (the
+	// raw pull diagnostic is withheld as untrusted free text); the
+	// returned error chain above keeps the full historical text.
+	if !strings.Contains(out, "incomplete: the account cursor source failed this run; remaining work stays pending") {
 		t.Fatalf("expected the failed-pull incomplete report, stdout:\n%s", out)
 	}
 	if !strings.Contains(out, "cursor sync: outcome=error pending=0") {
@@ -155,6 +159,7 @@ func TestRunPeriodicCursorRetryExhaustedIsIncomplete(t *testing.T) {
 		"--server", server.URL,
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -196,6 +201,7 @@ func TestRunPeriodicCursorFenceFlipIsIncomplete(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -207,8 +213,8 @@ func TestRunPeriodicCursorFenceFlipIsIncomplete(t *testing.T) {
 	if !strings.Contains(out, "cursor sync: outcome=fence_stop pending=1") {
 		t.Fatalf("the fence-stop outcome must be named explicitly, stdout:\n%s", out)
 	}
-	if !strings.Contains(out, "cursor sync: cursor source fence changed; a full sync is required to recover pending history") {
-		t.Fatalf("the skip reason must stay visible, stdout:\n%s", out)
+	if !strings.Contains(out, "cursor sync: stopped by an authorization or source-state change") {
+		t.Fatalf("the skip state must stay visible (closed-set phrase), stdout:\n%s", out)
 	}
 	if n := periodicCursorPending(t, stateDir); n != 1 {
 		t.Fatalf("the skipped batch must stay pending, got %d", n)
@@ -234,6 +240,7 @@ func TestRunPeriodicCursorScopeExclusionVerdicts(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -268,6 +275,7 @@ func TestRunPeriodicCursorScopeExclusionVerdicts(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err == nil {
@@ -304,6 +312,7 @@ func TestRunPeriodicCursorNoPermitAndPausedPermitStayClean(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -314,6 +323,12 @@ func TestRunPeriodicCursorNoPermitAndPausedPermitStayClean(t *testing.T) {
 		}
 		if !strings.Contains(out, "cursor sync: outcome=no_permit pending=0") {
 			t.Fatalf("the absent permit must be named explicitly, stdout:\n%s", out)
+		}
+		// The closed-set skip phrase prints for a no-permit round too
+		// (the permit was never loaded, so the Status gate would have
+		// hidden it); the raw skip text never does.
+		if !strings.Contains(out, "cursor sync: no local permit") {
+			t.Fatalf("the no-permit closed phrase must print, stdout:\n%s", out)
 		}
 		if !strings.Contains(out, "syncedBatches=1 syncedRecords=1") {
 			t.Fatalf("the device queue must still drain, stdout:\n%s", out)
@@ -334,6 +349,7 @@ func TestRunPeriodicCursorNoPermitAndPausedPermitStayClean(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -376,6 +392,7 @@ func TestRunPeriodicCursorBoundedPendingStaysClean(t *testing.T) {
 				"--state-dir", stateDir,
 				"--server", server.URL,
 				"--sync-timeout", "30s",
+				"--verbose",
 			}, tc.args...)
 			out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 			if err != nil {
@@ -416,6 +433,7 @@ func TestRunPeriodicCursorFenceRecoveryStaysClean(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err != nil {
@@ -424,8 +442,12 @@ func TestRunPeriodicCursorFenceRecoveryStaysClean(t *testing.T) {
 	if strings.Contains(out, "incomplete:") || strings.Contains(out, "outcome=") {
 		t.Fatalf("a recovered round must report neither incompleteness nor a stop outcome, stdout:\n%s", out)
 	}
-	if !strings.Contains(out, "2 pending batch(es) fenced out after the source fence moved") {
-		t.Fatalf("the recovery notes must stay visible, stdout:\n%s", out)
+	// The fenced-out count lives only in the round's free-text note,
+	// which verbose withholds by design; the recovery itself is proven
+	// below by the clean exit, the re-pulled counts and the drained
+	// queue state.
+	if !strings.Contains(out, "cursor sync: note present (details withheld)") {
+		t.Fatalf("the recovery note renders the withheld marker, stdout:\n%s", out)
 	}
 	if !strings.Contains(out, "cursor sync: exportedBatches=1 syncedBatches=1 syncedRecords=2 pendingRemaining=0") {
 		t.Fatalf("the re-pulled history must upload, stdout:\n%s", out)
@@ -469,6 +491,7 @@ func TestRunPeriodicCursorNoStableIDIsIncomplete(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -480,7 +503,7 @@ func TestRunPeriodicCursorNoStableIDIsIncomplete(t *testing.T) {
 	if !strings.Contains(out, "cursor sync: pulledEvents=2 new=1 replaced=0 unchanged=0 noStableId=1") {
 		t.Fatalf("the dropped event must be visible in the round summary, stdout:\n%s", out)
 	}
-	if !strings.Contains(out, "incomplete: the account cursor source skipped 1 usage event(s) without a stable upstream id (those events are not counted); the next run continues") {
+	if !strings.Contains(out, "incomplete: the account cursor source skipped 1 usage event(s) without a stable upstream id (those events are not counted); remaining work stays pending") {
 		t.Fatalf("expected the dropped-events incomplete report, stdout:\n%s", out)
 	}
 	if n := periodicCursorPending(t, stateDir); n != 0 {
@@ -511,6 +534,7 @@ func TestRunPeriodicCursorLegacyPausedBacklogIsIncomplete(t *testing.T) {
 		"--server", server.URL,
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -522,8 +546,8 @@ func TestRunPeriodicCursorLegacyPausedBacklogIsIncomplete(t *testing.T) {
 	if !strings.Contains(out, "cursor sync: outcome=paused pending=2") {
 		t.Fatalf("the paused skip must carry its recounted backlog, stdout:\n%s", out)
 	}
-	if !strings.Contains(out, "cursor sync: device is not authorized to upload (paused=true revoked=false)") {
-		t.Fatalf("the paused skip reason must stay visible, stdout:\n%s", out)
+	if !strings.Contains(out, "cursor sync: paused") {
+		t.Fatalf("the paused skip state must stay visible (closed-set phrase), stdout:\n%s", out)
 	}
 	if got := server.srcIngest.Load(); got != 0 {
 		t.Fatalf("a paused account queue must upload nothing, got %d", got)
@@ -554,6 +578,7 @@ func TestRunPeriodicCursorAccountSwitchAfterWorkIsDrift(t *testing.T) {
 			"--server", server.URL,
 			"--max-batches", "5",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err == nil {
@@ -589,6 +614,7 @@ func TestRunPeriodicCursorAccountSwitchAfterWorkIsDrift(t *testing.T) {
 			"--server", server.URL,
 			"--max-batches", "5",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -600,8 +626,8 @@ func TestRunPeriodicCursorAccountSwitchAfterWorkIsDrift(t *testing.T) {
 		if !strings.Contains(out, "cursor sync: outcome=auth_withheld pending=0") {
 			t.Fatalf("the pre-work switch must stay a withheld verdict, stdout:\n%s", out)
 		}
-		if !strings.Contains(out, "cursor sync: the desktop login switched to a different Cursor account") {
-			t.Fatalf("the switch reason must stay visible, stdout:\n%s", out)
+		if !strings.Contains(out, "cursor sync: withheld by the current authorization") {
+			t.Fatalf("the switch state must stay visible (closed-set phrase), stdout:\n%s", out)
 		}
 		if pull.calls != 0 {
 			t.Fatalf("the switched round must never pull, pulls=%d", pull.calls)
@@ -620,6 +646,7 @@ func TestRunPeriodicCursorAccountSwitchAfterWorkIsDrift(t *testing.T) {
 			"--state-dir", stateDir,
 			"--server", server.URL,
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err == nil {

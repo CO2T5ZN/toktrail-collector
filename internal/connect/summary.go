@@ -150,21 +150,23 @@ func normalizeBindStatus(status BindStatus) BindStatus {
 // that never recorded how far binding got.
 const BindUnknownSummary BindStatus = "unknown"
 
-// connectStopReason composes the run verdict. Sentinel classification
-// comes first (busy, budget, cancellation, retry exhaustion) and a
-// hard error ALWAYS stays fatal: only the honest incompleteness
-// envelope (errors.Is(err, ErrSyncIncomplete)) may be refined from the
-// structured sync state — the run-wide budget stop, an authorization
-// drift, a pause, or an authorized source this device could not cover
-// (partial). A nil error is complete except for the defensive
-// uncovered-source check (connect.Run turns uncovered work into
-// ErrSyncIncomplete through evaluateIncomplete, so a real nil-error
-// run has none).
-func connectStopReason(res Result, err, ctxErr error) collection.StopReason {
+// SyncStopReason composes one Sync orchestration's verdict from the
+// closed sets — the same classification SummarizeRun applies to a
+// connect run. Sentinel classification comes first (busy, budget,
+// cancellation, retry exhaustion) and a hard error ALWAYS stays fatal:
+// only the honest incompleteness envelope (errors.Is(err,
+// ErrSyncIncomplete)) may be refined from the structured sync state —
+// the run-wide budget stop, an authorization drift, a pause, or an
+// authorized source this device could not cover (partial). A nil error
+// is complete except for the defensive uncovered-source check
+// (evaluateIncomplete turns uncovered work into ErrSyncIncomplete, so a
+// real nil-error run has none). Exported so the resync CLI's human
+// rendering reuses exactly this verdict instead of inventing one.
+func SyncStopReason(sync SyncResult, err, ctxErr error) collection.StopReason {
 	reason, classified := collection.ClassifyRunError(err, ctxErr)
 	if !classified {
-		if collection.PendingCoverageConcerns(res.Sync.Collection.GrantSync.Pending) > 0 ||
-			collection.PendingCoverageConcerns(res.Sync.Backlog.Result.GrantSync.Pending) > 0 {
+		if collection.PendingCoverageConcerns(sync.Collection.GrantSync.Pending) > 0 ||
+			collection.PendingCoverageConcerns(sync.Backlog.Result.GrantSync.Pending) > 0 {
 			return collection.StopPartial
 		}
 		return collection.StopComplete
@@ -177,7 +179,6 @@ func connectStopReason(res Result, err, ctxErr error) collection.StopReason {
 		// structural refinements below.
 		return collection.StopFatalError
 	}
-	sync := res.Sync
 	switch {
 	case sync.BudgetExhausted:
 		return collection.StopBudgetExhausted
@@ -196,6 +197,13 @@ func connectStopReason(res Result, err, ctxErr error) collection.StopReason {
 	default:
 		return collection.StopFatalError
 	}
+}
+
+// connectStopReason is SyncStopReason over the connect run's sync
+// state; connect.Run's own Result carries nothing the verdict reads
+// beyond it.
+func connectStopReason(res Result, err, ctxErr error) collection.StopReason {
+	return SyncStopReason(res.Sync, err, ctxErr)
 }
 
 // historyScopeUnconfirmed reports the history phase that ran without

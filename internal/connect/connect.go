@@ -82,6 +82,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if out == nil {
 		out = io.Discard
 	}
+	// The human display layer: concise phase output by default, detail
+	// under Verbose. Nothing below reads it back — display only.
+	d := newDisplay(out, opt.Verbose)
 
 	nowFn := opt.Now
 	if nowFn == nil {
@@ -151,7 +154,12 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err != nil {
 		return Result{BindStatus: BindNotAttempted}, err
 	}
-	fmt.Fprintf(out, "connected to %s (applicationId=%s, subjectId=%s)\n", strippedURL, cfg.ApplicationID, cfg.SubjectID)
+	// The connect acknowledgement merges with the bind outcome below
+	// into ONE setup line. The connect/server URL (even stripped of its
+	// ticket fragment and query) is never printed in ANY mode — an
+	// attacker-controlled server can reflect ticket material into the
+	// path or the serverUrl field, so no mode echoes server-controlled
+	// strings here, and the internal consent revision is verbose-only.
 
 	// Compute deterministic receipt fingerprint (SHA-256 of ticket and canonical URL).
 	fingerprint := computeReceiptFingerprint(ticket, strippedURL)
@@ -303,7 +311,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					return fmt.Errorf("save state: %w", err)
 				}
 			}
-			fmt.Fprintf(out, "device %s already bound; skipping bind\n", deviceID)
+			// Device identifiers never enter the human display: the id is
+			// server-controlled (unvetted reflection surface), so both the
+			// concise and the verbose lines carry only the local fact.
+			d.phase("connected to server; device already bound")
+			d.detail("bind skipped for this receipt; consent revision %d", consentRev)
 		} else {
 			skippedBind = false
 			bindStatus = BindNotAttempted
@@ -349,7 +361,8 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			if err := store.Save(st); err != nil {
 				return fmt.Errorf("save bound state: %w", err)
 			}
-			fmt.Fprintf(out, "bound device %s (consentRevision=%d)\n", deviceID, consentRev)
+			d.phase("connected to server; device bound")
+			d.detail("consent revision %d", consentRev)
 		}
 
 		// Tool probing. Tools that could not be activated are reported to
@@ -358,13 +371,23 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		// flow with synced / no_new_records and are intentionally absent
 		// here. Duplicate entries in cfg.Tools are collapsed by tool name
 		// so the report stays within the tool-status contract.
+		//
+		// Display: the merged sources line below carries the per-category
+		// COUNTS (deduplicated by tool name); the per-tool lines are
+		// verbose-only for the local probes. An unsupported tool name is
+		// never echoed in any mode — it is unvetted server text.
 		var grantsToApply []grants.Grant
 		var probeStatuses []syncclient.ToolStatus
 		reportedProbe := map[string]bool{}
+		var toolCounts toolCountSet
 		for _, toolName := range cfg.Tools {
 			spec, ok := registry.LookupTool(toolName)
 			if !ok {
-				fmt.Fprintf(out, "tool %q: unsupported tool; skipped\n", toolName)
+				// Counted, never echoed: the raw spelling is
+				// server-controlled and unvetted.
+				if toolCounts.counted(toolName) {
+					toolCounts.unsupported++
+				}
 				if !reportedProbe[toolName] {
 					reportedProbe[toolName] = true
 					probeStatuses = append(probeStatuses, syncclient.ToolStatus{
@@ -387,8 +410,12 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				// the sync phase reports the account source as incomplete
 				// instead.
 				accountTools = append(accountTools, spec.Tool)
+				counted := toolCounts.counted(spec.Tool)
 				if opt.Cursor == nil {
-					fmt.Fprintf(out, "tool %q: account source; this build has no cursor wiring, skipped\n", spec.Tool)
+					d.phase("tool %q: account source; this build has no cursor wiring, skipped", spec.Tool)
+					if counted {
+						toolCounts.accountNotEnabled++
+					}
 					continue
 				}
 				license, hasLicense, lErr := cursorsource.New(stateDir).Load()
@@ -396,8 +423,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					return lErr
 				}
 				if hasLicense && license.Collectable() {
-					fmt.Fprintf(out, "tool %q: local permit already active; the initial collection continues it\n", spec.Tool)
+					d.phase("tool %q: local permit already active; the initial collection continues it", spec.Tool)
 					authorizedTools = append(authorizedTools, spec.Tool)
+					if counted {
+						toolCounts.accountActive++
+					}
 					continue
 				}
 				enableOpts := *opt.Cursor
@@ -423,8 +453,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				// heartbeat. The emitter is scoped to the enable phase
 				// alone and stopped before the sync phase starts — no
 				// ticker ever overlaps the initial round's own emitter. A
-				// nil Progress keeps the enable byte-for-byte on its
-				// historical path (no emitter, no goroutine, no events).
+				// nil Progress keeps the enable free of progress wiring
+				// (no emitter, no goroutine, no events); the human text
+				// itself is the display layer's, in every mode.
 				// The origin label stays conservatively unknown: the
 				// round's internal drain runs before the first pull, so
 				// its batches' provenance is mixed by the same rule every
@@ -444,7 +475,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					return cursorsync.Enable(ctx, enableOpts, opt.CursorConfirm)
 				}()
 				if enableErr != nil {
-					fmt.Fprintf(out, "tool %q: %v\n", spec.Tool, enableErr)
+					// The raw error text is never echoed into the human
+					// display (unvetted text may carry reflected
+					// material): the closed-set lines below carry the
+					// boundary, and the structured reason flows through
+					// the run's incompleteness channel unchanged.
 					if enableRes.Sync.Ran {
 						// The first sync attempt executed and failed: the
 						// server-side enable already happened and the
@@ -459,24 +494,47 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 						// no-op there): the honest guidance is the
 						// continuation path.
 						cursorFirstSyncFailed = enableErr.Error()
+						if counted {
+							toolCounts.accountFirstSyncIncomplete++
+						}
 						if budgetDeclined(enableErr) {
-							fmt.Fprintf(out, "tool %q: enabled; the first sync stopped at this run's shared sync budget — the pending batches continue on the next connect or the scheduled collection\n", spec.Tool)
+							// Neutral wording: no reconnect advice (a
+							// reconnect may re-run the history phase)
+							// and no scheduled-continuation promise
+							// (the service install may have failed, the
+							// device may be paused).
+							d.phase("tool %q: enabled; the first sync stopped at this run's shared sync budget; pending work remains", spec.Tool)
 						} else {
-							fmt.Fprintf(out, "tool %q: enabled; the first sync did not complete — the permit and its queue keep their state and the next connect or the scheduled collection continues them\n", spec.Tool)
+							d.phase("tool %q: enabled; the first sync did not complete; the permit and its queue keep their state", spec.Tool)
 						}
 					} else {
 						// No permit exists (a declined confirmation, a
 						// capability or credential failure before the
 						// enable wrote anything): the interactive enable
 						// remains the right pointer.
-						fmt.Fprintf(out, "tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally\n", spec.Tool)
+						if counted {
+							toolCounts.accountNotEnabled++
+						}
+						d.phase("tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
 					}
 					continue
 				}
-				fmt.Fprintf(out, "tool %q: enabled (source %s, state=%s)\n", spec.Tool,
+				d.phase("tool %q: enabled (source %s, state=%s)", spec.Tool,
 					sourceConfiguredLabel(enableRes.Source.SourceInstanceID), displaySourceState(enableRes.Source.State))
 				if enableRes.Sync.Ran {
-					fmt.Fprintf(out, "tool %q: first sync pulled=%d new=%d replaced=%d uploaded=%d pending=%d\n",
+					// The default line is natural English and only the
+					// confirmed fact: records the server's receipts
+					// confirmed (never "new" or "unique" records - a
+					// receipt says accepted, nothing more). The pending
+					// count prints only behind its own observation gate;
+					// the diagnostic counters stay verbose-only.
+					if enableRes.Sync.SyncedRecords > 0 {
+						d.phase("%s: the server confirmed %d record(s).", spec.Tool, enableRes.Sync.SyncedRecords)
+					}
+					if enableRes.Sync.PendingCounted && enableRes.Sync.PendingRemaining > 0 {
+						d.phase("%d %s batch(es) remain pending.", enableRes.Sync.PendingRemaining, spec.Tool)
+					}
+					d.detail("%s first sync: pulled=%d new=%d replaced=%d uploaded=%d pending=%d",
 						spec.Tool, enableRes.Sync.PulledEvents, enableRes.Sync.NewRecords, enableRes.Sync.ReplacedRecords, enableRes.Sync.SyncedRecords, enableRes.Sync.PendingRemaining)
 					// The enable's first sync pulled the full authorized
 					// window (a fresh permit has no watermark) and it is
@@ -487,6 +545,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					cursorFreshlyEnabled = true
 				}
 				authorizedTools = append(authorizedTools, spec.Tool)
+				if counted {
+					toolCounts.accountActive++
+				}
 				continue
 			}
 			targetDir := spec.ResolveDefaultInput(homeDir)
@@ -501,8 +562,12 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				}
 				// Truly absent (os.ErrNotExist): the tool is not
 				// installed at its default location — a normal,
-				// observable skip.
-				fmt.Fprintf(out, "tool %q: directory %s not found; skipped\n", spec.Tool, targetDir)
+				// observable skip, reported in the merged counts line
+				// (verbose shows the per-tool directory line).
+				if toolCounts.counted(spec.Tool) {
+					toolCounts.notDetected++
+				}
+				d.detail("tool %q: not detected at its default location; skipped (local path withheld)", spec.Tool)
 				if !reportedProbe[spec.Tool] {
 					reportedProbe[spec.Tool] = true
 					probeStatuses = append(probeStatuses, syncclient.ToolStatus{
@@ -522,7 +587,15 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				// this probe (only the default directory does).
 				return fmt.Errorf("probe default directory for tool %q: %s exists but is not a directory", spec.Tool, targetDir)
 			}
-			fmt.Fprintf(out, "tool %q: detected directory %s; authorized\n", spec.Tool, targetDir)
+			if toolCounts.counted(spec.Tool) {
+				toolCounts.detected++
+			}
+			// The local path is withheld even under --verbose: the
+			// HOME-derived default directory is environment-controlled
+			// text (a hostile environment can plant ticket material in
+			// it), and the canonical tool name plus the status carry
+			// the diagnostic value.
+			d.detail("tool %q: detected at its default location; authorized (local path withheld)", spec.Tool)
 			authorizedTools = append(authorizedTools, spec.Tool)
 			grantsToApply = append(grantsToApply, grants.Grant{
 				Source: spec.Source,
@@ -535,13 +608,28 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		if err != nil {
 			return fmt.Errorf("apply grants: %w", err)
 		}
+		// The merged sources line: one line for the whole probe, with
+		// deduplicated per-category counts and closed-set labels. The
+		// categories never collapse into each other — an unsupported
+		// name is not "not installed", and an account source awaiting
+		// its local confirmation is neither.
+		if summary := toolCounts.summary(); summary != "" {
+			d.phase("sources: %s", summary)
+		}
 		if len(enabledGrants) == 0 && len(authorizedTools) == 0 {
 			// Account-network tools (Cursor) never create local grants;
 			// a run that enabled one is not "no sources active".
-			fmt.Fprintf(out, "warning: no tool directories detected locally; no sources active\n")
+			d.phase("warning: no tool directories detected locally; no sources active")
 		}
 
-		// Scheduler installation
+		// Scheduler installation. The scheduler package's own output is
+		// ISOLATED behind schedulerNotes: its best-effort failure notes
+		// and its dry-run plan quote raw command errors and full local
+		// paths, so the raw text is never forwarded to any display
+		// mode - only the fact that a note occurred survives, rendered
+		// as one fixed safe line below. The installation itself, its
+		// error propagation and its rollback are untouched.
+		schedNotes := &schedulerNotes{}
 		plan, err := scheduler.Install(scheduler.InstallOptions{
 			Config: scheduler.TaskConfig{
 				Platform: runtime.GOOS,
@@ -552,13 +640,24 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			},
 			Runner: opt.SchedulerRunner,
 			DryRun: opt.DryRun,
-			Out:    out,
+			Out:    schedNotes,
 		})
 		if err != nil {
 			return fmt.Errorf("install service failed: %w", err)
 		}
 		serviceIdentity = plan.TaskName
-		fmt.Fprintf(out, "installed service %s (interval=%s)\n", plan.TaskName, interval)
+		// Reader-facing wording without the internal task name; the
+		// line prints only after the installation succeeded, so
+		// "enabled" is never claimed over a failed install - and a dry
+		// run never claims an installation at all (only the plan was
+		// prepared). The plan and result contracts are untouched.
+		if opt.DryRun {
+			d.phase("scheduled collection plan prepared (dry run; not installed)")
+		} else if schedNotes.seen {
+			d.phase("scheduled collection enabled (every %s); a non-critical setup step reported a note (details withheld)", interval)
+		} else {
+			d.phase("scheduled collection enabled (every %s)", interval)
+		}
 
 		// 6. Report probe-only tool statuses to the server. Older servers
 		// that have not deployed the tool-status endpoint answer 404/405,
@@ -628,6 +727,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		HTTPClient:            opt.HTTPClient,
 		Now:                   nowFn,
 		Out:                   out,
+		Verbose:               opt.Verbose,
 		HomeDir:               homeDir,
 		Cursor:                opt.Cursor,
 		CursorFreshlyEnabled:  cursorFreshlyEnabled,

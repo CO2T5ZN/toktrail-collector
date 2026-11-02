@@ -446,6 +446,15 @@ func runCursorConnectWithOptionsOut(t *testing.T, cfg *syncConfigMock, stateDir,
 
 func runSyncConnectWithOptions(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket string, extra Options) (Result, error) {
 	t.Helper()
+	res, err, _ := runSyncConnectWithOutput(t, cfg, stateDir, homeDir, ticket, extra)
+	return res, err
+}
+
+// runSyncConnectWithOutput is runSyncConnectWithOptions's twin that
+// also returns the captured human output (the display-layer regression
+// tests read it).
+func runSyncConnectWithOutput(t *testing.T, cfg *syncConfigMock, stateDir, homeDir, ticket string, extra Options) (Result, error, string) {
+	t.Helper()
 	out := &strings.Builder{}
 	opt := Options{
 		URL:             fmt.Sprintf("%s/api/collector/connect#%s", cfg.URL, ticket),
@@ -469,8 +478,17 @@ func runSyncConnectWithOptions(t *testing.T, cfg *syncConfigMock, stateDir, home
 	if extra.Retry != nil {
 		opt.Retry = extra.Retry
 	}
+	if extra.Verbose {
+		opt.Verbose = true
+	}
+	if extra.DryRun {
+		opt.DryRun = true
+	}
+	if extra.SchedulerRunner != nil {
+		opt.SchedulerRunner = extra.SchedulerRunner
+	}
 	res, err := Run(context.Background(), opt)
-	return res, err
+	return res, err, out.String()
 }
 
 func journalExists(stateDir string) bool {
@@ -1270,7 +1288,7 @@ func TestSyncResyncPhaseSkipsWhenStateBusy(t *testing.T) {
 		ServerURL:  mock.URL,
 		HTTPClient: mock.Client(),
 		Now:        func() time.Time { return syncTestNow },
-	}, nil, out, func() time.Time { return syncTestNow }, nil)
+	}, nil, newDisplay(out, false), func() time.Time { return syncTestNow }, nil)
 	if phaseErr != nil {
 		t.Fatalf("a busy lock is a recorded skip, not a hard error, got %v", phaseErr)
 	}

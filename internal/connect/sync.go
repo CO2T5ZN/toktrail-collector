@@ -170,6 +170,11 @@ type SyncOptions struct {
 	Now func() time.Time
 	// Out receives progress output (defaults to io.Discard).
 	Out io.Writer
+	// Verbose switches the human display to its detailed mode: per-pass
+	// collection rounds and per-batch retransmission lines join the
+	// concise phase output. Never a secret: URLs, tickets, device ids
+	// and server-controlled free text stay unprinted in every mode.
+	Verbose bool
 
 	// HomeDir and CollectorVersion forward to the collection rounds.
 	HomeDir          string
@@ -582,6 +587,9 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	if out == nil {
 		out = io.Discard
 	}
+	// The human display layer: concise phase output by default, detail
+	// under Verbose. Display only — nothing reads it back.
+	d := newDisplay(out, opt.Verbose)
 	// The serialized dispatch for connect's own phase markers and the
 	// history adapter. The collection rounds construct their own
 	// emitters over opt.Progress (serialized by construction); this
@@ -644,7 +652,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			return syncRes, fmt.Errorf("history retransmission planning failed: %w", err)
 		}
 		syncRes.Resync.Stop = ResyncStopCompleted
-		fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope NOT verified; execution checks consent before every upload")
+		d.phase("dry-run: offline, no files changed, remote consent scope NOT verified; execution checks consent before every upload")
 		return syncRes, nil
 	}
 
@@ -676,7 +684,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 				return syncRes, fmt.Errorf("override planning failed: %w", err)
 			}
 			syncRes.Resync.Stop = ResyncStopCompleted
-			fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope and server capability NOT verified")
+			d.phase("dry-run: offline, no files changed, remote consent scope and server capability NOT verified")
 			return syncRes, nil
 		}
 		if err := checkHistoryOwnership(stateDir); err != nil {
@@ -687,7 +695,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			if errors.Is(err, runlock.ErrBusy) {
 				syncRes.Resync.Skipped = fmt.Sprintf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the override pass was NOT run", stateLockRetryTotal)
 				syncRes.Resync.Stop = ResyncStopBusy
-				fmt.Fprintf(out, "override pass: not run (%s)\n", syncRes.Resync.Skipped)
+				d.phase("override pass: not run (the state directory stayed busy; another collector process holds the lock)")
 				return syncRes, nil
 			}
 			return syncRes, fmt.Errorf("acquire state lock for the override pass: %w", err)
@@ -702,7 +710,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			HTTPClient: opt.HTTPClient,
 			MaxBatches: opt.ResyncMaxBatches,
 			Confirm:    opt.ResyncOverrideConfirm,
-			Progress:   progressOverrideOrDefault(opt.ResyncOverrideProgress, out),
+			Progress:   progressOverrideOrDefault(opt.ResyncOverrideProgress, d),
 			Now:        now,
 		})
 		_ = lock.Close()
@@ -711,7 +719,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			if errors.Is(overrideErr, syncclient.ErrDevicePaused) {
 				syncRes.Resync.Skipped = overrideErr.Error()
 				syncRes.Resync.Stop = ResyncStopPaused
-				fmt.Fprintf(out, "override pass: skipped (device paused)\n")
+				d.phase("override pass: skipped (device paused)")
 				return syncRes, nil
 			}
 			syncRes.Resync.Err = overrideErr.Error()
@@ -719,8 +727,9 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			return syncRes, fmt.Errorf("override pass failed: %w", overrideErr)
 		}
 		syncRes.Resync.Stop = ResyncStopCompleted
-		fmt.Fprintf(out, "override pass: complete (uploads=%d replaced=%d inserted=%d confirmedKeys=%d)\n", res.Uploads, res.ReplacedRecords, res.InsertedRecords, res.ConfirmedKeys)
-		fmt.Fprintln(out, "normal collection resumes on the next ordinary sync or scheduled run")
+		d.phase("override pass: complete")
+		d.detail("override pass: uploads=%d replaced=%d inserted=%d confirmedKeys=%d", res.Uploads, res.ReplacedRecords, res.InsertedRecords, res.ConfirmedKeys)
+		d.phase("normal collection resumes on the next ordinary sync or scheduled run")
 		return syncRes, nil
 	}
 
@@ -748,9 +757,9 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 				syncRes.Resync.Stop = ResyncStopFailed
 				return syncRes, fmt.Errorf("history retransmission planning failed: %w", planErr)
 			}
-			fmt.Fprintln(out, "plan note: no synced history is eligible under the current local grants; source scanning may still upload usage")
+			d.phase("plan note: no synced history is eligible under the current local grants; source scanning may still upload usage")
 		} else {
-			fmt.Fprintln(out, "plan note: the confirmed plan lists the already-synced archive only; batches this run's collection syncs join the executed retransmission afterwards")
+			d.phase("plan note: the confirmed plan lists the already-synced archive only; batches this run's collection syncs join the executed retransmission afterwards")
 		}
 		if err := opt.ResyncConfirm(planRes.Plan); err != nil {
 			return syncRes, fmt.Errorf("sync aborted before any collection or upload: %w", err)
@@ -764,7 +773,10 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	// setup just performed the first-time cursor enable runs the round's
 	// cursor phase drain-only (no second upstream pull); every other
 	// run — a reconnect, the resync CLI — keeps the full cursor round.
-	fmt.Fprintf(out, "running initial collection...\n")
+	// The initial round's start line prints immediately (the user-
+	// approved phase progress); its healthy outcome is carried by the
+	// final result summary, and the detailed counters are verbose.
+	d.phase("Collecting local usage...")
 	collectOpts := collection.Options{
 		StateDir:              stateDir,
 		ServerURL:             opt.ServerURL,
@@ -812,12 +824,12 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			if budgetTotalOrDeadlineDeclined(collectErr) {
 				syncRes.BudgetExhausted = true
 			}
-			fmt.Fprintf(out, "initial collection: stopped at the shared sync budget (the drained part stands, the rest stays pending): %v\n", collectErr)
+			d.phase("initial collection: stopped at the shared sync budget (the drained part stands, the rest stays pending)")
 		} else {
 			return syncRes, fmt.Errorf("initial collection failed: %w", collectErr)
 		}
 	}
-	printCollectionRound(out, "initial collection", collectRes)
+	printCollectionRound(d, "initial collection", collectRes)
 
 	// The history retransmission's scope: the caller's explicit snapshot
 	// wins; a capture-flagged run (connect) uses the §6.3 snapshot the
@@ -852,7 +864,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		// until the queues are empty or the budget declines.
 		stageStarted := emitProgressStageStart(progress, "backlog")
 		var backlogErr error
-		syncRes, backlogErr = drainBacklog(ctx, syncRes, collectOpts, out, maxBacklogPasses, budget)
+		syncRes, backlogErr = drainBacklog(ctx, syncRes, collectOpts, d, maxBacklogPasses, budget)
 		emitProgressStageEnd(progress, "backlog", stageStarted)
 		if backlogErr != nil && runErr == nil {
 			runErr = backlogErr
@@ -871,6 +883,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		// case.
 		historyStageStarted := emitProgressStageStart(progress, "history")
 		defer emitProgressStageEnd(progress, "history", historyStageStarted)
+		d.detail("retransmitting history...")
 		switch {
 		case collectRes.GrantSync.Paused:
 			// Pause is a server state, not a run failure — collection
@@ -878,7 +891,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			// completeness evaluation still reports it.
 			syncRes.Resync.Skipped = "server reports collection paused for this device; history retransmission not attempted"
 			syncRes.Resync.Stop = ResyncStopPaused
-			fmt.Fprintf(out, "history retransmission: skipped (device paused)\n")
+			d.phase("history retransmission: skipped (device paused)")
 		case historyBlockedByBudget(syncRes, resyncSnapshot, budget):
 			// The shared budget can no longer grant ANY history POST
 			// (the run-wide total is spent, or a total/deadline decline
@@ -890,9 +903,9 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			syncRes.Resync.Skipped = "the run's shared sync budget was exhausted before the history retransmission; re-run connect or toktrail resync --all to resume it under a fresh budget"
 			syncRes.Resync.Stop = ResyncStopBudget
 			syncRes.BudgetExhausted = true
-			fmt.Fprintf(out, "history retransmission: not run (the shared sync budget is exhausted; nothing was sent or lost)\n")
+			d.phase("history retransmission: not started because the run's upload budget was reached")
 		default:
-			summary, hardErr, budgetStopped := runResyncPhase(ctx, stateDir, opt, resyncSnapshot, out, now, progress)
+			summary, hardErr, budgetStopped := runResyncPhase(ctx, stateDir, opt, resyncSnapshot, d, now, progress)
 			syncRes.Resync = summary
 			if budgetStopped {
 				syncRes.BudgetExhausted = true
@@ -914,8 +927,15 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 	// Completeness: an authorization that was not fully covered is
 	// reported as incomplete and never as success.
 	syncRes.Incomplete = evaluateIncomplete(&syncRes, opt)
-	for _, reason := range syncRes.Incomplete {
-		fmt.Fprintf(out, "incomplete: %s\n", reason)
+	if codes := incompleteCodes(syncRes); len(codes) > 0 {
+		// The closed-code mirror of the incompleteness reasons: the
+		// free-text reasons embed grant inputs, OS errors and unvetted
+		// server strings, so they are never echoed in any mode. The
+		// codes are verbose detail; the final result summary renders
+		// the same boundaries in natural language, and the reasons stay
+		// on the error chain (the command layer never prints them
+		// raw).
+		d.detail("incomplete: %s", strings.Join(codes, ", "))
 	}
 	if runErr != nil {
 		return syncRes, runErr
@@ -957,7 +977,7 @@ func checkHistoryOwnership(stateDir string) error {
 // shared run budget is a graceful stop (budgetStopped=true, the journal
 // stays resumable); every other failure is a hard error returned as-is
 // for the caller to wrap.
-func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snapshot *resync.SyncedBatchSnapshot, out io.Writer, now func() time.Time, progress func(collection.ProgressEvent)) (summary ResyncSummary, hardErr error, budgetStopped bool) {
+func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snapshot *resync.SyncedBatchSnapshot, d *display, now func() time.Time, progress func(collection.ProgressEvent)) (summary ResyncSummary, hardErr error, budgetStopped bool) {
 	summary = ResyncSummary{}
 
 	// The history phase's own emitter: the retransmission can be long,
@@ -965,19 +985,21 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 	// passes have finished), so its ticker never overlaps a round's. A
 	// nil progress keeps everything unwired.
 	var emitter *collection.ProgressEmitter
-	resyncProgress := progressResyncOrDefault(opt.ResyncProgress, out)
+	resyncProgress := progressResyncOrDefault(opt.ResyncProgress, d)
 	if progress != nil {
 		emitter = collection.NewProgressEmitter(ctx, progress, collection.DefaultProgressHeartbeat)
 		defer emitter.Stop()
 		emitter.EnterStage("history")
 		base := resyncProgress
 		resyncProgress = func(ev resync.ProgressEvent) {
-			// The historical human output stays byte-for-byte; the
-			// unified stream gets the adapted batch event alongside.
-			// The done outcome's counts are aggregates over the
-			// parent's stored receipts (earlier rounds included), so
-			// they are NEVER folded into this round's processing rate —
-			// the history phase reports no rate of its own.
+			// The human line prints only under --verbose (the concise
+			// default carries the phase summary and the final result
+			// instead); the unified stream gets the adapted batch event
+			// alongside either way. The done outcome's counts are
+			// aggregates over the parent's stored receipts (earlier
+			// rounds included), so they are NEVER folded into this
+			// round's processing rate — the history phase reports no
+			// rate of its own.
 			base(ev)
 			emitter.Dispatch(historyBatchEvent(ev))
 		}
@@ -991,7 +1013,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 		if errors.Is(err, runlock.ErrBusy) {
 			summary.Skipped = fmt.Sprintf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the history was NOT retransmitted", stateLockRetryTotal)
 			summary.Stop = ResyncStopBusy
-			fmt.Fprintf(out, "history retransmission: not run (%s)\n", summary.Skipped)
+			d.phase("history retransmission: not run (the state directory stayed busy; another collector process holds the lock)")
 			return summary, nil, false
 		}
 		return summary, fmt.Errorf("acquire state lock for history retransmission: %w", err), false
@@ -1004,7 +1026,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 		Budget:     opt.Budget,
 		Retry:      opt.Retry,
 		Snapshot:   snapshot,
-		Confirm:    confirmResyncOrDefault(opt, out),
+		Confirm:    confirmResyncOrDefault(opt, d),
 		Progress:   resyncProgress,
 		Now:        now,
 	})
@@ -1042,7 +1064,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 			// a run failure. Nothing was sent; the job stays resumable.
 			summary.Skipped = resyncErr.Error()
 			summary.Stop = ResyncStopPaused
-			fmt.Fprintf(out, "history retransmission: skipped (device paused)\n")
+			d.phase("history retransmission: skipped (device paused)")
 			return summary, nil, false
 		}
 		if errResyncNothingEligible(resyncErr) {
@@ -1052,7 +1074,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 			// narrowed), not a failure: report it, do not alarm.
 			summary.NotApplicable = resyncErr.Error()
 			summary.Stop = ResyncStopNothingEligible
-			fmt.Fprintf(out, "history retransmission: nothing eligible under the current authorization (%v)\n", resyncErr)
+			d.phase("history retransmission: nothing eligible under the current authorization")
 			return summary, nil, false
 		}
 		if budgetDeclined(resyncErr) {
@@ -1063,7 +1085,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 			// own stop contract). A budget stop is an honest incomplete,
 			// never a hard run failure.
 			summary.Stop = ResyncStopBudget
-			fmt.Fprintf(out, "history retransmission: stopped at the shared sync budget (the job stays resumable; nothing was marked failed)\n")
+			d.phase("history retransmission: stopped at the shared sync budget (the job stays resumable; nothing was marked failed)")
 			return summary, nil, true
 		}
 		summary.Stop = ResyncStopFailed
@@ -1076,7 +1098,7 @@ func runResyncPhase(ctx context.Context, stateDir string, opt SyncOptions, snaps
 	} else {
 		summary.Stop = ResyncStopStopped
 	}
-	printResyncSummary(out, summary)
+	printResyncSummary(d, summary)
 	return summary, nil, false
 }
 
@@ -1291,7 +1313,7 @@ func runBacklogPassLocked(ctx context.Context, collectOpts collection.Options, c
 // decline from a pass is a graceful stop, never a failure: the declined
 // batch was never POSTed and stays pending, and the loop records why it
 // stopped for the completeness evaluation.
-func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collection.Options, out io.Writer, maxPasses int, budget *syncbudget.Budget) (SyncResult, error) {
+func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collection.Options, d *display, maxPasses int, budget *syncbudget.Budget) (SyncResult, error) {
 	if collectOpts.Cursor != nil {
 		cursor := *collectOpts.Cursor
 		cursor.ForceResync = false
@@ -1305,6 +1327,9 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 	var passErr error
 	pending := syncRes.Collection.PendingRemaining
 	cursorPending := syncRes.Collection.Cursor.PendingRemaining
+	if pending > 0 || cursorPending > 0 {
+		d.detail("draining backlog...")
+	}
 	// A queue that already spent its OWN budget cap cannot post; skip
 	// its drain so the OTHER queue still advances (once the other queue
 	// is empty too, the loop head below stops). Fairness is symmetric:
@@ -1339,7 +1364,7 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 			syncRes.BudgetExhausted = true
 			break
 		}
-		fmt.Fprintf(out, "draining backlog (pendingBatches=%d pendingCursorBatches=%d)...\n", pending, cursorPending)
+		d.detail("draining backlog (pendingBatches=%d pendingCursorBatches=%d)...", pending, cursorPending)
 		passRes, err := runBacklogPass(ctx, collectOpts, cursorPending, skipDevice, skipCursor)
 		if cursorPending == 0 && syncRes.Backlog.Passes == 0 {
 			passRes.Cursor.Ran = syncRes.Collection.Cursor.Ran
@@ -1399,7 +1424,12 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 			passErr = fmt.Errorf("backlog drain failed: %w", err)
 			break
 		}
-		printCollectionRound(out, fmt.Sprintf("backlog pass %d", syncRes.Backlog.Passes), passRes)
+		if d.verbose {
+			// Per-pass rounds are verbose-only: a long drain shows its
+			// progress through the heartbeat and its totals in the final
+			// backlog summary, never as pass-by-pass noise.
+			printCollectionRound(d, fmt.Sprintf("backlog pass %d", syncRes.Backlog.Passes), passRes)
+		}
 		if !backlogPassMadeProgress(passRes, pending, cursorPending, skipCursor) {
 			// No batch moved and nothing was drained: paused, restricted,
 			// or otherwise stuck. Stop instead of spinning; the
@@ -1419,17 +1449,43 @@ func drainBacklog(ctx context.Context, syncRes SyncResult, collectOpts collectio
 	syncRes.Backlog.PendingRemaining = pending
 	syncRes.Backlog.CursorPendingRemaining = cursorPending
 	if syncRes.Backlog.Passes > 0 {
-		fmt.Fprintf(out, "backlog: passes=%d syncedBatches=%d syncedRecords=%d pendingBatches=%d pendingCursorBatches=%d\n",
+		// The concise default carries the phase outcome and its
+		// boundary only; the counters are verbose detail (the final
+		// result summary carries the natural-language totals).
+		if pending > 0 || cursorPending > 0 {
+			d.phase("backlog: not fully drained; batches remain pending")
+		} else {
+			d.phase("backlog: drained")
+		}
+		if syncRes.Backlog.Stopped != "" {
+			// The stop reason renders behind a closed phrase derived
+			// from structure; the stored free text is never echoed.
+			d.phase("backlog: %s", backlogStopPhrase(syncRes, budget, maxPasses))
+		}
+		d.detail("backlog: passes=%d syncedBatches=%d syncedRecords=%d pendingBatches=%d pendingCursorBatches=%d",
 			syncRes.Backlog.Passes, syncRes.Backlog.Result.SyncedBatches, syncRes.Backlog.Result.SyncedRecords,
 			pending, cursorPending)
-		if syncRes.Backlog.Stopped != "" {
-			fmt.Fprintf(out, "backlog: %s\n", syncRes.Backlog.Stopped)
-		}
-		if pending > 0 || cursorPending > 0 {
-			fmt.Fprintf(out, "backlog: not fully drained; re-run connect or let the scheduled collection continue it\n")
-		}
 	}
 	return syncRes, passErr
+}
+
+// backlogStopPhrase renders why the backlog drain stopped behind a
+// fixed phrase derived from structure (the budget flags, the pass
+// bound, the per-queue caps) - never the stored free text, which the
+// sending layers may compose from unvetted error chains.
+func backlogStopPhrase(syncRes SyncResult, budget *syncbudget.Budget, maxPasses int) string {
+	switch {
+	case syncRes.BudgetExhausted:
+		return "stopped at the shared sync budget"
+	case syncRes.Backlog.Passes >= maxPasses:
+		return "stopped at the backlog pass bound"
+	case budget != nil && deviceQueueSpent(budget):
+		return "stopped at the device queue's own budget cap"
+	case budget != nil && cursorQueueSpent(budget):
+		return "stopped at the account queue's own budget cap"
+	default:
+		return "stopped early (paused, restricted, or a pass made no progress)"
+	}
 }
 
 func backlogPassMadeProgress(pass collection.Result, devicePending, cursorPending int, skipCursor bool) bool {
@@ -1800,35 +1856,43 @@ func syncedBatchIDs(stateDir string) ([]string, error) {
 // a caller hook (connect) there is no interaction at all: the connect
 // link is itself the user's authorization gesture, and the plan is
 // printed for the record.
-func confirmResyncOrDefault(opt SyncOptions, out io.Writer) func(resync.Plan) error {
+func confirmResyncOrDefault(opt SyncOptions, d *display) func(resync.Plan) error {
 	return func(plan resync.Plan) error {
-		printResyncPlan(out, plan)
+		printResyncPlan(d, plan)
 		if opt.ResyncConfirm != nil {
-			fmt.Fprintln(out, "history retransmission proceeding under the confirmation given before this run started")
+			d.detail("history retransmission proceeding under the confirmation given before this run started")
 		} else {
-			fmt.Fprintln(out, "history retransmission confirmed by this authorization")
+			d.detail("history retransmission confirmed by this authorization")
 		}
 		return nil
 	}
 }
 
-func progressResyncOrDefault(progress func(resync.ProgressEvent), out io.Writer) func(resync.ProgressEvent) {
+func progressResyncOrDefault(progress func(resync.ProgressEvent), d *display) func(resync.ProgressEvent) {
 	if progress != nil {
 		return progress
 	}
 	return func(ev resync.ProgressEvent) {
-		fmt.Fprintf(out, "batch %s: %s submitted=%d accepted=%d rejected=%d skipped=%d replay=%t\n",
-			ev.BatchID, ev.Outcome, ev.Uploaded, ev.Accepted, ev.Rejected, ev.Skipped, ev.Replay)
+		if !d.verbose {
+			// Per-batch lines are verbose-only: the default output keeps
+			// the phase summary and the heartbeat, never per-batch noise.
+			return
+		}
+		d.detail("history batch: %s submitted=%d accepted=%d rejected=%d skipped=%d replay=%t",
+			sealedOutcome(ev.Outcome), ev.Uploaded, ev.Accepted, ev.Rejected, ev.Skipped, ev.Replay)
 	}
 }
 
-func progressOverrideOrDefault(progress func(resync.OverrideProgressEvent), out io.Writer) func(resync.OverrideProgressEvent) {
+func progressOverrideOrDefault(progress func(resync.OverrideProgressEvent), d *display) func(resync.OverrideProgressEvent) {
 	if progress != nil {
 		return progress
 	}
 	return func(ev resync.OverrideProgressEvent) {
-		fmt.Fprintf(out, "override batch %s: %s records=%d accepted=%d rejected=%d replay=%t\n",
-			ev.BatchID, ev.Outcome, ev.Records, ev.Accepted, ev.Rejected, ev.Replay)
+		if !d.verbose {
+			return
+		}
+		d.detail("override batch: %s records=%d accepted=%d rejected=%d replay=%t",
+			sealedOutcome(ev.Outcome), ev.Records, ev.Accepted, ev.Rejected, ev.Replay)
 	}
 }
 
@@ -1853,12 +1917,49 @@ func summarizeOverride(res resync.OverrideResult, ran bool) ResyncSummary {
 // printResyncPlan prints the frozen plan (the same summary the resync CLI
 // prints) so the user sees exactly what will be retransmitted and what
 // the phase does NOT cover.
-func printResyncPlan(out io.Writer, plan resync.Plan) {
-	fmt.Fprintf(out, "resync target: server=%s device=%s\n", plan.ServerURL, plan.DeviceID)
-	fmt.Fprintf(out, "plan: batches=%d records=%d resumed=%t alreadyDone=%d\n", len(plan.Batches), plan.PlannedRecords, plan.Resumed, plan.DoneInJob)
-	fmt.Fprintf(out, "excluded: pendingBatches=%d reorganizedParents=%d localGrantBatches=%d afterSnapshotBatches=%d quarantineRecords=%d\n", plan.ExcludedPending, plan.ExcludedReorganized, len(plan.ExcludedLocalGrant), plan.ExcludedAfterSnapshot, plan.QuarantinedRecords)
-	fmt.Fprintln(out, plan.CoverageNote)
-	fmt.Fprintln(out, "De-duplication applies to the current device only; this phase never creates a device or clears progress.")
+func printResyncPlan(d *display, plan resync.Plan) {
+	// The target line (server URL, device id) is never printed in ANY
+	// mode: both are unvetted reflection surfaces.
+	if len(plan.Batches) == 0 {
+		// An empty plan has nothing to confirm and nothing to cover: a
+		// first install's automatic pass prints nothing by default (the
+		// verbose detail below keeps the record).
+		d.detail("plan: empty - no synced history is eligible under the current authorization")
+	} else {
+		if plan.Resumed {
+			// A resumed journal carries the batch list and the done count
+			// but not necessarily a records total (the resume path may
+			// leave PlannedRecords unset); the provable batch count is the
+			// only claim - an unknown record total is never shown as zero.
+			d.phase("plan: resuming an unfinished retransmission job; %d batch(es) remain in the plan.", len(plan.Batches))
+		} else {
+			d.phase("plan: %d batch(es) (%d record(s)) to retransmit.", len(plan.Batches), plan.PlannedRecords)
+		}
+		// The coverage limitation in ONE short fixed line (the long
+		// local note stays verbose). The PLAN's own SnapshotRestricted
+		// marker is the single authority - it is set for a fresh
+		// connect pass (CaptureResyncSnapshot), for an explicitly
+		// passed snapshot, and for a resumed job's journal-frozen
+		// universe alike - so the wording never depends on how the
+		// caller wired the option. A resumed restricted job names its
+		// ORIGINAL snapshot (frozen when the job was planned, possibly
+		// by an earlier run); only a fresh pass may say "before this
+		// run".
+		if plan.SnapshotRestricted {
+			if plan.Resumed {
+				d.phase("History replay covers this device only, limited to the job's original snapshot; account history and quarantined records are excluded.")
+			} else {
+				d.phase("History replay covers this device only, and only the batches already synced before this run; batches synced during this run, account history and quarantined records are excluded.")
+			}
+		} else {
+			d.phase("History replay covers this device only; account history and quarantined records are excluded.")
+		}
+	}
+	d.detail("%s", plan.CoverageNote)
+	d.detail("De-duplication applies to the current device only; this phase never creates a device or clears progress.")
+	d.detail("plan detail: batches=%d records=%d resumed=%t alreadyDone=%d excludedPending=%d reorganizedParents=%d localGrantBatches=%d afterSnapshotBatches=%d quarantineRecords=%d",
+		len(plan.Batches), plan.PlannedRecords, plan.Resumed, plan.DoneInJob,
+		plan.ExcludedPending, plan.ExcludedReorganized, len(plan.ExcludedLocalGrant), plan.ExcludedAfterSnapshot, plan.QuarantinedRecords)
 }
 
 // summarizeResync maps a resync.Result onto the connect summary.
@@ -1890,21 +1991,18 @@ func summarizeResync(res resync.Result, ran bool) ResyncSummary {
 // printResyncSummary prints the round's outcome; it mirrors the resync
 // CLI's report, including the explicit statements about withheld
 // history, so partial coverage is never presented as a full restore.
-func printResyncSummary(out io.Writer, summary ResyncSummary) {
-	fmt.Fprintf(out, "history retransmission: completed=%t uploads=%d submitted=%d accepted=%d rejected=%d blocked=%d skipped=%d remaining=%d\n",
-		summary.Completed, summary.Uploads, summary.UploadedRecords, summary.AcceptedRecords, summary.RejectedRecords,
+func printResyncSummary(d *display, summary ResyncSummary) {
+	d.detail("history retransmission: stop=%s completed=%t uploads=%d submitted=%d accepted=%d rejected=%d blocked=%d skipped=%d remaining=%d",
+		summary.Stop, summary.Completed, summary.Uploads, summary.UploadedRecords, summary.AcceptedRecords, summary.RejectedRecords,
 		summary.Blocked, summary.SkippedOutOfScopeRecords, summary.Remaining)
-	if summary.Stopped != "" {
-		fmt.Fprintf(out, "history retransmission: stopped: %s\n", summary.Stopped)
-	}
 	if summary.Remaining > 0 {
-		fmt.Fprintf(out, "history retransmission: re-run connect (or toktrail resync --all) to resume; completed batches in this job are preserved. The scheduled task does NOT continue a resync job.\n")
+		d.detail("history retransmission: the job is unfinished; resume it explicitly with toktrail resync --all when intended (the scheduled task does not continue a resync job).")
 	}
 	if summary.Blocked > 0 || summary.SkippedOutOfScopeRecords > 0 {
-		fmt.Fprintf(out, "history retransmission: some history was not retransmitted because it is outside the current authorization; original archives remain unchanged.\n")
+		d.phase("history retransmission: some history was not retransmitted because it is outside the current authorization; original archives remain unchanged.")
 	}
 	if summary.ExcludedAfterSnapshot > 0 {
-		fmt.Fprintf(out, "history retransmission: %d batch(es) synced during this run were not replayed (they were just uploaded by this run's collection); a later connect or an explicit toktrail resync --all covers them.\n", summary.ExcludedAfterSnapshot)
+		d.phase("history retransmission: %d batch(es) synced during this run were not re-sent (they were just uploaded by this run's collection).", summary.ExcludedAfterSnapshot)
 	}
 }
 
@@ -1912,21 +2010,29 @@ func printResyncSummary(out io.Writer, summary ResyncSummary) {
 // label the phase reports under. A no-grants round that actually drained
 // the sendable queue (§6.1) reports the no-grants fact AND its counts —
 // never a bare "skipped" that hides uploaded or still-pending batches.
-func printCollectionRound(out io.Writer, label string, res collection.Result) {
+func printCollectionRound(d *display, label string, res collection.Result) {
 	if res.NoGrants {
 		if res.SyncedBatches == 0 && res.PendingRemaining == 0 {
-			fmt.Fprintf(out, "%s: no enabled source grants; skipped\n", label)
+			d.phase("%s: no enabled source grants; skipped", label)
 			return
 		}
-		fmt.Fprintf(out, "%s: no enabled source grants; drained the device outbox only\n", label)
+		d.phase("%s: no enabled source grants; drained the device outbox only", label)
 	}
-	fmt.Fprintf(out, "%s: exportedBatches=%d exportedRecords=%d syncedBatches=%d syncedRecords=%d\n",
+	// A pause is a server state worth naming in the default; the
+	// healthy outcome is carried by the final result summary, and the
+	// counters are verbose detail.
+	if res.GrantSync.Paused {
+		d.phase("%s: skipped (the device is paused server-side)", label)
+	} else {
+		d.detail("%s: finished", label)
+	}
+	d.detail("%s: exportedBatches=%d exportedRecords=%d syncedBatches=%d syncedRecords=%d",
 		label, res.ExportedBatches, res.ExportedRecords, res.SyncedBatches, res.SyncedRecords)
 	if res.Cursor.Ran {
 		// The account-level cursor round is independent of the local
 		// grant counts above; surface it so a cursor-only device never
 		// looks like an all-zero run.
-		fmt.Fprintf(out, "%s: cursor pulledEvents=%d newRecords=%d replacedRecords=%d reemittedRecords=%d uploadedRecords=%d pendingBatches=%d\n",
+		d.detail("%s: cursor pulledEvents=%d newRecords=%d replacedRecords=%d reemittedRecords=%d uploadedRecords=%d pendingBatches=%d",
 			label, res.Cursor.PulledEvents, res.Cursor.NewRecords,
 			res.Cursor.ReplacedRecords, res.Cursor.ReemittedRecords, res.Cursor.SyncedRecords,
 			res.Cursor.PendingRemaining)

@@ -186,6 +186,7 @@ func TestRunPeriodicRetriesTransientIngestFailure(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err != nil {
@@ -232,6 +233,7 @@ func TestRunPeriodicBudgetDeclineStopsTheRetry(t *testing.T) {
 		"--server", server.URL,
 		"--max-total-batches", "1",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -265,6 +267,7 @@ func TestRunPeriodicRetryAfterPastRunDeadlineStops(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "5s",
+		"--verbose",
 	}
 	start := time.Now()
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
@@ -305,6 +308,7 @@ func TestRunPeriodicAuthorizationChangeStopsTheRetry(t *testing.T) {
 		"--state-dir", stateDir,
 		"--server", server.URL,
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {

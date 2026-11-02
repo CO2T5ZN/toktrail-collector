@@ -4,7 +4,7 @@ package connect
 // confirmation, the real upstream pull and the real source-batch POSTs)
 // emits the unified progress stream like every other queue. The emitter
 // is scoped to the enable call alone, a nil Progress keeps the enable
-// byte-for-byte on its historical path, and the events carry only
+// free of progress wiring when Progress is nil, and the events carry only
 // sealed facts. Everything is synthetic (tempdir state, httptest fakes,
 // injected auth/verify/pull providers); no real credentials or Cursor
 // state are ever touched.

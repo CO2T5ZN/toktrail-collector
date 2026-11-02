@@ -455,6 +455,7 @@ func TestRunPeriodicDrainOnlySyntheticEndToEnd(t *testing.T) {
 		"--max-batches", "5",
 		"--max-total-batches", "2",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out1, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -557,6 +558,7 @@ func TestRunPeriodicDrainOnlySyntheticEndToEnd(t *testing.T) {
 		"--drain-only",
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out2, err := capturePeriodicStdout(t, func() error { return runPeriodic(args2) })
 	if err != nil {
@@ -614,6 +616,7 @@ func TestRunPeriodicNoGrantsStillDrainsAndReportsCounts(t *testing.T) {
 		"--server", server.URL,
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err != nil {
@@ -642,6 +645,7 @@ func TestRunPeriodicNoGrantsStillDrainsAndReportsCounts(t *testing.T) {
 		"--server", emptyServer.URL,
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out2, err := capturePeriodicStdout(t, func() error { return runPeriodic(args2) })
 	if err != nil {

@@ -481,8 +481,8 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	if !strings.Contains(out, "enabled (source configured, state=active)") {
 		t.Fatalf("output must report the integrated enable, got:\n%s", out)
 	}
-	if !strings.Contains(out, "initial collection: cursor") {
-		t.Fatalf("output must summarize the cursor round, got:\n%s", out)
+	if !strings.Contains(out, "Cursor: the server confirmed 2 record(s).") {
+		t.Fatalf("output must summarize the cursor round's confirmed records, got:\n%s", out)
 	}
 	if strings.Contains(out, "no tool directories detected locally; no sources active") {
 		t.Fatalf("a cursor-only enable must not warn about inactive sources, got:\n%s", out)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,7 +47,11 @@ func main() {
 		fmt.Println("toktrail", version)
 	case "connect":
 		if err := runConnect(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "connect failed: %v\n", err)
+			// The same safe display contract as periodic: the curated
+			// text when the runner attached one, the fixed fallback
+			// otherwise — raw error text (paths, URLs, tokens) is never
+			// echoed. Exit code unchanged.
+			fmt.Fprintf(os.Stderr, "connect failed: %s\n", displayErrorText(err))
 			os.Exit(1)
 		}
 	case "bind":
@@ -81,12 +86,21 @@ func main() {
 		}
 	case "resync":
 		if err := runResync(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "resync failed: %v\n", err)
+			// Same safe display contract as periodic/connect.
+			fmt.Fprintf(os.Stderr, "resync failed: %s\n", displayErrorText(err))
 			os.Exit(1)
 		}
 	case "periodic":
 		if err := runPeriodic(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "periodic failed: %v\n", err)
+			// The unified failure line: displayErrorText renders the
+			// curated safe summary when the runner attached one and a
+			// fixed fallback otherwise — a raw error text may embed
+			// local paths, endpoint URLs or secret-bearing values, so
+			// it is never echoed here. The full date-time prefix keeps
+			// long-lived appended error logs (periodic.err.log)
+			// locatable across days. The error value, its chain and
+			// the exit code are untouched (see displayErrorText).
+			fmt.Fprintf(os.Stderr, "[%s] periodic failed: %s\n", time.Now().Format("2006-01-02 15:04:05"), displayErrorText(err))
 			os.Exit(1)
 		}
 	case "cursor":
@@ -440,21 +454,57 @@ func runPeriodic(args []string) error {
 }
 
 // runPeriodicIO runs the periodic command with explicit output
-// writers. By default (no --json) every human text goes to stdout
-// exactly as before. With --json, stdout carries EXACTLY one JSON
-// object — the stable §6.5 result, printed on every exit path
-// including errors — while all human text (the historical summary
-// lines, incomplete reasons) moves to stderr, so the machine stream
-// stays parseable. The returned error, and therefore the process exit
-// code, is identical with and without --json: partial completion
-// still exits non-zero and the historical zero-exit shapes (a paused
-// run with nothing pending, an explicitly bounded drain) still exit
-// zero — the JSON verdict never dresses partial completion up as
-// success (stop_reason differs from "complete" on those shapes).
+// writers. By default (no --json, no --verbose) stdout carries exactly
+// ONE concise English status line — timestamp, this run's
+// server-confirmed counts, observable pending, and an idle marker when
+// nothing new was collected — rendered from the SAME closed-set
+// collection.Summarize classification the --json verdict uses (never
+// from err==nil). Real errors are stated exactly once through main's
+// unified "periodic failed:" line; the round itself never duplicates
+// the reason. --verbose replaces the concise line with the detailed
+// per-phase log (counts and closed status codes only; never
+// credentials, URLs, tickets, raw records, local paths or untrusted
+// free text). With --json, stdout carries EXACTLY one JSON object —
+// the stable §6.5 result, printed on every exit path including
+// errors — while all human text (the concise line, the verbose log,
+// incomplete reasons) moves to stderr, so the machine stream stays
+// parseable. The returned error, and therefore the process exit code,
+// is identical with and without --json: partial completion still
+// exits non-zero and the historical zero-exit shapes (a paused run
+// with nothing pending, an explicitly bounded drain) still exit zero
+// — the JSON verdict never dresses partial completion up as success
+// (stop_reason differs from "complete" on those shapes).
+//
+// Human heartbeat: while --progress-json is off, a long run prints
+// nothing between its start and its final line, so a filtering
+// progress callback (reusing the collection round's existing
+// ProgressEmitter) renders one human heartbeat line roughly every 30
+// seconds on the human stream. The callback shares the existing
+// progress-callback I/O contract: the emitter dispatches it
+// synchronously under its own mutex — exactly like the JSON event
+// writer — so a blocked writer delays subsequent progress events the
+// same way the --progress-json writer already does; the throttle
+// rejects every intervening event before any I/O, so the cost is at
+// most one small line per ~30 seconds, and the emitter's deferred
+// Stop joins its ticker goroutine on every exit path (cancellation
+// included). When --progress-json is on, the machine events already
+// provide the periodic output, so no human heartbeat is added and the
+// event writer stays byte-identical to the historical one.
 func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	started := time.Now()
 	fs := flag.NewFlagSet("periodic", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	// The flag package echoes raw argument VALUES in its own
+	// parse-error output ("invalid value \"...\" for flag
+	// --sync-timeout") and prints them to the flag set's output BEFORE
+	// Parse returns, so a value that carries a token, URL or path would
+	// leak through fs.SetOutput(stderr). The flag set therefore writes
+	// into a capture buffer that is discarded on parse failure; only the
+	// -h usage (static help text, no argument values) is re-emitted to
+	// keep the help convention. The raw parse error stays in the
+	// returned chain (errors.Is, the --json usage-error object); only
+	// its display is the fixed safe text.
+	var flagOutput bytes.Buffer
+	fs.SetOutput(&flagOutput)
 	serverURL := fs.String("server", env("TOKTRAIL_SERVER_URL", ""), "toktrail-server base URL; defaults to bound server")
 	stateDir := fs.String("state-dir", env("TOKTRAIL_HOME", ""), "local TokTrail state directory")
 	maxBatches := fs.Int("max-batches", collection.DefaultMaxSyncBatches, "max pending batches to upload per active queue per run (an explicit legacy bound; the default run instead drains until the shared upload budget stops it)")
@@ -462,7 +512,20 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	syncTimeout := fs.Duration("sync-timeout", collection.DefaultSharedPOSTWindow, "overall periodic run timeout; the default shared upload budget's deadline follows this value (§6.2 default: 2 minutes)")
 	drainOnly := fs.Bool("drain-only", false, "only drain existing device outbox batches; do not refresh grants, scan sources, or run account sources")
 	progressJSON := fs.Bool("progress-json", false, "emit collection progress events as JSON Lines on stderr")
+	verbose := fs.Bool("verbose", false, "print the detailed per-phase run log (counts and closed status codes only; never credentials, URLs, tickets or raw records) instead of the default one-line status summary")
 	jsonOut := fs.Bool("json", false, "print the run's stable §6.5 result (stop_reason and phase counts) as a single JSON object on stdout; human output moves to stderr")
+	// The automatic -h help prints every flag's DefValue, and two of
+	// them come from the environment (TOKTRAIL_SERVER_URL may carry an
+	// endpoint with credentials; TOKTRAIL_HOME a local path), so their
+	// recorded defaults are scrubbed to the empty string AFTER
+	// registration — PrintDefaults then omits the "(default ...)"
+	// suffix entirely while the usage text still documents the
+	// behavior. The live flag values are untouched.
+	fs.VisitAll(func(f *flag.Flag) {
+		if f.Name == "server" || f.Name == "state-dir" {
+			f.DefValue = ""
+		}
+	})
 	if err := fs.Parse(args); err != nil {
 		// Flag parsing failed before the flags were readable; a literal
 		// --json in the raw arguments is the best-effort signal to still
@@ -470,7 +533,18 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 		if jsonWantsEmission(fs, *jsonOut, args) {
 			emitResultJSON(stdout, collection.SummarizeNotRun(err, "periodic", elapsedMS(started)))
 		}
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			// -h: the captured usage is static flag help (no argument
+			// values); re-emit it verbatim to keep the help convention.
+			_, _ = io.WriteString(stderr, flagOutput.String())
+			return safeDisplayError(err, err.Error())
+		}
+		// Any other parse failure: the flag package's own output (and
+		// the raw error text) may echo the user's argument value, which
+		// can carry a token, URL or path — it is never displayed. The
+		// chain keeps the original error for errors.Is and the JSON
+		// usage-error object; the display is the fixed safe text.
+		return safeDisplayError(err, "invalid flag or flag value (raw text withheld; run \"toktrail help\" for usage)")
 	}
 	// The human stream: stdout by default (the historical behavior);
 	// stderr under --json, keeping stdout to exactly one JSON object.
@@ -478,8 +552,7 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	// with human text (always stderr for events; human moves there under
 	// --json), one mutex serializes every write so lines never interleave
 	// and no ticker/run-goroutine pair races on the writer. With progress
-	// off the plain writer is kept and the output is byte-identical to
-	// the historical behavior.
+	// off the plain writer is kept for the machine-event stream.
 	stderrSink := io.Writer(stderr)
 	if *progressJSON {
 		stderrSink = newSerializedWriter(stderr)
@@ -488,42 +561,90 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	if *jsonOut {
 		human = stderrSink
 	}
-	result, runErr, ctxErr, ran := runPeriodicRound(fs, human, stderrSink, *serverURL, *stateDir, *maxBatches, *maxTotalBatches, *syncTimeout, *drainOnly, *progressJSON)
-	if *jsonOut {
-		switch {
-		case !ran:
-			// The round never started (validation, state directory or
-			// wiring failure): report not_run phases, never a fabricated
-			// drained queue.
-			emitResultJSON(stdout, collection.SummarizeNotRun(runErr, "periodic", elapsedMS(started)))
-		case *drainOnly:
-			// The explicit partial mode: the device queue only, the
-			// account source never read. A clean run keeps its
-			// historical exit zero but the verdict never claims global
-			// completion.
-			emitResultJSON(stdout, collection.SummarizePartialMode(result, runErr, ctxErr, "periodic", elapsedMS(started)))
-		default:
-			emitResultJSON(stdout, collection.Summarize(result, runErr, ctxErr, "periodic", elapsedMS(started)))
+	if !*progressJSON {
+		// The human heartbeat is armed (machine events are off): its
+		// lines arrive from the emitter's ticker goroutine while the run
+		// goroutine keeps writing prompts and verbose detail, so the
+		// human stream gets the same per-line serialization the event
+		// sink has. Sequential writes stay byte-identical to the plain
+		// writer; only concurrent heartbeat writes gain ordering.
+		if *jsonOut {
+			human = newSerializedWriter(stderr)
+		} else {
+			human = newSerializedWriter(stdout)
 		}
 	}
+	// The progress wiring, distinguishing the machine and human modes:
+	//   - --progress-json: the historical JSONL event writer, unchanged
+	//     and byte-identical (never the heartbeat);
+	//   - otherwise: the ~30s human heartbeat filter over the same
+	//     collection ProgressEmitter (batch/queue events are dropped —
+	//     they are machine events and the default output stays one
+	//     line; only heartbeat events render, throttled).
+	var progress func(collection.ProgressEvent)
+	if *progressJSON {
+		progress = writeCollectionProgressJSON(stderrSink)
+	} else {
+		progress = newPeriodicHumanHeartbeat(human, started, time.Now).handle
+	}
+	result, runErr, ctxErr, ran := runPeriodicRound(fs, human, progress, *serverURL, *stateDir, *maxBatches, *maxTotalBatches, *syncTimeout, *drainOnly, *verbose)
+	// One summary feeds both surfaces, so the concise human line and
+	// the --json verdict can never disagree: the classification is the
+	// closed-set walk (stop_reason, observation bits), never err==nil.
+	var summary collection.RunSummary
+	switch {
+	case !ran:
+		// The round never started (validation, state directory or
+		// wiring failure): report not_run phases, never a fabricated
+		// drained queue.
+		summary = collection.SummarizeNotRun(runErr, "periodic", elapsedMS(started))
+	case *drainOnly:
+		// The explicit partial mode: the device queue only, the
+		// account source never read. A clean run keeps its historical
+		// exit zero but the verdict never claims global completion.
+		summary = collection.SummarizePartialMode(result, runErr, ctxErr, "periodic", elapsedMS(started))
+	default:
+		summary = collection.Summarize(result, runErr, ctxErr, "periodic", elapsedMS(started))
+	}
+	if !*verbose && ran {
+		// The default one-line summary. Pre-run failures (ran=false)
+		// print no status line: nothing ran, and main's unified error
+		// line is the single, clear reason surface.
+		periodicConciseResult(human, summary, *drainOnly, time.Now())
+	}
+	if *jsonOut {
+		emitResultJSON(stdout, summary)
+	}
+	// runErr is already wrapped with its safe display text at every
+	// construction site inside the round (chain, err.Error() and every
+	// errors.Is/As match preserved verbatim); the summary above read
+	// the same error value, so the JSON verdict is unchanged too.
 	return runErr
 }
 
-// runPeriodicRound is the periodic body after flag parsing: the
-// historical run flow, printing every human line to human (and the
-// progress JSONL events to stderr). It returns the collection result,
-// the run error (nil on the historical zero-exit shapes), the run
+// runPeriodicRound is the periodic body after flag parsing. In the
+// default (concise) mode it prints NO run summary or reason lines at
+// all: the one-line status summary is rendered by runPeriodicIO from
+// the shared closed-set classification, and a real error is stated
+// exactly once by main's unified "periodic failed:" line. In --verbose
+// mode the historical detail lines print to human (and the progress
+// events flow through the caller's progress callback). It returns the
+// collection result, the run error (nil on the historical zero-exit
+// shapes; every non-nil error is wrapped with its curated SafeDisplay
+// text while the chain and err.Error() stay verbatim), the run
 // context's own state at return time (nil while the context is still
 // live) for the §6.5 deadline/cancellation classification, and whether
 // the collection round actually started (false for the pre-run
 // failures, so the summary reports not_run instead of a drained
 // queue).
-func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stateDir string, maxBatches, maxTotalBatches int, syncTimeout time.Duration, drainOnly, progressJSON bool) (collection.Result, error, error, bool) {
+func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collection.ProgressEvent), serverURL, stateDir string, maxBatches, maxTotalBatches int, syncTimeout time.Duration, drainOnly, verbose bool) (collection.Result, error, error, bool) {
 	if syncTimeout <= 0 {
-		return collection.Result{}, fmt.Errorf("--sync-timeout must be positive"), nil, false
+		err := fmt.Errorf("--sync-timeout must be positive")
+		return collection.Result{}, safeDisplayError(err, err.Error()), nil, false
 	}
 	if maxTotalBatches < 0 {
-		return collection.Result{}, fmt.Errorf("--max-total-batches must be non-negative"), nil, false
+		err := fmt.Errorf("--max-total-batches must be non-negative")
+		return collection.Result{}, safeDisplayError(err, err.Error()), nil, false
 	}
 	// flag.Visit reports only the flags the user actually passed, so it
 	// is the explicit-ness signal for the legacy --max-batches bound:
@@ -541,15 +662,8 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 		var err error
 		dir, err = statedir.DefaultDir()
 		if err != nil {
-			return collection.Result{}, err, nil, false
+			return collection.Result{}, safeDisplayError(err, "cannot determine the local TokTrail state directory"), nil, false
 		}
-	}
-	// stderr here is the caller's serialized sink, so the JSONL lines
-	// are already serialized against the human stream at the writer
-	// level; events also never go to stdout.
-	var progress func(collection.ProgressEvent)
-	if progressJSON {
-		progress = writeCollectionProgressJSON(stderr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
 	defer cancel()
@@ -612,7 +726,7 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 		// a local permit exists.
 		cursorOpts, cursorErr := periodicCursorOptions(dir, serverURL, nil)
 		if cursorErr != nil {
-			return collection.Result{}, cursorErr, nil, false
+			return collection.Result{}, safeDisplayError(cursorErr, "cannot initialize the account source (cursor) wiring"), nil, false
 		}
 		cursorOpts.MaxBatches = options.MaxBatches
 		cursorOpts.Budget = budget
@@ -629,49 +743,63 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			printPeriodicResult(human, result)
-			fmt.Fprintf(human, "incomplete: the periodic run timeout (%s) elapsed; work may remain for the next run\n", syncTimeout)
-			return result, fmt.Errorf("periodic incomplete: run timeout (%s) elapsed: %w", syncTimeout, err), ctx.Err(), true
+			if verbose {
+				printPeriodicResult(human, result)
+				fmt.Fprintf(human, "incomplete: the periodic run timeout (%s) elapsed; remaining work stays pending\n", syncTimeout)
+			}
+			msg := fmt.Sprintf("periodic incomplete: run timeout (%s) elapsed", syncTimeout)
+			return result, safeDisplayError(fmt.Errorf("%s: %w", msg, err), msg+"; remaining work stays pending"), ctx.Err(), true
 		}
 		if isSyncBudgetDecline(err) {
 			// The shared upload budget stopped the run before some of its
 			// work (pending device batches, pending account batches,
 			// not-yet-uploaded exports): report the partial result as
 			// incomplete and exit non-zero. The declined batches were
-			// never POSTed and stay pending; the next run resumes them
+			// never POSTed and stay pending; remaining work stays pending
 			// under its own fresh budget.
-			printPeriodicResult(human, result)
-			if result.PendingRemaining > 0 {
-				fmt.Fprintf(human, "pendingRemaining=%d (stopped by the shared upload budget; the next run continues)\n", result.PendingRemaining)
+			if verbose {
+				printPeriodicResult(human, result)
+				if result.PendingRemaining > 0 {
+					fmt.Fprintf(human, "pendingRemaining=%d (stopped by the shared upload budget; remaining work stays pending)\n", result.PendingRemaining)
+				}
+				switch {
+				case maxTotalBatches > 0:
+					fmt.Fprintf(human, "incomplete: the --max-total-batches %d shared upload budget is exhausted (devicePending=%d cursorPending=%d); remaining work stays pending\n",
+						maxTotalBatches, result.PendingRemaining, result.Cursor.PendingRemaining)
+				case errors.Is(err, syncbudget.ErrDeadlineExceeded):
+					fmt.Fprintf(human, "incomplete: the periodic upload window (--sync-timeout %s) elapsed with work remaining (devicePending=%d cursorPending=%d); remaining work stays pending\n",
+						syncTimeout, result.PendingRemaining, result.Cursor.PendingRemaining)
+				default:
+					fmt.Fprintf(human, "incomplete: the default shared upload budget (%d POSTs / %s) is exhausted (devicePending=%d cursorPending=%d); remaining work stays pending\n",
+						collection.DefaultSharedPOSTBudget, syncTimeout, result.PendingRemaining, result.Cursor.PendingRemaining)
+				}
 			}
+			var msg string
 			switch {
 			case maxTotalBatches > 0:
-				fmt.Fprintf(human, "incomplete: the --max-total-batches %d shared upload budget is exhausted (devicePending=%d cursorPending=%d); the next run continues\n",
-					maxTotalBatches, result.PendingRemaining, result.Cursor.PendingRemaining)
-				return result, fmt.Errorf("periodic incomplete: the shared upload budget (--max-total-batches %d) is exhausted with work remaining: %w", maxTotalBatches, err), ctx.Err(), true
+				msg = fmt.Sprintf("periodic incomplete: the shared upload budget (--max-total-batches %d) is exhausted with work remaining", maxTotalBatches)
 			case errors.Is(err, syncbudget.ErrDeadlineExceeded):
-				fmt.Fprintf(human, "incomplete: the periodic upload window (--sync-timeout %s) elapsed with work remaining (devicePending=%d cursorPending=%d); the next run continues\n",
-					syncTimeout, result.PendingRemaining, result.Cursor.PendingRemaining)
-				return result, fmt.Errorf("periodic incomplete: the periodic upload window (--sync-timeout %s) elapsed with work remaining: %w", syncTimeout, err), ctx.Err(), true
+				msg = fmt.Sprintf("periodic incomplete: the periodic upload window (--sync-timeout %s) elapsed with work remaining", syncTimeout)
 			default:
-				fmt.Fprintf(human, "incomplete: the default shared upload budget (%d POSTs / %s) is exhausted (devicePending=%d cursorPending=%d); the next run continues\n",
-					collection.DefaultSharedPOSTBudget, syncTimeout, result.PendingRemaining, result.Cursor.PendingRemaining)
-				return result, fmt.Errorf("periodic incomplete: the default shared upload budget (%d POSTs / %s) is exhausted with work remaining: %w",
-					collection.DefaultSharedPOSTBudget, syncTimeout, err), ctx.Err(), true
+				msg = fmt.Sprintf("periodic incomplete: the default shared upload budget (%d POSTs / %s) is exhausted with work remaining",
+					collection.DefaultSharedPOSTBudget, syncTimeout)
 			}
+			return result, safeDisplayError(fmt.Errorf("%s: %w", msg, err), msg+"; remaining work stays pending"), ctx.Err(), true
 		}
-		return result, err, ctx.Err(), true
+		return result, safeDisplayError(err, periodicRunErrorSafeText(err, ctx.Err())), ctx.Err(), true
 	}
-	printPeriodicResult(human, result)
-	if result.PendingRemaining > 0 {
-		if fair {
-			if maxBatchesExplicit {
-				fmt.Fprintf(human, "pendingRemaining=%d (drain stops at %d batch(es) per queue per run; the next run continues)\n", result.PendingRemaining, drainLimit)
+	if verbose {
+		printPeriodicResult(human, result)
+		if result.PendingRemaining > 0 {
+			if fair {
+				if maxBatchesExplicit {
+					fmt.Fprintf(human, "pendingRemaining=%d (drain stops at %d batch(es) per queue per run; remaining work stays pending)\n", result.PendingRemaining, drainLimit)
+				} else {
+					fmt.Fprintf(human, "pendingRemaining=%d (the run stopped before the queues were empty; remaining work stays pending)\n", result.PendingRemaining)
+				}
 			} else {
-				fmt.Fprintf(human, "pendingRemaining=%d (the run stopped before the queues were empty; the next run continues)\n", result.PendingRemaining)
+				fmt.Fprintf(human, "pendingRemaining=%d (drain stops at %d batch(es) per run; remaining work stays pending)\n", result.PendingRemaining, drainLimit)
 			}
-		} else {
-			fmt.Fprintf(human, "pendingRemaining=%d (drain stops at %d batch(es) per run; the next run continues)\n", result.PendingRemaining, drainLimit)
 		}
 	}
 	// §6.5/F1: a granted source that failed to read or export is an
@@ -680,8 +808,11 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 	// (the server scope excludes the source) is an authorization
 	// verdict and stays a complete exit.
 	if faults := grantFaultCount(result); faults > 0 {
-		fmt.Fprintf(human, "incomplete: %d granted source(s) did not complete this run (input inaccessible or export failed); the next run retries them\n", faults)
-		return result, fmt.Errorf("%w: periodic incomplete: %d granted source(s) did not complete", collection.ErrIncompleteRun, faults), ctx.Err(), true
+		if verbose {
+			fmt.Fprintf(human, "incomplete: %d granted source(s) did not complete this run (input inaccessible or export failed); their remaining work stays pending\n", faults)
+		}
+		msg := fmt.Sprintf("periodic incomplete: %d granted source(s) did not complete", faults)
+		return result, safeDisplayError(fmt.Errorf("%w: %s", collection.ErrIncompleteRun, msg), msg+"; their remaining work stays pending"), ctx.Err(), true
 	}
 	// §6.5: an authorized source whose pending restriction could not be
 	// classified (a reason outside the closed wire vocabulary) is an
@@ -693,8 +824,11 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 	// and the scope summary). The count is the only detail reported: no
 	// tool names, paths or reason text.
 	if concerns := collection.PendingCoverageConcerns(result.GrantSync.Pending); concerns > 0 {
-		fmt.Fprintf(human, "incomplete: %d authorized source(s) are not covered on this device (unclassified restriction); the next run retries them\n", concerns)
-		return result, fmt.Errorf("%w: periodic incomplete: %d authorized source(s) are not covered", collection.ErrIncompleteRun, concerns), ctx.Err(), true
+		if verbose {
+			fmt.Fprintf(human, "incomplete: %d authorized source(s) are not covered on this device (unclassified restriction); their remaining work stays pending\n", concerns)
+		}
+		msg := fmt.Sprintf("periodic incomplete: %d authorized source(s) are not covered", concerns)
+		return result, safeDisplayError(fmt.Errorf("%w: %s", collection.ErrIncompleteRun, msg), msg+"; their remaining work stays pending"), ctx.Err(), true
 	}
 	// §6.5: a successful (nil-error) run still owes the truth about its
 	// account queue — a round that failed, drifted or paused with work
@@ -702,10 +836,467 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 	// reads only the structured cursorsync outcome, never Skipped/Note
 	// text; the device-queue report above stays exactly as it was.
 	if reason, incomplete := periodicCursorIncomplete(result.Cursor); incomplete {
-		fmt.Fprintf(human, "incomplete: the account cursor source %s; the next run continues\n", reason)
-		return result, fmt.Errorf("%w: periodic incomplete: the account cursor source %s", collection.ErrIncompleteRun, reason), ctx.Err(), true
+		if verbose {
+			// The verbose reason is the structured phrase (the closed
+			// vocabulary derived from the round outcome), never the
+			// free-text Skipped/Note diagnostic that may embed raw
+			// error text.
+			fmt.Fprintf(human, "incomplete: the account cursor source %s; remaining work stays pending\n", cursorIncompleteStructuredText(result.Cursor))
+		}
+		return result, safeDisplayError(fmt.Errorf("%w: periodic incomplete: the account cursor source %s", collection.ErrIncompleteRun, reason),
+			"periodic incomplete: the account cursor source "+cursorIncompleteStructuredText(result.Cursor)+"; remaining work stays pending"), ctx.Err(), true
 	}
 	return result, nil, ctx.Err(), true
+}
+
+// periodicRunErrorSafeText maps a non-budget, non-timeout run error to
+// its closed English rendering for main's unified failure line. The
+// mapping keys only off error sentinels — never message text — and the
+// residual default is a fixed fallback: a raw collection error may
+// embed local paths, endpoint URLs or secret-bearing values, so its
+// text is never displayed. The run-context deadline keeps its earlier
+// budget wording (stop_reason and the JSON verdict are untouched by
+// this display mapping); the deadline case here is the bare in-chain
+// sentinel (a client or network timeout).
+func periodicRunErrorSafeText(err, ctxErr error) string {
+	switch {
+	case errors.Is(err, runlock.ErrBusy):
+		return "another collector process holds the collector state lock; no work was performed"
+	case errors.Is(err, syncretry.ErrRetryExhausted):
+		return "periodic incomplete: the bounded retry policy spent its retries before the run deadline; remaining work stays pending"
+	case errors.Is(err, context.Canceled), errors.Is(ctxErr, context.Canceled):
+		return "the run was cancelled before it finished"
+	case errors.Is(err, os.ErrPermission):
+		return "local access denied; check permissions"
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
+		return "operation timed out"
+	default:
+		return "the collection round failed (details withheld; review the configuration before another run)"
+	}
+}
+
+// ---------------------------------------------------------------------------
+// periodic display surfaces: the safe error wrapper, the default
+// one-line summary and the human heartbeat. Everything here renders
+// ONLY closed vocabularies and counts — never credentials, URLs,
+// tickets, raw records, local paths or untrusted free text.
+// ---------------------------------------------------------------------------
+
+// displaySafeError couples a returned error with its curated safe
+// rendering for main's unified failure line. Error() and Unwrap()
+// delegate verbatim, so the wrapped error keeps its exact text, chain
+// and every errors.Is/As match — only the display changes.
+type displaySafeError struct {
+	err  error
+	safe string
+}
+
+func (e *displaySafeError) Error() string       { return e.err.Error() }
+func (e *displaySafeError) Unwrap() error       { return e.err }
+func (e *displaySafeError) SafeDisplay() string { return e.safe }
+
+// safeDisplayError wraps err (a nil err stays nil) with the safe human
+// rendering used by main's unified failure line.
+func safeDisplayError(err error, safe string) error {
+	if err == nil {
+		return nil
+	}
+	return &displaySafeError{err: err, safe: safe}
+}
+
+// displayErrorText renders a command failure for main's unified error
+// line: the curated safe text of a *displaySafeError constructed in
+// THIS package (never a SafeDisplay method on an arbitrary external
+// error type, whose string is untrusted), and a fixed fallback for
+// everything else — a raw error text may embed local paths, endpoint
+// URLs or secret-bearing values, so it is never echoed. The error
+// value, its chain and the exit code are untouched.
+func displayErrorText(err error) string {
+	var safe *displaySafeError
+	if errors.As(err, &safe) {
+		return safe.safe
+	}
+	return "the run failed (unclassified; details withheld; review the configuration before another run)"
+}
+
+// cursorIncompleteStructuredText renders the account cursor round's
+// incompleteness phrase from the closed RoundOutcome vocabulary and
+// its counts — never the free-text Skipped/Note diagnostic, which may
+// embed raw error text. The phrases mirror the historical wording so
+// the verbose line stays recognizable.
+func cursorIncompleteStructuredText(cursor cursorsync.Result) string {
+	switch cursor.Outcome {
+	case cursorsync.RoundError:
+		return "failed this run"
+	case cursorsync.RoundFenceStop:
+		return "stopped by an authorization or source-state change"
+	case cursorsync.RoundPaused:
+		if cursor.PendingRemaining > 0 {
+			return fmt.Sprintf("is paused with %d batch(es) still pending", cursor.PendingRemaining)
+		}
+	}
+	if cursor.SkippedNoStableID > 0 {
+		return fmt.Sprintf("skipped %d usage event(s) without a stable upstream id (those events are not counted)", cursor.SkippedNoStableID)
+	}
+	return "did not complete"
+}
+
+// periodicStatusPhrase maps the closed §6.5 stop_reason onto the
+// natural English status word of the default one-line summary. The
+// mapping is total (an unknown value reads as incomplete, never as
+// success), and the machine vocabulary stays available through --json
+// and the verbose log.
+func periodicStatusPhrase(reason collection.StopReason) string {
+	switch reason {
+	case collection.StopComplete:
+		return "Complete"
+	case collection.StopPartial:
+		return "Partial"
+	case collection.StopPaused:
+		return "Paused"
+	case collection.StopBounded:
+		return "Stopped at the requested batch limit"
+	case collection.StopBusy:
+		return "Busy"
+	case collection.StopCancelled:
+		return "Cancelled"
+	case collection.StopScopeChanged:
+		return "Authorization changed"
+	case collection.StopBudgetExhausted, collection.StopRetryExhausted, collection.StopFatalError:
+		return "Incomplete"
+	default:
+		return "Incomplete"
+	}
+}
+
+// pluralRecords/pluralBatches render simple English plurals for the
+// natural-language summary line.
+func pluralRecords(n int) string {
+	if n == 1 {
+		return "1 record"
+	}
+	return fmt.Sprintf("%d records", n)
+}
+
+func pluralBatches(n int) string {
+	if n == 1 {
+		return "1 batch"
+	}
+	return fmt.Sprintf("%d batches", n)
+}
+
+// periodicConciseResult renders the DEFAULT one-line English run
+// summary: timestamp, this run's server-confirmed record count, the
+// observable pending state, and an idle marker when the scan provably
+// ran to completion over every granted source and found nothing new.
+// Every value comes from the same closed-set summary the --json
+// verdict uses; pending appears only where its queue was actually
+// observed (an unobserved queue never reads as zero), and "confirmed"
+// means server-receipt-confirmed this run — never a claim about new
+// unique records. "no new records" is stated ONLY for a globally
+// complete run whose scan demonstrably ran (a partial verdict, a
+// drain-only run, a no-grants run or a paused run never claims it —
+// unexamined scope stays neutral); any confirmed count always shows,
+// so a backlog drain never reads as idleness.
+func periodicConciseResult(w io.Writer, summary collection.RunSummary, drainOnly bool, now time.Time) {
+	phases := summary.Phases
+	drain, account, counts := phases.Drain, phases.Drain.Account, phases.Counts
+
+	// Only a globally COMPLETE run may claim "no new records": a
+	// partial verdict (drain-only, an uncovered authorized source)
+	// leaves scope unexamined, so it keeps the neutral wording.
+	// scanProvedRan: the scan phase demonstrably ran — at least one
+	// granted source returned a real scan verdict (the healthy
+	// empty-scan code or an export) or the account round pulled. A run
+	// whose grants are all not-allowed, disabled or otherwise never
+	// scanned proves nothing, and drain-only / no-grants runs scan
+	// nothing at all; those keep the neutral wording.
+	scanProvedRan := phases.Scan.Account.Ran
+	for _, src := range phases.Scan.Sources {
+		if src.Status == collection.GrantNoNewRecords || src.Status == collection.GrantExported {
+			scanProvedRan = true
+			break
+		}
+	}
+	// nothingNew: no source exported and no account pull produced new,
+	// replaced or re-emitted records.
+	nothingNew := counts.ExportedRecords == 0 &&
+		(!phases.Scan.Account.Ran ||
+			(phases.Scan.Account.NewRecords == 0 && phases.Scan.Account.ReplacedRecords == 0 && phases.Scan.Account.ReemittedRecords == 0))
+	for _, src := range phases.Scan.Sources {
+		if src.Status == collection.GrantExported {
+			nothingNew = false
+			break
+		}
+	}
+	// scanProvedEmpty: the only state in which "no new records" is a
+	// provable claim rather than a guess — complete status AND a
+	// demonstrably-run scan AND nothing new anywhere.
+	scanProvedEmpty := summary.StopReason == collection.StopComplete && scanProvedRan && nothingNew
+
+	var clauses []string
+	confirmed := counts.SyncedRecords > 0 || counts.SyncedBatches > 0
+	switch {
+	case confirmed:
+		text := fmt.Sprintf("%s confirmed in %s", pluralRecords(counts.SyncedRecords), pluralBatches(counts.SyncedBatches))
+		if counts.ExportedRecords > 0 {
+			text += fmt.Sprintf(", %s newly exported", pluralRecords(counts.ExportedRecords))
+		}
+		if scanProvedEmpty {
+			text += ", no new records this scan"
+		}
+		clauses = append(clauses, text)
+	case scanProvedEmpty:
+		clauses = append(clauses, "no new records")
+	case counts.ExportedRecords > 0:
+		clauses = append(clauses, fmt.Sprintf("no records confirmed yet, %s exported", pluralRecords(counts.ExportedRecords)))
+	default:
+		// Nothing was confirmed and nothing new is provable (a
+		// drain-only run, a no-grants run, a paused or incomplete one):
+		// the honest neutral wording, never a "no new records" claim.
+		clauses = append(clauses, "no records confirmed")
+	}
+	if clause := conciseFaultedSourcesClause(phases.Scan.Sources); clause != "" {
+		clauses = append(clauses, clause)
+	}
+	if counts.RejectedRecords > 0 {
+		clauses = append(clauses, fmt.Sprintf("%s rejected by the server", pluralRecords(counts.RejectedRecords)))
+	}
+	if counts.Recovered > 0 {
+		clauses = append(clauses, fmt.Sprintf("%d quarantined records recovered", counts.Recovered))
+	}
+	if counts.Quarantined > 0 {
+		clauses = append(clauses, fmt.Sprintf("%d records quarantined", counts.Quarantined))
+	}
+	clauses = append(clauses, periodicPendingClause(drain, account, drainOnly))
+
+	fmt.Fprintf(w, "[%s] %s: %s.\n", now.Format("2006-01-02 15:04:05"), periodicStatusPhrase(summary.StopReason), strings.Join(clauses, "; "))
+}
+
+// conciseFaultedSourcesClause renders the granted sources whose closed
+// scan status is a fault (the input no longer reads, or the export
+// failed): at most three canonical registry names with their closed
+// fault phrase, the remainder summarized as a count. Input paths and
+// free text never appear — only the structured GrantSkipCode — and the
+// canonicalization defends against a contaminated summary so a hostile
+// source name never echoes. The main error line stays count-only, so
+// the detail lives exactly here.
+func conciseFaultedSourcesClause(sources []collection.GrantSourceStatus) string {
+	const maxNamed = 3
+	var named []string
+	total := 0
+	for _, src := range sources {
+		switch src.Status {
+		case collection.GrantInputInaccessible, collection.GrantExportFailed, collection.GrantSplitFailed:
+			total++
+			if len(named) < maxNamed {
+				named = append(named, fmt.Sprintf("%s (%s)", canonicalToolDisplay(src.Source), grantFaultPhrase(src.Status)))
+			}
+		}
+	}
+	if total == 0 {
+		return ""
+	}
+	clause := fmt.Sprintf("%d source(s) did not complete: %s", total, strings.Join(named, ", "))
+	if rest := total - len(named); rest > 0 {
+		clause += fmt.Sprintf(", and %d more", rest)
+	}
+	return clause
+}
+
+// grantFaultPhrase maps a closed fault GrantSkipCode onto its fixed
+// English phrase for the concise faulted-sources clause.
+func grantFaultPhrase(status collection.GrantSkipCode) string {
+	switch status {
+	case collection.GrantInputInaccessible:
+		return "input not accessible"
+	case collection.GrantExportFailed:
+		return "export preparation failed"
+	case collection.GrantSplitFailed:
+		return "export split failed"
+	default:
+		return "unclassified fault"
+	}
+}
+
+// periodicPendingClause renders the observable pending state in
+// natural English. A queue's count appears only when it was actually
+// measured (PendingObserved); an unobserved queue never reads as zero
+// and the global "nothing pending" is reserved for runs where BOTH
+// queues were measured. The account queue distinguishes "not read"
+// (an absent round) from "unknown" (a round that ended before
+// measuring) — and the absent-round wording never infers the command
+// mode from the outcome alone: only the caller's explicit drain-only
+// flag may name the mode, every other absent round stays neutral.
+func periodicPendingClause(drain collection.DrainSummary, account collection.AccountDrainSummary, drainOnly bool) string {
+	if drain.PendingObserved && account.PendingObserved {
+		if total := drain.PendingRemaining + account.PendingRemaining; total > 0 {
+			return fmt.Sprintf("%s pending", pluralBatches(total))
+		}
+		return "nothing pending"
+	}
+	if drain.PendingObserved && !account.PendingObserved {
+		if account.Outcome == cursorsync.RoundAbsent {
+			if drainOnly {
+				if drain.PendingRemaining == 0 {
+					return "nothing pending (drain-only; the cursor queue was not read)"
+				}
+				return fmt.Sprintf("%s pending (drain-only; the cursor queue was not read)", pluralBatches(drain.PendingRemaining))
+			}
+			// An absent account round WITHOUT the drain-only flag: the
+			// mode is not inferable from the outcome, so the wording
+			// stays neutral about why the queue was not read.
+			if drain.PendingRemaining == 0 {
+				return "device queue empty; account queue not read"
+			}
+			return fmt.Sprintf("%s pending on the device queue; account queue not read", pluralBatches(drain.PendingRemaining))
+		}
+		if drain.PendingRemaining == 0 {
+			return "nothing pending on the device queue; cursor pending unknown"
+		}
+		return fmt.Sprintf("%s pending on the device queue; cursor pending unknown", pluralBatches(drain.PendingRemaining))
+	}
+	if !drain.PendingObserved && account.PendingObserved {
+		// The account queue was measured but the device queue was not:
+		// the measured count always shows — a known positive queue is
+		// never swallowed by the unknown — and the unmeasured side is
+		// named as unknown, never as zero.
+		if account.PendingRemaining > 0 {
+			batches := "batches"
+			if account.PendingRemaining == 1 {
+				batches = "batch"
+			}
+			return fmt.Sprintf("%d account %s pending; device pending unknown", account.PendingRemaining, batches)
+		}
+		return "account queue empty; device pending unknown"
+	}
+	return "pending unknown"
+}
+
+// periodicHumanHeartbeatInterval is the nominal cadence of the default
+// human heartbeat during long runs (plan §10 keeps the machine
+// heartbeat at ~5s; the human line is deliberately quieter).
+const periodicHumanHeartbeatInterval = 30 * time.Second
+
+// periodicHumanHeartbeat renders the ~30s human heartbeat line for a
+// run whose machine events are off. It wraps the collection round's
+// existing progress callback: the emitter dispatches every event
+// synchronously under its own mutex, so handle is never invoked
+// concurrently with itself — but it MAY be invoked from the emitter's
+// ticker goroutine, which is why the heartbeat writes only through the
+// caller's serialized human stream.
+//
+// I/O contract (the same one the --progress-json event writer already
+// has): the callback runs under the emitter's dispatch mutex, so a
+// blocked writer delays subsequent progress events exactly like the
+// JSON event writer does; the throttle below rejects every event
+// before any I/O, so the cost is at most one small line per
+// ~30 seconds. The emitter's deferred Stop joins the ticker goroutine
+// on every exit path, so cancellation unwinds cleanly and no heartbeat
+// outlives the run.
+type periodicHumanHeartbeat struct {
+	out      io.Writer
+	started  time.Time
+	last     time.Time
+	now      func() time.Time
+	interval time.Duration
+}
+
+func newPeriodicHumanHeartbeat(out io.Writer, started time.Time, now func() time.Time) *periodicHumanHeartbeat {
+	return &periodicHumanHeartbeat{out: out, started: started, now: now, interval: periodicHumanHeartbeatInterval}
+}
+
+// handle is the progress callback: every non-heartbeat event is
+// dropped (they are machine events; the default output stays one
+// line), and heartbeat events render at most once per interval. It
+// performs no I/O until the throttle passes.
+func (h *periodicHumanHeartbeat) handle(event collection.ProgressEvent) {
+	if event.Kind != collection.ProgressHeartbeat {
+		return
+	}
+	now := h.now()
+	if now.Sub(h.started) < h.interval {
+		return
+	}
+	if !h.last.IsZero() && now.Sub(h.last) < h.interval {
+		return
+	}
+	h.last = now
+	h.render(event, now)
+}
+
+// render writes one heartbeat line from the event's closed fields,
+// honoring every observation gate (an uncounted queue never reads as a
+// zero pending). The write goes through WriteProgressLine when the
+// stream supports it, so an interactive prompt left open on the line
+// is completed first and the heartbeat never shares a line.
+func (h *periodicHumanHeartbeat) render(event collection.ProgressEvent, now time.Time) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] Still running: %s elapsed", now.Format("2006-01-02 15:04:05"), formatDurationWords(now.Sub(h.started)))
+	if event.Stage != "" {
+		fmt.Fprintf(&b, ", %s", heartbeatStagePhrase(event.Stage))
+	}
+	if event.AttemptInFlightKnown {
+		if event.AttemptInFlight {
+			b.WriteString(", uploading a batch")
+		} else {
+			b.WriteString(", between uploads")
+		}
+	}
+	if event.Counted {
+		fmt.Fprintf(&b, ", %s pending", pluralBatches(event.PendingBatches))
+		if event.RecordsCounted {
+			fmt.Fprintf(&b, " (%s)", pluralRecords(event.PendingRecords))
+		}
+	} else {
+		b.WriteString(", pending unknown")
+	}
+	b.WriteString(".\n")
+	line := []byte(b.String())
+	if lp, ok := h.out.(interface {
+		WriteProgressLine([]byte) (int, error)
+	}); ok {
+		_, _ = lp.WriteProgressLine(line)
+		return
+	}
+	_, _ = h.out.Write(line)
+}
+
+// heartbeatStagePhrase maps the closed progress-stage vocabulary onto
+// natural English for the human heartbeat line. A value outside the
+// known set (contaminated state, a future stage) collapses to the
+// fixed "working" and is never echoed raw.
+func heartbeatStagePhrase(stage string) string {
+	switch stage {
+	case "grant_sync":
+		return "syncing the server grant scope"
+	case "source_scan":
+		return "scanning the granted sources"
+	case "cursor_sync":
+		return "collecting the account source"
+	case "drain":
+		return "uploading pending batches"
+	case "history":
+		return "retransmitting history"
+	case "complete":
+		return "finishing"
+	default:
+		return "working"
+	}
+}
+
+// formatDurationWords renders a duration for the human heartbeat line.
+func formatDurationWords(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	secs := int(d.Seconds())
+	if secs < 60 {
+		return fmt.Sprintf("%ds", secs)
+	}
+	mins := secs / 60
+	secs %= 60
+	return fmt.Sprintf("%dm%02ds", mins, secs)
 }
 
 // grantFaultCount counts the granted sources whose structured skip
@@ -826,55 +1417,241 @@ func isSyncBudgetDecline(err error) bool {
 		errors.Is(err, syncbudget.ErrDeadlineExceeded))
 }
 
-// printPeriodicResult renders the periodic run summary through the synced
-// counters. A run whose Skipped reason means nothing was attempted (no
-// grants, server pause) prints only that reason — the historical output.
+// printPeriodicResult renders the periodic run's DETAILED summary for
+// --verbose through the synced counters and closed status codes. It is
+// the sanitized successor of the historical log: input paths, the
+// grantSync free-text note, the cursor round's free-text note and
+// untrusted skip diagnostics are never printed (an unclassified
+// diagnostic is named as withheld, never guessed); the closed
+// GrantSkipCode / RoundOutcome vocabularies and the observation gates
+// carry the same information without raw fields. A run whose Skipped
+// reason means nothing was attempted (no grants, server pause) prints
+// only that state's fixed wording.
 func printPeriodicResult(human io.Writer, result collection.Result) {
 	if result.GrantSync.Active {
 		fmt.Fprintf(human, "grantSync: revision=%d paused=%t refreshed=%t acked=%t allowedTools=%s\n",
-			result.GrantSync.ConsentRevision, result.GrantSync.Paused, result.GrantSync.Refreshed, result.GrantSync.Acked, toolListDisplay(result.GrantSync.AllowedTools))
+			result.GrantSync.ConsentRevision, result.GrantSync.Paused, result.GrantSync.Refreshed, result.GrantSync.Acked, toolListDisplaySafe(result.GrantSync.AllowedTools))
 		for _, added := range result.GrantSync.AddedGrants {
-			fmt.Fprintf(human, "grantSync: added managed grant %s\n", added)
+			// The added-grant entry is "source input": the input is a
+			// local path, so only the registry-shaped source name is
+			// shown.
+			source := strings.Fields(added)
+			name := "unknown"
+			if len(source) > 0 {
+				name = canonicalToolDisplay(source[0])
+			}
+			fmt.Fprintf(human, "grantSync: added managed grant %s (input path withheld)\n", name)
 		}
-		for _, p := range sortedPendingDisplay(result.GrantSync.Pending) {
-			fmt.Fprintf(human, "grantSync: pending %s\n", p)
+		// The pending restrictions: per tool only the canonical
+		// registry name plus a withheld marker (the raw reason is free
+		// text that may embed local paths); the closed reason counts
+		// come from the same redaction walk the §6.5 JSON uses.
+		for _, tool := range sortedPendingTools(result.GrantSync.Pending) {
+			fmt.Fprintf(human, "grantSync: pending %s (restriction details withheld)\n", tool)
+		}
+		if scope := collection.SummarizePhases(result).Scope; scope.PendingTools > 0 {
+			fmt.Fprintf(human, "grantSync: pendingRestrictions unsupported=%d disabled=%d missingInput=%d unclassified=%d\n",
+				scope.PendingUnsupported, scope.PendingDisabled, scope.PendingMissingInput, scope.PendingUnmapped)
 		}
 		if result.GrantSync.Note != "" {
-			fmt.Fprintf(human, "grantSync: %s\n", result.GrantSync.Note)
+			fmt.Fprintf(human, "grantSync: note present (details withheld)\n")
 		}
 	}
 	if result.Cursor.Ran {
-		printCursorSyncResult(human, result.Cursor)
+		printCursorSyncVerbose(human, result.Cursor)
 	}
-	if result.Cursor.Status != "" && result.Cursor.Skipped != "" {
-		fmt.Fprintf(human, "cursor sync: %s\n", result.Cursor.Skipped)
+	if result.Cursor.Skipped != "" {
+		// Triggered by the skip FACT alone (a no-permit round never
+		// loaded the permit, so Status stays empty): the closed-set
+		// phrase keyed off the outcome prints, never the raw text.
+		fmt.Fprintf(human, "cursor sync: %s\n", cursorSkippedDisplay(result.Cursor))
 	}
 	// §6.5: name the account round's structured outcome explicitly so a
 	// non-clean round — notably a paused one that keeps the historical
 	// exit zero with nothing pending — never reads as a silent success.
+	// Only the closed RoundOutcome vocabulary prints; a value outside it
+	// (persisted-state contamination) reads as unknown, never raw.
 	if o := result.Cursor.Outcome; o != cursorsync.RoundAbsent && o != cursorsync.RoundRan {
-		fmt.Fprintf(human, "cursor sync: outcome=%s pending=%d\n", o, result.Cursor.PendingRemaining)
+		if !knownCursorRoundOutcome(o) {
+			o = "unknown"
+		}
+		cursorPending := "unknown"
+		if result.Cursor.PendingCounted {
+			cursorPending = strconv.Itoa(result.Cursor.PendingRemaining)
+		}
+		fmt.Fprintf(human, "cursor sync: outcome=%s pending=%s\n", o, cursorPending)
 	}
 	if result.Skipped != "" && result.NoGrants {
-		fmt.Fprintf(human, "%s\n", result.Skipped)
+		fmt.Fprintf(human, "%s\n", periodicRunSkippedDisplay(result))
 		return
 	}
 	if result.Skipped != "" && !result.NoGrants && len(result.GrantOutcomes) == 0 {
-		fmt.Fprintf(human, "%s\n", result.Skipped)
+		fmt.Fprintf(human, "%s\n", periodicRunSkippedDisplay(result))
 		return
 	}
-	for _, outcome := range result.GrantOutcomes {
+	for i, outcome := range result.GrantOutcomes {
+		source := canonicalToolDisplay(outcome.Source)
 		switch {
 		case outcome.Skipped != "":
-			fmt.Fprintf(human, "grant %s %s: skipped (%s)\n", outcome.Source, outcome.Input, outcome.Skipped)
+			fmt.Fprintf(human, "grant %s: skipped (%s)\n", source, grantSkipDisplay(outcome))
 		case !outcome.Exported:
-			fmt.Fprintf(human, "grant %s %s: no new records\n", outcome.Source, outcome.Input)
+			fmt.Fprintf(human, "grant %s: no new records\n", source)
 		default:
-			fmt.Fprintf(human, "grant %s %s: exported batch %s records=%d\n", outcome.Source, outcome.Input, outcome.BatchID, outcome.Records)
+			// The batch id read from persisted state could carry
+			// arbitrary text (a ticket, a token — even a plain
+			// alphanumeric one defeats charset checks), so no mode
+			// echoes it: the per-run ORDINAL identifies the line
+			// without identifying the stored id.
+			fmt.Fprintf(human, "grant %s: exported batch #%d records=%d\n", source, i+1, outcome.Records)
 		}
 	}
 	fmt.Fprintf(human, "exportedBatches=%d exportedRecords=%d\n", result.ExportedBatches, result.ExportedRecords)
 	fmt.Fprintf(human, "syncedBatches=%d syncedRecords=%d\n", result.SyncedBatches, result.SyncedRecords)
+}
+
+// printCursorSyncVerbose renders the account round's detailed lines
+// from closed counts only — the successor of the shared
+// printCursorSyncResult with the free-text note withheld (the note may
+// embed raw upload error text). pendingRemaining prints its raw
+// historical number; the observation gate is carried by the outcome
+// line and the §6.5 summary.
+func printCursorSyncVerbose(w io.Writer, res cursorsync.Result) {
+	fmt.Fprintf(w, "cursor sync: pulledEvents=%d new=%d replaced=%d unchanged=%d noStableId=%d\n",
+		res.PulledEvents, res.NewRecords, res.ReplacedRecords, res.SkippedUnchanged, res.SkippedNoStableID)
+	// pendingRemaining honors its observation gate: an uncounted queue
+	// never reads as a zero.
+	pending := "unknown"
+	if res.PendingCounted {
+		pending = strconv.Itoa(res.PendingRemaining)
+	}
+	fmt.Fprintf(w, "cursor sync: exportedBatches=%d syncedBatches=%d syncedRecords=%d pendingRemaining=%s\n",
+		res.ExportedBatches, res.SyncedBatches, res.SyncedRecords, pending)
+	if res.FirstSyncCompleted {
+		fmt.Fprintf(w, "cursor sync: first usage pull persisted; local permit active (upload confirmation is shown in syncedRecords/pendingRemaining)\n")
+	}
+	if res.Note != "" {
+		fmt.Fprintf(w, "cursor sync: note present (details withheld)\n")
+	}
+}
+
+// cursorSkippedDisplay renders the cursor round's skip state as a
+// fixed short English phrase keyed ONLY off the closed RoundOutcome
+// vocabulary — never the free-text Skipped diagnostic (which may echo
+// an arbitrary persisted string through the permit-status fallback, or
+// raw error text), and never with reconnect/resync guidance: the line
+// states what happened, not what the operator should re-run.
+func cursorSkippedDisplay(res cursorsync.Result) string {
+	switch res.Outcome {
+	case cursorsync.RoundError:
+		return "failed (raw diagnostics withheld)"
+	case cursorsync.RoundFenceStop:
+		return "stopped by an authorization or source-state change"
+	case cursorsync.RoundPaused:
+		return "paused"
+	case cursorsync.RoundBounded:
+		return "stopped at the batch limit"
+	case cursorsync.RoundNoPermit:
+		return "no local permit"
+	case cursorsync.RoundAuthWithheld:
+		return "withheld by the current authorization"
+	default:
+		return "skipped (details withheld)"
+	}
+}
+
+// knownCursorRoundOutcome reports whether the outcome value belongs to
+// the closed RoundOutcome vocabulary this build knows; anything else
+// renders as "unknown" rather than echoing the raw string.
+func knownCursorRoundOutcome(o cursorsync.RoundOutcome) bool {
+	switch o {
+	case cursorsync.RoundError, cursorsync.RoundFenceStop, cursorsync.RoundPaused,
+		cursorsync.RoundBounded, cursorsync.RoundNoPermit, cursorsync.RoundAuthWithheld:
+		return true
+	}
+	return false
+}
+
+// toolListDisplaySafe renders the applied allowed-tools scope as
+// canonical registry names only: the raw list is server-provided free
+// text, so an unknown or hostile name never echoes (it collapses to
+// "unknown"; the §6.5 JSON counts those separately).
+func toolListDisplaySafe(tools []string) string {
+	if len(tools) == 0 {
+		return "(unrestricted)"
+	}
+	parts := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		parts = append(parts, canonicalToolDisplay(tool))
+	}
+	return strings.Join(parts, ",")
+}
+
+// canonicalToolDisplay renders a grant or tool name as its
+// operator-facing canonical TOOL name through the compiled-in
+// registry: a tool name (grant-sync pending keys, allowedTools)
+// matches directly; a source identifier (grant outcomes, added grants)
+// maps onto its tool's display name via the supported-tool list — the
+// internal source id (e.g. a "codex-jsonl" style identifier) never
+// reaches the display. An unknown or hostile name is never echoed
+// (the JSON contract only counts those).
+func canonicalToolDisplay(name string) string {
+	if spec, known := registry.LookupTool(name); known {
+		return spec.Tool
+	}
+	for _, spec := range registry.SupportedTools() {
+		if spec.Source == name {
+			return spec.Tool
+		}
+	}
+	return "unknown"
+}
+
+// sortedPendingTools lists the pending map's keys as canonical registry
+// names (an unknown name renders as "unknown"), sorted for stable
+// output. The raw reason values never enter the display.
+func sortedPendingTools(pending map[string]string) []string {
+	keys := make([]string, 0, len(pending))
+	for k := range pending {
+		keys = append(keys, canonicalToolDisplay(k))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// grantSkipDisplay renders one granted source's skip reason from its
+// closed GrantSkipCode — fixed wording keyed off structure, never the
+// free-text Skipped message (which may embed local paths or raw error
+// text).
+func grantSkipDisplay(outcome collection.GrantOutcome) string {
+	switch outcome.Code {
+	case collection.GrantNotAllowed:
+		return "source not allowed by the server grant scope for this device"
+	case collection.GrantInputInaccessible:
+		return "input not accessible (details withheld)"
+	case collection.GrantExportFailed:
+		return "export preparation failed (details withheld)"
+	case collection.GrantSplitFailed:
+		return "export split failed (details withheld)"
+	case collection.GrantNoNewRecords:
+		return "no new records since the last confirmed baselines"
+	default:
+		return "unclassified (details withheld)"
+	}
+}
+
+// periodicRunSkippedDisplay renders the run-level no-op state from
+// structure: the two historical shapes (no enabled grants, a server
+// pause) keep their authored wording; any other skipped reason is
+// never echoed raw.
+func periodicRunSkippedDisplay(result collection.Result) string {
+	switch {
+	case result.NoGrants:
+		return "no enabled source grants; nothing to collect (sources enable requires explicit --source and --input)"
+	case result.GrantSync.Paused:
+		return fmt.Sprintf("server reports collection paused for this device (consent revision %d); no local reading or uploads this run", result.GrantSync.ConsentRevision)
+	default:
+		return "run skipped (reason withheld)"
+	}
 }
 
 // emitResultJSON writes exactly one JSON object (newline-terminated) to
@@ -1640,12 +2417,15 @@ func printHelp() {
 
 Commands:
   version                    print collector version
-  connect '<URL>'            one-step device setup via connect URL/ticket: fetches
+  connect '<URL>' [--verbose]    one-step device setup via connect URL/ticket: fetches
                              server configuration, binds device, probes local tools,
                              configures source grants, installs scheduled service,
                              and runs initial collection; --json prints the stable
                              result (stop_reason + phase counts) as one JSON object
-                             on stdout, with human output and prompts on stderr
+                             on stdout, with human output and prompts on stderr;
+                             --verbose prints the detailed per-step log (counts and
+                             closed status codes only; never credentials, URLs,
+                             tickets or raw records)
   bind                       bind this device to toktrail-server using explicit upload authorization
   status                     check bound device authorization from toktrail-server
   scan [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness|workbuddy-jsonl|qwen-jsonl|kimi-cli-jsonl|kimi-code-jsonl|zcode-sqlite|hermes-sqlite|openclaw-sqlite] --input <path>
@@ -1658,10 +2438,13 @@ Commands:
                               (or the oldest pending outbox batch) with the current
                               consent revision; revoked/deleted devices stop sending
 
-  resync --all [--dry-run] [--yes] [--max-batches N]
+  resync --all [--dry-run] [--yes] [--max-batches N] [--verbose]
                               retransmit archived synced batches to the bound device;
                               dry-run is offline and read-only; execution confirms
-                              live authorization and preserves collection progress
+                              live authorization and preserves collection progress;
+                              --verbose prints the detailed per-batch log (counts
+                              and closed status codes only; never credentials,
+                              URLs, tickets or raw records)
 
 Planned by the approved architecture:
   sources / plugins            adapter visibility and enablement
@@ -1669,7 +2452,7 @@ Planned by the approved architecture:
   privacy / doctor             consent and diagnostics
 
 Scheduling and diagnostics (implemented):
-  periodic [--state-dir <dir>] [--max-batches <n>] [--max-total-batches <n>] [--sync-timeout <dur>] [--drain-only] [--progress-json] [--json]
+  periodic [--state-dir <dir>] [--max-batches <n>] [--max-total-batches <n>] [--sync-timeout <dur>] [--drain-only] [--progress-json] [--verbose] [--json]
                                complete-exit scheduled run: collect the
                                enabled source grants only (no default
                                scanning), export via the WAL, then drain
@@ -1695,7 +2478,20 @@ Scheduling and diagnostics (implemented):
                                --json prints the stable result
                                (stop_reason + phase counts) as one JSON
                                object on stdout, with human output on
-                               stderr
+                               stderr. By default the human output is
+                               one concise English status line
+                               (date-time, this run's server-confirmed
+                               counts, observable pending; a provably
+                               empty scan reads as "no new records";
+                               real errors surface exactly once through
+                               the command's dated failure line) and a
+                               long run prints a human heartbeat
+                               roughly every 30 seconds; --verbose
+                               restores the detailed per-phase log
+                               (counts and closed status codes only;
+                               never credentials, URLs, tickets, raw
+                               records, local paths or untrusted free
+                               text)
   sources list                 show built-in sources and enabled grants
   sources enable --source <s> --input <path>
                                grant scheduled collection an explicit

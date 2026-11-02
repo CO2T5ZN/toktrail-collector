@@ -77,6 +77,7 @@ func TestRunPeriodicFullModeSharedBudgetStopsIncompleteNonZero(t *testing.T) {
 		"--max-batches", "5",
 		"--max-total-batches", "1",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out1, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 	if err == nil {
@@ -87,7 +88,7 @@ func TestRunPeriodicFullModeSharedBudgetStopsIncompleteNonZero(t *testing.T) {
 	}
 	// The grant was scanned (its outcome is reported) even though the
 	// budget stopped the uploads.
-	if !strings.Contains(out1, "grant claude-code-jsonl") || !strings.Contains(out1, "no new records") {
+	if !strings.Contains(out1, "grant Claude Code") || !strings.Contains(out1, "no new records") {
 		t.Fatalf("the full-mode run must still scan the granted source, stdout:\n%s", out1)
 	}
 	if !strings.Contains(out1, "exportedBatches=0 exportedRecords=0") {
@@ -118,6 +119,7 @@ func TestRunPeriodicFullModeSharedBudgetStopsIncompleteNonZero(t *testing.T) {
 		"--server", server.URL,
 		"--max-batches", "5",
 		"--sync-timeout", "30s",
+		"--verbose",
 	}
 	out2, err := capturePeriodicStdout(t, func() error { return runPeriodic(args2) })
 	if err != nil {
@@ -157,6 +159,7 @@ func TestRunPeriodicWithoutTotalBudgetKeepsBoundedStop(t *testing.T) {
 			"--drain-only",
 			"--max-batches", "2",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
@@ -183,12 +186,13 @@ func TestRunPeriodicWithoutTotalBudgetKeepsBoundedStop(t *testing.T) {
 			"--server", server.URL,
 			"--max-batches", "2",
 			"--sync-timeout", "30s",
+			"--verbose",
 		}
 		out, err := capturePeriodicStdout(t, func() error { return runPeriodic(args) })
 		if err != nil {
 			t.Fatalf("a plain per-queue bounded stop must stay exit-zero, got %v\nstdout:\n%s", err, out)
 		}
-		if !strings.Contains(out, "grant claude-code-jsonl") {
+		if !strings.Contains(out, "grant Claude Code") {
 			t.Fatalf("the full-mode run must scan the granted source, stdout:\n%s", out)
 		}
 		if !strings.Contains(out, "syncedBatches=2 syncedRecords=2") {
