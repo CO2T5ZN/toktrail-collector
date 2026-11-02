@@ -434,7 +434,7 @@ func TestConnectStopReasonHardErrorNotDowngraded(t *testing.T) {
 				GrantSync: collection.GrantSync{
 					Active: true,
 					Pending: map[string]string{
-						"Claude Code": "default directory not found: /missing",
+						"Claude Code": "some future restriction format",
 					},
 				},
 			},
@@ -455,6 +455,38 @@ func TestConnectStopReasonHardErrorNotDowngraded(t *testing.T) {
 	nilErr := SummarizeRun(res, nil, nil, 1)
 	if nilErr.StopReason != collection.StopPartial {
 		t.Fatalf("a nil error with uncovered sources must not claim complete, got %q", nilErr.StopReason)
+	}
+}
+
+// TestConnectStopReasonNeverInstalledToolsComplete pins the
+// missing-input reclassification on the connect verdict: an authorized
+// tool whose default directory was never detected on this device is an
+// observable pending state, not an uncovered source — the verdict may
+// be complete (all executable local work done). An unclassifiable
+// restriction still refuses completion.
+func TestConnectStopReasonNeverInstalledToolsComplete(t *testing.T) {
+	neverInstalled := Result{
+		BindStatus: BindBound,
+		Sync: SyncResult{
+			Collection: collection.Result{
+				GrantSync: collection.GrantSync{
+					Active: true,
+					Pending: map[string]string{
+						"Claude Code": "default directory not found: /missing",
+						"Codex":       "default directory not found: /also/missing",
+					},
+				},
+			},
+		},
+	}
+	if got := SummarizeRun(neverInstalled, nil, nil, 1); got.StopReason != collection.StopComplete {
+		t.Fatalf("never-installed tools must not flip the verdict, got %q", got.StopReason)
+	}
+	// The observable fact survives in the phases: both tools are
+	// counted as missing-input pending, never as covered or applied.
+	phases := SummarizeRun(neverInstalled, nil, nil, 1)
+	if phases.Collection.Scope.PendingMissingInput != 2 || phases.Collection.Scope.PendingTools != 2 {
+		t.Fatalf("the pending missing-input facts must stay observable, got %+v", phases.Collection.Scope)
 	}
 }
 

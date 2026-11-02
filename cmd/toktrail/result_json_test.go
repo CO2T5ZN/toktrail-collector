@@ -997,18 +997,19 @@ func TestPeriodicJSONNoPermitAccountUnobserved(t *testing.T) {
 	}
 }
 
-// TestPeriodicJSONUncoveredAuthorizedSourceIsIncomplete pins the
-// review fix end to end: an authorized tool whose default input is
-// missing on this device makes the periodic run a NON-ZERO incomplete
-// exit (never a quiet partial), with stop_reason=partial, the concern
-// counted in the scope section, and a path-free incomplete line on
-// the human stream.
-func TestPeriodicJSONUncoveredAuthorizedSourceIsIncomplete(t *testing.T) {
+// TestPeriodicJSONNeverInstalledAuthorizedSourceStaysComplete pins
+// the missing-input reclassification end to end: an authorized tool
+// whose default directory was never present on this device is an
+// observable pending restriction (counted in the scope section, the
+// grantSync pending lines and the grant-ack) but NOT an incompleteness
+// — the run keeps exit zero with stop_reason=complete, because no
+// executable local work was owed.
+func TestPeriodicJSONNeverInstalledAuthorizedSourceStaysComplete(t *testing.T) {
 	stateDir := t.TempDir()
 	server := grantProtocolCLIServer(t, []string{"Claude Code"})
 	bindPeriodicCLIDevice(t, stateDir, server.URL)
-	// An isolated, EMPTY home: the managed grant for the authorized
-	// tool cannot apply (its default directory is missing).
+	// An isolated, EMPTY home: the authorized tool's default directory
+	// was never present.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -1020,35 +1021,24 @@ func TestPeriodicJSONUncoveredAuthorizedSourceIsIncomplete(t *testing.T) {
 		"--sync-timeout", "30s",
 		"--json",
 	}, &stdout, &stderr)
-	if err == nil {
-		t.Fatal("an uncovered authorized source must exit non-zero")
+	if err != nil {
+		t.Fatalf("a never-installed authorized source must keep the complete exit: %v\nstderr:\n%s", err, stderr.String())
 	}
 	decoded := decodeSingleJSONLine(t, stdout.String())
-	if decoded["stop_reason"] != string(collection.StopPartial) {
-		t.Fatalf("stop_reason = %v, want partial: %s", decoded["stop_reason"], stdout.String())
+	if decoded["stop_reason"] != string(collection.StopComplete) {
+		t.Fatalf("stop_reason = %v, want complete: %s", decoded["stop_reason"], stdout.String())
 	}
 	scope := decoded["scope"].(map[string]any)
 	if scope["pendingMissingInput"] != float64(1) {
-		t.Fatalf("the uncovered source must be counted: %s", stdout.String())
+		t.Fatalf("the never-installed source must stay observable in the scope section: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "incomplete: 1 authorized source(s) are not covered") {
-		t.Fatalf("the human stream must carry the path-free incomplete line: %s", stderr.String())
+	if strings.Contains(stderr.String(), "incomplete:") {
+		t.Fatalf("no incomplete line is owed for a never-installed tool: %s", stderr.String())
 	}
-	// The NEW incomplete line itself is path-free (the historical
-	// grantSync pending lines keep their full reason text by design).
-	var incompleteLine string
-	for _, line := range strings.Split(stderr.String(), "\n") {
-		if strings.HasPrefix(line, "incomplete: 1 authorized source(s)") {
-			incompleteLine = line
-		}
-	}
-	if incompleteLine == "" {
-		t.Fatalf("the incomplete line must exist: %s", stderr.String())
-	}
-	for _, forbidden := range []string{home, ".claude", "/"} {
-		if strings.Contains(incompleteLine, forbidden) {
-			t.Fatalf("the incomplete line must stay path-free, got %q", incompleteLine)
-		}
+	// The human stream keeps the historical pending line with its full
+	// reason text (by design), so the restriction is never silent.
+	if !strings.Contains(stderr.String(), "grantSync: pending Claude Code: default directory not found:") {
+		t.Fatalf("the grantSync pending line must keep reporting the restriction: %s", stderr.String())
 	}
 }
 
@@ -1084,13 +1074,16 @@ func TestPeriodicJSONUnsupportedAuthorizedToolStaysComplete(t *testing.T) {
 	}
 }
 
-// TestConnectJSONUncoveredAuthorizedSourceIsIncomplete pins the
-// connect side: an authorization naming a tool whose default directory
-// is missing on this device never reads as success — the run reports
-// ErrSyncIncomplete with stop_reason=partial and the closed
-// source_uncovered code, and the human stream carries the path-free
-// incomplete line.
-func TestConnectJSONUncoveredAuthorizedSourceIsIncomplete(t *testing.T) {
+// TestConnectJSONNeverInstalledAuthorizedSourceStaysComplete pins the
+// connect side of the missing-input reclassification: an authorization
+// naming a tool whose default directory was never present on this
+// device is a normal, observable skip — the run completes (exit zero,
+// stop_reason=complete), the probe reported the tool not_detected to
+// the server, and the scope section keeps the pendingMissingInput
+// fact. The all-never-installed NoGrants boundary is covered by the
+// same shape: connect's activated-tool list is empty, so no
+// incompleteness reason fires.
+func TestConnectJSONNeverInstalledAuthorizedSourceStaysComplete(t *testing.T) {
 	oldRunner := connectSchedulerRunner
 	connectSchedulerRunner = mockSchedulerRunner{}
 	defer func() { connectSchedulerRunner = oldRunner }()
@@ -1103,27 +1096,175 @@ func TestConnectJSONUncoveredAuthorizedSourceIsIncomplete(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
-	if err == nil || !errors.Is(err, connect.ErrSyncIncomplete) {
-		t.Fatalf("an uncovered authorized source must keep the honest incomplete error, got %v", err)
+	if err != nil {
+		t.Fatalf("a never-installed authorized source must keep the complete exit, got %v\nstderr:\n%s", err, stderr.String())
 	}
 	decoded := decodeSingleJSONLine(t, stdout.String())
-	if decoded["stop_reason"] != string(collection.StopPartial) {
-		t.Fatalf("stop_reason = %v, want partial: %s", decoded["stop_reason"], stdout.String())
+	if decoded["stop_reason"] != string(collection.StopComplete) {
+		t.Fatalf("stop_reason = %v, want complete: %s", decoded["stop_reason"], stdout.String())
 	}
-	found := false
-	if codes, ok := decoded["incompleteCodes"].([]any); ok {
-		for _, c := range codes {
-			if c == "source_uncovered" {
-				found = true
-			}
+	collectionBlock := decoded["collection"].(map[string]any)
+	scope := collectionBlock["scope"].(map[string]any)
+	if scope["pendingMissingInput"] != float64(1) {
+		t.Fatalf("the never-installed tool must stay observable in the scope section: %s", stdout.String())
+	}
+	if codes, ok := decoded["incompleteCodes"].([]any); ok && len(codes) != 0 {
+		t.Fatalf("a complete run carries no incomplete codes, got %v: %s", codes, stdout.String())
+	}
+	if strings.Contains(stderr.String(), "incomplete:") {
+		t.Fatalf("no incomplete line is owed for a never-installed tool: %s", stderr.String())
+	}
+}
+
+// TestConnectJSONFirstConnectEightSelectedTwoInstalled pins the
+// headline first-connect scenario end to end: the server authorizes
+// eight local tools and this machine has only two installed. The
+// connect run completes (exit zero, stop_reason=complete): the two
+// installed tools are activated, granted and scanned; the six
+// never-installed tools stay observable (scope.pendingMissingInput=6,
+// probe not_detected reports, grant-ack pending) without turning the
+// run incomplete. A second connect over the unchanged state repeats
+// the same verdict with no duplicate grants.
+func TestConnectJSONFirstConnectEightSelectedTwoInstalled(t *testing.T) {
+	oldRunner := connectSchedulerRunner
+	connectSchedulerRunner = mockSchedulerRunner{}
+	defer func() { connectSchedulerRunner = oldRunner }()
+
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	// Two of the eight authorized tools are installed.
+	writeCLICodexSession(t, filepath.Join(home, ".codex", "sessions"), "rollout-first.jsonl")
+	writeCLIClaudeSession(t, filepath.Join(home, ".claude", "projects"), "session-first.jsonl")
+	connectURL := connectCLIServers(t, []string{
+		"Codex", "Claude Code", "DeepSeek Harness", "WorkBuddy",
+		"Qwen Code", "Kimi CLI", "Kimi Code", "ZCode",
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("a first connect with six never-installed optional tools must complete, got %v\nstderr:\n%s", err, stderr.String())
+	}
+	decoded := decodeSingleJSONLine(t, stdout.String())
+	if decoded["stop_reason"] != string(collection.StopComplete) {
+		t.Fatalf("stop_reason = %v, want complete: %s", decoded["stop_reason"], stdout.String())
+	}
+	collectionBlock := decoded["collection"].(map[string]any)
+	scope := collectionBlock["scope"].(map[string]any)
+	if scope["pendingMissingInput"] != float64(6) || scope["pendingTools"] != float64(6) {
+		t.Fatalf("the six never-installed tools must stay observable in the scope section: %s", stdout.String())
+	}
+	scan := collectionBlock["scan"].(map[string]any)
+	if scan["grants"] != float64(2) {
+		t.Fatalf("exactly the two installed tools must hold grants, got %v: %s", scan["grants"], stdout.String())
+	}
+	enabledGrants := readEnabledGrantInputs(t, stateDir)
+	if len(enabledGrants) != 2 {
+		t.Fatalf("two managed grants must be recorded, got %#v", enabledGrants)
+	}
+
+	// Second connect over the unchanged state: same complete verdict,
+	// no duplicate grants, the six pending restrictions re-reported.
+	stdout.Reset()
+	stderr.Reset()
+	err = runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("the repeated connect must keep the complete exit, got %v\nstderr:\n%s", err, stderr.String())
+	}
+	decoded = decodeSingleJSONLine(t, stdout.String())
+	if decoded["stop_reason"] != string(collection.StopComplete) {
+		t.Fatalf("stop_reason = %v, want complete on the repeated connect: %s", decoded["stop_reason"], stdout.String())
+	}
+	collectionBlock = decoded["collection"].(map[string]any)
+	scope = collectionBlock["scope"].(map[string]any)
+	if scope["pendingMissingInput"] != float64(6) {
+		t.Fatalf("the repeated connect must re-report the six restrictions, got %s", stdout.String())
+	}
+	if got := readEnabledGrantInputs(t, stateDir); len(got) != 2 {
+		t.Fatalf("the repeated connect must not duplicate grants, got %#v", got)
+	}
+}
+
+// writeCLICodexSession writes a synthetic Codex session whose two
+// token_count events produce exactly one delta record.
+func writeCLICodexSession(t *testing.T, dir, name string) {
+	t.Helper()
+	line := func(ts string, in, out uint64) string {
+		b, err := json.Marshal(map[string]any{
+			"timestamp": ts,
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type": "token_count",
+				"info": map[string]any{"total_token_usage": map[string]any{
+					"input_tokens": in, "cached_input_tokens": uint64(0),
+					"cache_write_input_tokens": uint64(0), "output_tokens": out,
+				}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	content := line("2026-10-26T04:00:00Z", 100, 50) + "\n" + line("2026-10-26T04:01:00Z", 160, 90) + "\n"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeCLIClaudeSession writes a synthetic Claude Code session with one
+// assistant usage message.
+func writeCLIClaudeSession(t *testing.T, dir, name string) {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"type":      "assistant",
+		"timestamp": "2026-10-26T04:00:00Z",
+		"message": map[string]any{"id": "msg-cli-first", "usage": map[string]any{
+			"input_tokens": 30, "cache_read_input_tokens": 0,
+			"cache_creation_input_tokens": 0, "output_tokens": 9,
+		}},
+		"sessionId": "sess-cli-first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readEnabledGrantInputs returns the enabled grant inputs recorded in
+// the state directory's grants.json.
+func readEnabledGrantInputs(t *testing.T, stateDir string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "grants.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Grants []struct {
+			Input   string `json:"input"`
+			Enabled bool   `json:"enabled"`
+		} `json:"grants"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, g := range cfg.Grants {
+		if g.Enabled {
+			out = append(out, g.Input)
 		}
 	}
-	if !found {
-		t.Fatalf("the closed source_uncovered code must be reported: %s", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "incomplete:") {
-		t.Fatalf("the human stream must carry the incomplete line: %s", stderr.String())
-	}
+	return out
 }
 
 // TestEmitResultJSONMarshalFallback pins the never-happens net: a

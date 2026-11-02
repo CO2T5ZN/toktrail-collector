@@ -491,7 +491,17 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			}
 			targetDir := spec.ResolveDefaultInput(homeDir)
 			stat, err := os.Stat(targetDir)
-			if err != nil || !stat.IsDir() {
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					// A permission or I/O failure must never masquerade
+					// as an undetected tool: fail the run with the probe
+					// error instead of reporting a fabricated
+					// not_detected status for an unreadable path.
+					return fmt.Errorf("probe default directory for tool %q: %w", spec.Tool, err)
+				}
+				// Truly absent (os.ErrNotExist): the tool is not
+				// installed at its default location — a normal,
+				// observable skip.
 				fmt.Fprintf(out, "tool %q: directory %s not found; skipped\n", spec.Tool, targetDir)
 				if !reportedProbe[spec.Tool] {
 					reportedProbe[spec.Tool] = true
@@ -502,6 +512,15 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					})
 				}
 				continue
+			}
+			if !stat.IsDir() {
+				// Every default path in the registry is a directory, so
+				// a file (or FIFO, socket, ...) at that path is a real
+				// local fault — never an undetected tool. Fail closed
+				// instead of reporting a fabricated not_detected status.
+				// Custom user grants pointing at files never pass through
+				// this probe (only the default directory does).
+				return fmt.Errorf("probe default directory for tool %q: %s exists but is not a directory", spec.Tool, targetDir)
 			}
 			fmt.Fprintf(out, "tool %q: detected directory %s; authorized\n", spec.Tool, targetDir)
 			authorizedTools = append(authorizedTools, spec.Tool)

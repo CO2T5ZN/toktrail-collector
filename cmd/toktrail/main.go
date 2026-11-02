@@ -683,14 +683,17 @@ func runPeriodicRound(fs *flag.FlagSet, human, stderr io.Writer, serverURL, stat
 		fmt.Fprintf(human, "incomplete: %d granted source(s) did not complete this run (input inaccessible or export failed); the next run retries them\n", faults)
 		return result, fmt.Errorf("%w: periodic incomplete: %d granted source(s) did not complete", collection.ErrIncompleteRun, faults), ctx.Err(), true
 	}
-	// §6.5: an authorized source the grant sync could not cover (its
-	// default input is missing on this device) is an incomplete run —
-	// the historical exit zero would dress an uncovered authorization
-	// up as success. User-disabled and unsupported tools are no-concern
-	// states and never trigger this. The count is the only detail
-	// reported: no tool names, paths or reason text.
+	// §6.5: an authorized source whose pending restriction could not be
+	// classified (a reason outside the closed wire vocabulary) is an
+	// incomplete run — the historical exit zero would dress an uncovered
+	// authorization up as success. User-disabled and unsupported tools
+	// are no-concern states and never trigger this, and a default input
+	// that was never detected is the normal skip of a tool this device
+	// never installed (still observable in the grantSync pending lines
+	// and the scope summary). The count is the only detail reported: no
+	// tool names, paths or reason text.
 	if concerns := collection.PendingCoverageConcerns(result.GrantSync.Pending); concerns > 0 {
-		fmt.Fprintf(human, "incomplete: %d authorized source(s) are not covered on this device (their default input is missing); the next run retries them\n", concerns)
+		fmt.Fprintf(human, "incomplete: %d authorized source(s) are not covered on this device (unclassified restriction); the next run retries them\n", concerns)
 		return result, fmt.Errorf("%w: periodic incomplete: %d authorized source(s) are not covered", collection.ErrIncompleteRun, concerns), ctx.Err(), true
 	}
 	// §6.5: a successful (nil-error) run still owes the truth about its

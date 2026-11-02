@@ -1468,14 +1468,24 @@ func evaluateIncomplete(syncRes *SyncResult, opt SyncOptions) []string {
 		}
 	}
 
-	// An authorized source the grant sync could not cover (its default
-	// input is missing on this device) must not read as success: the
-	// authorization names it, but nothing on this device collected it.
-	// User-disabled and unsupported tools are no-concern states. Either
-	// round's grant view counts (the backlog passes refresh it).
-	if concerns := collection.PendingCoverageConcerns(syncRes.Collection.GrantSync.Pending) +
-		collection.PendingCoverageConcerns(syncRes.Backlog.Result.GrantSync.Pending); concerns > 0 {
-		add("%d authorized source(s) are not covered on this device (their default input is missing); the next run retries them", concerns)
+	// An authorized source whose pending restriction could not be
+	// classified (a reason outside the closed wire vocabulary) must not
+	// read as success: the authorization names it, but nothing on this
+	// device collected it. User-disabled and unsupported tools are
+	// no-concern states, and a default input that was never detected is
+	// the normal skip of a tool this device never installed (observable
+	// through the pending map and the tool-status report, not an
+	// incompleteness). Either round's grant view counts (the backlog
+	// passes refresh it): the tools are merged by UNIQUE name, so a
+	// tool restricted in both the initial round and a backlog pass
+	// counts once while a real restriction from EITHER round is never
+	// dropped.
+	concernTools := collection.PendingConcernTools(
+		syncRes.Collection.GrantSync.Pending,
+		syncRes.Backlog.Result.GrantSync.Pending,
+	)
+	if len(concernTools) > 0 {
+		add("%d authorized source(s) are not covered on this device (unclassified restriction); the next run retries them", len(concernTools))
 	}
 
 	// Whole-run skips: pause is a server state that must not look like

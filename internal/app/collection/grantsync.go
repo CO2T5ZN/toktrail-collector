@@ -488,7 +488,18 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 			pending[tool] = "default-directory grant is manually disabled; re-enable it (toktrail sources enable) to resume collection"
 			continue
 		}
-		if !inputExists(def) {
+		// The default-directory probe for a tool with NO grant yet.
+		// Only a truly absent directory (os.ErrNotExist) counts as
+		// "never detected" — the normal skip of an optional tool this
+		// device never installed. Any other probe failure (a permission
+		// error, an I/O error, or a path that exists but is not a
+		// directory) must surface: classifying a real local fault as
+		// "not found" would disguise it as an uninstalled tool.
+		missing, probeErr := defaultInputMissing(def)
+		if probeErr != nil {
+			return nil, nil, fmt.Errorf("probe default directory for tool %q: %w", tool, probeErr)
+		}
+		if missing {
 			if anyEnabledForSource(cfg, spec.Source) {
 				// The tool is collected through a user-authored
 				// custom grant; the missing default directory is
@@ -528,9 +539,30 @@ func anyEnabledForSource(cfg grants.Config, source string) bool {
 	return false
 }
 
-func inputExists(path string) bool {
+// defaultInputMissing classifies the default-directory probe for one
+// allowed tool that has no grant yet. missing is true ONLY for
+// os.ErrNotExist — a directory this device never had, the normal skip
+// of an optional authorized tool. Any other stat failure (a permission
+// error, an I/O error) is returned as-is, and a path that exists but
+// is not a directory is likewise an honest error: every default path
+// in the registry is a directory (including the sqlite sources, whose
+// defaults are the directories holding the databases), so a file (or
+// FIFO, socket, ...) at that path is a real local fault, never an
+// undetected tool. Existing grants with custom file inputs (a
+// user-enabled .sqlite database, for example) never pass through this
+// probe — only a tool's default directory does.
+func defaultInputMissing(path string) (bool, error) {
 	info, err := os.Stat(path)
-	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+	if err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("%s exists but is not a directory", path)
+		}
+		return false, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, err
 }
 
 // resolveServerURL mirrors syncclient's server URL resolution so the

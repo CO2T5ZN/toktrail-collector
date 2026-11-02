@@ -188,25 +188,54 @@ func (o GrantOutcome) Fault() bool {
 	}
 }
 
-// PendingCoverageConcerns counts the authorized sources the grant
-// sync's pending map shows as NOT covered this run: a missing default
-// input, or a reason outside the closed wire vocabulary
-// (conservative). Unsupported tools and user-disabled managed grants
-// are no-concern states and never count — the count is exactly the
-// §6.5 incompleteness signal the periodic CLI turns into a non-zero
-// exit and connect's completeness evaluation reports.
-func PendingCoverageConcerns(pending map[string]string) int {
-	if len(pending) == 0 {
-		return 0
-	}
-	reasons, unmapped := ackPendingReasons(pending)
-	concerns := len(unmapped)
-	for _, code := range reasons {
-		if code == synccmd.PendingReasonMissingInput {
-			concerns++
+// PendingConcernTools returns the set of allowed tools whose pending
+// restriction is a coverage concern, merged by UNIQUE tool name across
+// every round's pending map: a tool restricted in both the initial
+// collection and a backlog pass counts once, and a tool restricted in
+// EITHER round is never dropped (a real stage failure survives the
+// merge). The concern vocabulary is deliberately conservative:
+//
+//   - a reason OUTSIDE the closed wire vocabulary is a concern — an
+//     unclassifiable restriction is held as an uncovered source, never
+//     guessed away;
+//   - a default input that was never detected (missing_input) is NOT a
+//     concern: the server's allowed-tools list is an allowance, and a
+//     tool this device never installed is not executable work here.
+//     Its absence stays observable — the grant-ack pending state with
+//     the missing_input code, the not_detected tool status and the
+//     summary's pendingMissingInput counter — without failing the
+//     round. A tool whose directory existed and was granted, then
+//     vanished, is NOT in this map either: that case is an enabled
+//     grant whose input no longer reads, reported by the scan as the
+//     GrantInputInaccessible fault;
+//   - unsupported tools and user-disabled managed grants are
+//     no-concern states.
+//
+// A nil result means no round reported a concern.
+func PendingConcernTools(pending ...map[string]string) map[string]struct{} {
+	var out map[string]struct{}
+	for _, p := range pending {
+		if len(p) == 0 {
+			continue
+		}
+		_, unmapped := ackPendingReasons(p)
+		for _, tool := range unmapped {
+			if out == nil {
+				out = make(map[string]struct{}, len(unmapped))
+			}
+			out[tool] = struct{}{}
 		}
 	}
-	return concerns
+	return out
+}
+
+// PendingCoverageConcerns counts the authorized sources the grant
+// sync's pending map shows as a coverage concern (see
+// PendingConcernTools for the vocabulary). It is exactly the §6.5
+// incompleteness signal the periodic CLI turns into a non-zero exit
+// and connect's completeness evaluation reports.
+func PendingCoverageConcerns(pending map[string]string) int {
+	return len(PendingConcernTools(pending))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +278,11 @@ type ScopeSummary struct {
 	// — a user choice, not a fault.
 	PendingDisabled int `json:"pendingDisabled"`
 	// PendingMissingInput counts allowed tools whose default input
-	// directory is absent — an authorized source this run did not
-	// cover (the verdict reports partial, never complete).
+	// directory is absent — an observable never-installed state (the
+	// grant-ack stays pending with the missing_input code and the tool
+	// status reports not_detected), not a run fault: a tool this
+	// device never installed is not executable work here, so the
+	// verdict may still be complete.
 	PendingMissingInput int `json:"pendingMissingInput"`
 	// PendingUnmapped counts pending reasons outside the closed
 	// vocabulary — treated as an uncovered source (conservative).
@@ -623,9 +655,11 @@ func SummarizeNotRun(err error, command string, durationMS int64) RunSummary {
 //     granted source that failed to read or export are fatal_error
 //     (the historical non-zero exits; the periodic CLI fails the run
 //     on the grant faults);
-//   - an authorized source the grant sync could not cover (a missing
-//     default input, or an unmapped pending reason) is partial — never
-//     a claimed completion;
+//   - an authorized source the grant sync could not classify (an
+//     unmapped pending reason) is partial — never a claimed
+//     completion. A never-detected default input is not a concern:
+//     the tool was never installed on this device, so no executable
+//     work is owed (see PendingConcernTools);
 //   - pending batches with an explicit bound (device or account) are
 //     the exit-zero bounded stop;
 //   - anything else with nothing pending is complete.

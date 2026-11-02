@@ -170,14 +170,18 @@ func TestSummarizeVerdicts(t *testing.T) {
 			want: StopComplete,
 		},
 		{
-			name: "authorized source with a missing default input is uncovered",
+			// A tool this device never installed is not executable work:
+			// the never-detected default directory stays observable
+			// (grant-ack pending, not_detected tool status, the summary's
+			// pendingMissingInput counter) but never fails the round.
+			name: "never-installed authorized tool is not a concern",
 			res: Result{
 				GrantSync: GrantSync{Pending: map[string]string{
 					"Claude Code": "default directory not found: /Users/secret/missing",
 				}},
 				PendingCounted: true,
 			},
-			want: StopPartial,
+			want: StopComplete,
 		},
 		{
 			name: "unsupported and user-disabled pending tools are no concern",
@@ -512,19 +516,30 @@ func assertKeySet(t *testing.T, m map[string]any, want []string) {
 
 // TestSummarizeIncompleteRunEnvelope pins the envelope semantics: a
 // command-layer incomplete exit wrapped in ErrIncompleteRun classifies
-// from the structured result — partial for an uncovered authorized
-// source, paused for an incomplete account round — never the default
-// fatal_error, while a plain error over the same state stays fatal.
+// from the structured result — partial for an authorized source the
+// grant sync could not classify, paused for an incomplete account
+// round — never the default fatal_error, while a plain error over the
+// same state stays fatal. A never-detected default input is not a
+// concern: the envelope over that state alone must not read partial.
 func TestSummarizeIncompleteRunEnvelope(t *testing.T) {
 	res := Result{
 		GrantSync: GrantSync{Pending: map[string]string{
-			"Claude Code": "default directory not found: /missing",
+			"Claude Code": "some future restriction format",
 		}},
 		PendingCounted: true,
 	}
 	envelope := fmt.Errorf("%w: periodic incomplete: 1 authorized source(s) are not covered", ErrIncompleteRun)
 	if got := Summarize(res, envelope, nil, "periodic", 1); got.StopReason != StopPartial {
-		t.Fatalf("the envelope over an uncovered source must be partial, got %q", got.StopReason)
+		t.Fatalf("the envelope over an unclassifiable authorized source must be partial, got %q", got.StopReason)
+	}
+	neverInstalled := Result{
+		GrantSync: GrantSync{Pending: map[string]string{
+			"Claude Code": "default directory not found: /missing",
+		}},
+		PendingCounted: true,
+	}
+	if got := Summarize(neverInstalled, fmt.Errorf("%w: nothing owed", ErrIncompleteRun), nil, "periodic", 1); got.StopReason != StopComplete {
+		t.Fatalf("a never-installed tool must not flip the envelope to partial, got %q", got.StopReason)
 	}
 	plain := errors.New("periodic incomplete: 1 authorized source(s) are not covered")
 	if got := Summarize(res, plain, nil, "periodic", 1); got.StopReason != StopFatalError {
