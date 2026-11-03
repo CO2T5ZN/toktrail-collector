@@ -103,6 +103,20 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		Tool:           "Pi",
+		Aliases:        []string{"pi", "pi-mono", "pi mono", "pi coding agent", "pi-agent", "badlogic pi", "earendil pi"},
+		Source:         adapter.PiJSONLSource,
+		DefaultSubpath: []string{".pi", "agent", "sessions"},
+		Mode:           ModeLocal,
+	},
+	{
+		Tool:           "Oh My Pi",
+		Aliases:        []string{"omp", "oh my pi", "oh-my-pi", "ohmypi"},
+		Source:         adapter.OMPJSONLSource,
+		DefaultSubpath: []string{".omp", "agent", "sessions"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It

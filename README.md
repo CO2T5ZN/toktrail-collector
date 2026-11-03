@@ -20,6 +20,8 @@ Supported sources in the current implementation:
 - ZCode SQLite (`zcode-sqlite`): passive `model_usage` table counters only.
 - Hermes Agent SQLite (`hermes-sqlite`): passive `state.db` usage table counters only.
 - OpenClaw SQLite (`openclaw-sqlite`): passive `transcript_events.event_json` usage events only.
+- Pi session JSONL (`pi-jsonl`): assistant message plus usage/model_usage entry counters only.
+- Oh My Pi session JSONL (`omp-jsonl`): same format as Pi, read under `~/.omp`.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -63,6 +65,7 @@ internal/source/
   zcodesqlite/           ZCode SQLite parser and tests
   hermessqlite/          Hermes Agent SQLite parser and tests
   openclawsqlite/        OpenClaw SQLite parser and tests
+  piwire/                Pi / Oh My Pi session JSONL parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -221,6 +224,28 @@ OpenClaw specifics:
 - Compressed `event_zstd` rows are reported and skipped in this first version; add zstd decoding before relying on compressed stores for complete totals.
 - Credentials, control-plane state, and non-usage transcript content are not uploaded; records contain counts, model, time, and a hashed event identity.
 
+Scan and export Pi usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source pi-jsonl --input ~/.pi/agent/sessions
+go run ./cmd/toktrail export --source pi-jsonl --input ~/.pi/agent/sessions --out ./pi-batch.json --batch pi-demo-1
+```
+
+Scan and export Oh My Pi usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source omp-jsonl --input ~/.omp/agent/sessions
+go run ./cmd/toktrail export --source omp-jsonl --input ~/.omp/agent/sessions --out ./omp-batch.json --batch omp-demo-1
+```
+
+Pi / Oh My Pi specifics:
+
+- Pi (badlogic/pi-mono, now earendil-works/pi) and Oh My Pi (omp, a can1357 fork) write the same JSONL session format. They register as two separate sources, `pi-jsonl` and `omp-jsonl`, with default roots `~/.pi/agent/sessions` and `~/.omp/agent/sessions`.
+- Session files are append-only trees (a header line followed by entries with id/parentId/timestamp). The collector reads assistant message `usage` plus standalone `usage` / `model_usage` entries (Oh My Pi calls outside the conversation flow such as title generation); each is a per-request delta.
+- The four usage buckets are `input`/`output`/`cacheRead`/`cacheWrite` (OpenAI convention: disjoint, input excludes cache). The collector uploads them verbatim with no arithmetic; `reasoningTokens` is an informational subset of output and is not uploaded separately.
+- Both products read the same `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR` environment variable names; honoring them from two sources could scan one directory twice, so the first version ignores them and uses the fixed default paths only.
+- /fork copies the active branch into a new session file, which can re-count historical requests; branch and reset semantics need real-sample validation. Oh My Pi profile directories (`~/.omp/profiles/<name>/agent/sessions`) are not discovered automatically and need an explicit grant.
+
 WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
@@ -262,6 +287,8 @@ go run ./cmd/toktrail service install \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
   --grant hermes-sqlite=$HOME/.hermes \
   --grant openclaw-sqlite=$HOME/.openclaw/agents \
+  --grant pi-jsonl=$HOME/.pi/agent/sessions \
+  --grant omp-jsonl=$HOME/.omp/agent/sessions \
   --interval 30m
 ```
 

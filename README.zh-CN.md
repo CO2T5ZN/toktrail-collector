@@ -20,6 +20,8 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - ZCode SQLite（`zcode-sqlite`）：仅读取 `model_usage` 用量表。
 - Hermes Agent SQLite（`hermes-sqlite`）：仅读取 `state.db` 的用量表。
 - OpenClaw SQLite（`openclaw-sqlite`）：仅读取 `transcript_events.event_json` 用量事件。
+- Pi session JSONL（`pi-jsonl`）：仅读取 assistant message 与 usage/model_usage 条目计数。
+- Oh My Pi session JSONL（`omp-jsonl`）：与 Pi 相同格式，读取 `~/.omp` 下的会话。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
@@ -63,6 +65,7 @@ internal/source/
   zcodesqlite/           ZCode SQLite parser 与测试
   hermessqlite/          Hermes Agent SQLite parser 与测试
   openclawsqlite/        OpenClaw SQLite parser 与测试
+  piwire/                Pi / Oh My Pi session JSONL parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -218,6 +221,28 @@ OpenClaw 说明：
 - 首版不解码 `event_zstd` 压缩事件；发现压缩行时会本地报告跳过，需后续加入 zstd 解码后再覆盖。
 - 不读取 credentials、控制面状态或不含用量的对话正文表；记录只上传计数、模型、时间和脱敏事件标识。
 
+扫描并导出 Pi 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source pi-jsonl --input ~/.pi/agent/sessions
+go run ./cmd/toktrail export --source pi-jsonl --input ~/.pi/agent/sessions --out ./pi-batch.json --batch pi-demo-1
+```
+
+扫描并导出 Oh My Pi 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source omp-jsonl --input ~/.omp/agent/sessions
+go run ./cmd/toktrail export --source omp-jsonl --input ~/.omp/agent/sessions --out ./omp-batch.json --batch omp-demo-1
+```
+
+Pi / Oh My Pi 说明：
+
+- Pi（badlogic/pi-mono，现 earendil-works/pi）与 Oh My Pi（omp，can1357 fork）写相同的 JSONL 会话格式；两者注册为 `pi-jsonl` 与 `omp-jsonl` 两个独立 source，默认目录分别是 `~/.pi/agent/sessions` 与 `~/.omp/agent/sessions`。
+- 会话文件是追加式树（首行 header + 带 id/parentId/timestamp 的 entry）。Collector 读取 assistant message 的 `usage` 以及独立的 `usage` / `model_usage` 条目（omp 的标题生成等会话外调用），每条为一次独立请求的 delta。
+- usage 四个桶为 `input`/`output`/`cacheRead`/`cacheWrite`（OpenAI 约定，互不相交，input 不含 cache），Collector 原样上传不做加减；`reasoningTokens` 是 output 的信息性子集，不单独上传。
+- 两个产品共用同名环境变量 `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR`；为避免同一目录被两个 source 各扫一遍造成双计，首版不读取这些环境变量，只用固定默认路径。
+- /fork 复制活动分支到新会话文件时可能重复计入历史请求；分支/重置语义需真实样本验收。omp 的 profile 目录（`~/.omp/profiles/<name>/agent/sessions`）首版不自动发现，需显式授权。
+
 WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
@@ -259,6 +284,8 @@ go run ./cmd/toktrail service install \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
   --grant hermes-sqlite=$HOME/.hermes \
   --grant openclaw-sqlite=$HOME/.openclaw/agents \
+  --grant pi-jsonl=$HOME/.pi/agent/sessions \
+  --grant omp-jsonl=$HOME/.omp/agent/sessions \
   --interval 30m
 ```
 

@@ -55,6 +55,15 @@ func TestLookupTool(t *testing.T) {
 		{"OpenClaw", "OpenClaw", "openclaw-sqlite", true},
 		{"openclaw", "OpenClaw", "openclaw-sqlite", true},
 		{"open-claw", "OpenClaw", "openclaw-sqlite", true},
+		{"Pi", "Pi", "pi-jsonl", true},
+		{"pi", "Pi", "pi-jsonl", true},
+		{"pi-mono", "Pi", "pi-jsonl", true},
+		{"pi coding agent", "Pi", "pi-jsonl", true},
+		{"Oh My Pi", "Oh My Pi", "omp-jsonl", true},
+		{"omp", "Oh My Pi", "omp-jsonl", true},
+		{"oh-my-pi", "Oh My Pi", "omp-jsonl", true},
+		{"ohmypi", "Oh My Pi", "omp-jsonl", true},
+		{"  Oh My Pi  ", "Oh My Pi", "omp-jsonl", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -175,6 +184,26 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".openclaw", "agents")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Pi")
+	if !found {
+		t.Fatal("Pi not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".pi", "agent", "sessions")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Oh My Pi")
+	if !found {
+		t.Fatal("Oh My Pi not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".omp", "agent", "sessions")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

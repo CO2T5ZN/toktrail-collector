@@ -11,6 +11,7 @@ import (
 	"toktrail-collector/internal/source/hermessqlite"
 	"toktrail-collector/internal/source/kimiwire"
 	"toktrail-collector/internal/source/openclawsqlite"
+	"toktrail-collector/internal/source/piwire"
 	"toktrail-collector/internal/source/qwenjsonl"
 	"toktrail-collector/internal/source/usagejson"
 	"toktrail-collector/internal/source/workbuddyjsonl"
@@ -42,7 +43,7 @@ func New(adapters ...adapter.Adapter) (*Registry, error) {
 var production = mustProduction()
 
 func mustProduction() *Registry {
-	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter(), qwenjsonl.Adapter(), kimiwire.KimiCLIAdapter(), kimiwire.KimiCodeAdapter(), zcodesqlite.Adapter(), hermessqlite.Adapter(), openclawsqlite.Adapter())
+	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter(), qwenjsonl.Adapter(), kimiwire.KimiCLIAdapter(), kimiwire.KimiCodeAdapter(), zcodesqlite.Adapter(), hermessqlite.Adapter(), openclawsqlite.Adapter(), piwire.PiAdapter(), piwire.OMPAdapter())
 	if err != nil {
 		panic(err)
 	}
