@@ -159,6 +159,9 @@ func readDB(ctx context.Context, path string) ([]hermesObservation, error) {
 
 func readSessionModelUsage(ctx context.Context, db *sql.DB, path string) ([]hermesObservation, error) {
 	query := `SELECT COALESCE(smu.session_id, ''), COALESCE(smu.model, ''), COALESCE(s.started_at, 0), COALESCE(smu.input_tokens, 0), COALESCE(smu.output_tokens, 0), COALESCE(smu.cache_read_tokens, 0), COALESCE(smu.cache_write_tokens, 0) FROM session_model_usage smu LEFT JOIN sessions s ON s.id = smu.session_id ORDER BY COALESCE(s.started_at, 0), smu.session_id, smu.model`
+	if scanQueryHook != nil {
+		scanQueryHook(ctx)
+	}
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, contextErr(ctx, fmt.Errorf("query Hermes session_model_usage: %w", err))
@@ -166,6 +169,9 @@ func readSessionModelUsage(ctx context.Context, db *sql.DB, path string) ([]herm
 	defer rows.Close()
 	var out []hermesObservation
 	for rows.Next() {
+		if scanRowHook != nil {
+			scanRowHook(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -193,8 +199,25 @@ func contextErr(ctx context.Context, err error) error {
 	return err
 }
 
+// Test-only scan hooks; both stay nil in production and are never set
+// outside this package's tests. They exist so cancellation tests can fire
+// the caller's scope at a chosen checkpoint (after the schema probe but
+// before the main query, or at a specific row) instead of racing a real
+// timer across an oversized fixture. scanQueryHook runs immediately before
+// the main table query; scanRowHook runs once per row iteration, before the
+// per-row context check, and receives the per-database scan scope the query
+// runs under. Neither hook can alter control flow beyond the cancellation
+// the context itself reports.
+var (
+	scanQueryHook func(ctx context.Context)
+	scanRowHook   func(ctx context.Context)
+)
+
 func readSessions(ctx context.Context, db *sql.DB, path string) ([]hermesObservation, error) {
 	query := `SELECT COALESCE(id, ''), COALESCE(model, ''), COALESCE(started_at, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0) FROM sessions ORDER BY started_at ASC, id ASC`
+	if scanQueryHook != nil {
+		scanQueryHook(ctx)
+	}
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, contextErr(ctx, fmt.Errorf("query Hermes sessions: %w", err))
@@ -202,6 +225,9 @@ func readSessions(ctx context.Context, db *sql.DB, path string) ([]hermesObserva
 	defer rows.Close()
 	var out []hermesObservation
 	for rows.Next() {
+		if scanRowHook != nil {
+			scanRowHook(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}

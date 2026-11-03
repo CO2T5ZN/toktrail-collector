@@ -1,21 +1,26 @@
 package hermessqlite
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	_ "modernc.org/sqlite"
 
 	"toktrail-collector/internal/source/adapter"
 )
+
+// closeHermesDB closes a fixture database and fails the test if the close
+// leaks an error, so fixture helpers never paper over resource problems.
+func closeHermesDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture database: %v", err)
+	}
+}
 
 func makeHermesDB(t *testing.T, path string, perModel bool) {
 	t.Helper()
@@ -26,7 +31,7 @@ func makeHermesDB(t *testing.T, path string, perModel bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeHermesDB(t, db)
 	if _, err := db.Exec(`CREATE TABLE sessions (
 		id TEXT PRIMARY KEY,
 		model TEXT,
@@ -58,7 +63,7 @@ func insertHermesSession(t *testing.T, path, id, model string, startedAt, input,
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeHermesDB(t, db)
 	if _, err := db.Exec(`INSERT INTO sessions (id, model, started_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)`, id, model, startedAt, input, output, cacheRead, cacheWrite); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +75,7 @@ func insertHermesModelUsage(t *testing.T, path, sessionID, model string, input, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeHermesDB(t, db)
 	if _, err := db.Exec(`INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) VALUES (?, ?, ?, ?, ?, ?)`, sessionID, model, input, output, cacheRead, cacheWrite); err != nil {
 		t.Fatal(err)
 	}
@@ -179,64 +184,5 @@ func TestLoadRecordsRejectsMissingUsageTables(t *testing.T) {
 	_, err = LoadRecords(root)
 	if err == nil || !strings.Contains(err.Error(), "sessions") {
 		t.Fatalf("expected missing table error, got %v", err)
-	}
-}
-
-func TestAdapterLoadHonorsCancelledContext(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "state.db")
-	makeHermesDB(t, path, false)
-	insertHermesSession(t, path, "sess-1", "summary-model", 1790000001000, 100, 30, 20, 5)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	res, err := Adapter().Load(adapter.Options{Input: root, Context: ctx})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
-	if len(res.Records) != 0 || res.Quarantined != 0 || len(res.Issues) != 0 {
-		t.Fatalf("cancelled load must fail without partial data: %#v", res)
-	}
-}
-
-func TestAdapterLoadDeadlineMidScanFailsWithoutPartialData(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "state.db")
-	makeHermesDB(t, path, false)
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	insert, err := tx.Prepare(`INSERT INTO sessions (id, model, started_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const rowCount = 20000
-	for i := 0; i < rowCount; i++ {
-		if _, err := insert.Exec(fmt.Sprintf("sess-%d", i), "summary-model", int64(1790000001000+i), 100, 30, 20, 5); err != nil {
-			t.Fatal(err)
-		}
-	}
-	insert.Close()
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// The deadline lands mid-scan: the 20k-row query and row loop take far
-	// longer than 5ms, so cancellation must abort the load (whichever check
-	// fires first) and never return the rows scanned so far.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	res, err := Adapter().Load(adapter.Options{Input: root, Context: ctx})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
-	}
-	if len(res.Records) != 0 || res.Quarantined != 0 || len(res.Issues) != 0 {
-		t.Fatalf("deadline-exceeded load must fail without partial data: %#v", res)
 	}
 }

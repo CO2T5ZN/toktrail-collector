@@ -171,6 +171,9 @@ func readDB(ctx context.Context, path string) ([]zcodeObservation, error) {
 		query += ` WHERE status = 'completed'`
 	}
 	query += ` ORDER BY started_at ASC, id ASC`
+	if scanQueryHook != nil {
+		scanQueryHook(ctx)
+	}
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, contextErr(ctx, fmt.Errorf("query ZCode model_usage: %w", err))
@@ -178,6 +181,9 @@ func readDB(ctx context.Context, path string) ([]zcodeObservation, error) {
 	defer rows.Close()
 	var out []zcodeObservation
 	for rows.Next() {
+		if scanRowHook != nil {
+			scanRowHook(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -258,6 +264,20 @@ func contextErr(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+// Test-only scan hooks; both stay nil in production and are never set
+// outside this package's tests. They exist so cancellation tests can fire
+// the caller's scope at a chosen checkpoint (after the schema probe but
+// before the main query, or at a specific row) instead of racing a real
+// timer across an oversized fixture. scanQueryHook runs immediately before
+// the main model_usage query; scanRowHook runs once per row iteration,
+// before the per-row context check, and receives the per-database scan
+// scope the query runs under. Neither hook can alter control flow beyond
+// the cancellation the context itself reports.
+var (
+	scanQueryHook func(ctx context.Context)
+	scanRowHook   func(ctx context.Context)
+)
 
 func modelUsageHasColumn(ctx context.Context, db *sql.DB, column string) (bool, error) {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(model_usage)`)

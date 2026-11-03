@@ -176,6 +176,9 @@ func readDB(ctx context.Context, path string) ([]openClawObservation, int, error
 	if hasZstd, err := hasColumn(ctx, db, "transcript_events", "event_zstd"); err == nil && hasZstd {
 		_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM transcript_events WHERE event_json IS NULL AND event_zstd IS NOT NULL`).Scan(&skipped)
 	}
+	if scanQueryHook != nil {
+		scanQueryHook(ctx)
+	}
 	rows, err := db.QueryContext(ctx, `SELECT rowid, COALESCE(session_id, ''), COALESCE(created_at, 0), event_json FROM transcript_events WHERE event_json IS NOT NULL ORDER BY rowid ASC`)
 	if err != nil {
 		return nil, skipped, contextErr(ctx, fmt.Errorf("query OpenClaw transcript_events: %w", err))
@@ -183,6 +186,9 @@ func readDB(ctx context.Context, path string) ([]openClawObservation, int, error
 	defer rows.Close()
 	var out []openClawObservation
 	for rows.Next() {
+		if scanRowHook != nil {
+			scanRowHook(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, skipped, err
 		}
@@ -220,6 +226,20 @@ func contextErr(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+// Test-only scan hooks; both stay nil in production and are never set
+// outside this package's tests. They exist so cancellation tests can fire
+// the caller's scope at a chosen checkpoint (after the schema probe but
+// before the main query, or at a specific row) instead of racing a real
+// timer across an oversized fixture. scanQueryHook runs immediately before
+// the main transcript query; scanRowHook runs once per row iteration,
+// before the per-row context check, and receives the per-database scan
+// scope the query runs under. Neither hook can alter control flow beyond
+// the cancellation the context itself reports.
+var (
+	scanQueryHook func(ctx context.Context)
+	scanRowHook   func(ctx context.Context)
+)
 
 func parseEvent(path string, rowID int64, sessionID string, createdRaw any, text string) (openClawObservation, bool, error) {
 	decoder := json.NewDecoder(strings.NewReader(text))

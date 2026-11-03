@@ -112,11 +112,13 @@ Remove-Item Env:TOKTRAIL_WINDOWS_SCHEDULER_E2E
 $env:TOKTRAIL_WINDOWS_CONNECT_E2E = '1'
 go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -v
 Remove-Item Env:TOKTRAIL_WINDOWS_CONNECT_E2E
+go test ./internal/source/hermessqlite ./internal/source/openclawsqlite ./internal/source/zcodesqlite -run '^TestSQLiteCancellationReleasesDatabase$' -count=50 -timeout=5m -v
 pwsh -File scripts/windows-smoke.ps1
 ```
 
-Each command must exit zero, and the two integration runs must actually run
-their named test (not skip). Also run the Linux-side checks that the `check`
+Each command must exit zero, and the two integration runs and the sqlite
+stress run must actually run their named test (not skip; the stress run must
+produce 50 top-level passes per package). Also run the Linux-side checks that the `check`
 job enforces — `go vet ./...`, `go test ./... -count=1`, and the
 `TOKTRAIL_RELEASE_E2E=1` signed-chain test from
 [CONTRIBUTING](../CONTRIBUTING.md) — then perform the local release build
@@ -135,7 +137,7 @@ Configure the repository's protected `release` environment with:
 - Variable `TOKTRAIL_RELEASE_PUBLIC_KEY`: independently configured trusted public-key PEM used to verify the assembled release. Public keys may be published in the repository; the verifier's trusted pin must be established independently of the downloaded release.
 - Environment reviewers and tag/deployment restrictions appropriate to the repository. Use repository settings to restrict which team can approve releases.
 
-Push a valid version tag such as `v0.1.0`. The workflow validates it with the shared Go version parser, runs vet, tests and signed E2E with a temporary test key, and runs the full native Windows gate (`windows-check`: the complete test suite on `windows-2025`, the real Task Scheduler and connect integration tests, and `scripts/windows-smoke.ps1`) on the tagged commit. `build` starts only after both `check` and `windows-check` pass, then builds six platform pairs in parallel. Build jobs have read-only repository permissions and receive no signing key. The final signing job (with manual approval when required reviewers are configured) assembles/signs using the private key, verifies every artifact against the independently pinned public key, and creates a **draft** GitHub Release. Only that job has `contents: write` permission. Review and publish the draft through the normal release process. Existing releases are not silently overwritten on rerun.
+Push a valid version tag such as `v0.1.0`. The workflow validates it with the shared Go version parser, runs vet, tests and signed E2E with a temporary test key, and runs the full native Windows gate (`windows-check`: the complete test suite on `windows-2025`, the real Task Scheduler and connect integration tests, the sqlite cancel-resource stress — 50 repetitions of `TestSQLiteCancellationReleasesDatabase` in each of the three SQLite source packages — and `scripts/windows-smoke.ps1`) on the tagged commit. The five gate steps collect results independently: one failing gate does not skip the others, so a rejected tag shows every failing gate at once, and any single failure fails `windows-check`. `build` starts only after both `check` and `windows-check` pass, then builds six platform pairs in parallel. Build jobs have read-only repository permissions and receive no signing key. The final signing job (with manual approval when required reviewers are configured) assembles/signs using the private key, verifies every artifact against the independently pinned public key, and creates a **draft** GitHub Release. Only that job has `contents: write` permission. Review and publish the draft through the normal release process. Existing releases are not silently overwritten on rerun.
 
 The workflows assume `.github/workflows/` is at the repository root. When `toktrail-collector` is split into an independent Git repository, move `.github/workflows/ci.yml` and `.github/workflows/release.yml` from this directory to the repository root for GitHub to execute them.
 

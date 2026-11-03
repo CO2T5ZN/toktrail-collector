@@ -1,0 +1,14 @@
+diff --git a/vendor/modernc.org/sqlite/sqlite.go b/vendor/modernc.org/sqlite/sqlite.go
+index b693956..18a0785 100644
+--- a/vendor/modernc.org/sqlite/sqlite.go
++++ b/vendor/modernc.org/sqlite/sqlite.go
+@@ -625,6 +625,9 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
+ 
+ 	defer func() {
+ 		if ctx != nil && atomic.LoadInt32(&done) != 0 {
++			if r != nil {
++				r.Close()
++			}
+ 			r, err = nil, ctx.Err()
+ 		} else if r == nil && err == nil {
+ 			r, err = newRows(s.c, pstmt, allocs, true)

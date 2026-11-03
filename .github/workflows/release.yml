@@ -7,6 +7,12 @@
 # of the test job in ci.yml; see docs/CI.md). `build` depends on both, and
 # `publish` depends on `build`, so no artifact is built or published unless
 # every gate passed on the exact release commit.
+#
+# The Windows gate checks in `windows-check` collect results independently:
+# each gate step runs under `!cancelled()` once checkout and setup-go have
+# succeeded, so one failing check does not skip the remaining checks. Only a
+# preparation failure or a cancelled run skips them, and any single gate
+# failure still fails the job — and therefore blocks `build`.
 name: Release
 
 on:
@@ -50,17 +56,23 @@ jobs:
 
   # Native Windows gate for the tagged commit. Mirrors the Windows leg of the
   # test job in ci.yml step for step: structured full-suite log, real Task
-  # Scheduler and connect integration tests behind env gates, and the
-  # scripts/windows-smoke.ps1 smoke script. No repository secret is read here.
+  # Scheduler and connect integration tests behind env gates, the sqlite
+  # cancel-resource stress step, and the scripts/windows-smoke.ps1 smoke
+  # script. No repository secret is read here. The gate steps run
+  # independently of each other (see the note at the top of this file).
   windows-check:
     name: Windows gate (native tests + integration)
     runs-on: windows-2025
-    timeout-minutes: 40
+    # Sized for the sqlite cancel-resource stress step (50 iterations x 3
+    # packages) on top of the other gates; a cap, not a billed minimum.
+    timeout-minutes: 50
     steps:
       - name: Check out
+        id: checkout
         uses: actions/checkout@v4
 
       - name: Set up Go
+        id: setup-go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -69,16 +81,30 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # The five Windows gate steps below (full suite, scheduler, connect,
+      # sqlite stress, smoke) run independently of each other: `!cancelled()`
+      # overrides the implicit success() precondition, so a failure in one
+      # gate does not skip the others, and each check still fails the job on
+      # its own. The checkout/setup-go outcome guards keep a broken
+      # preparation from starting any gate work, and a cancelled run skips
+      # them entirely. Keep this step block byte-identical with ci.yml.
       - name: go test (Windows structured log)
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         shell: pwsh
         run: |
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           go test ./... -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath 'windows-test-output.jsonl'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Real Windows Task Scheduler integration: registers, queries, and removes a
+      # real per-user task on the runner. Opt-in via the env gate so the plain
+      # suite above stays hermetic. The pass-count check below fails this step
+      # when the -run pattern does not match the agreed test name or when the
+      # test skips instead of passing (go test alone would exit 0 either way).
+      # Runs independently of the other gate steps (see the condition note on
+      # the full-suite step above).
       - name: Windows scheduler native integration test
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         shell: pwsh
         env:
           TOKTRAIL_WINDOWS_SCHEDULER_E2E: '1'
@@ -97,8 +123,11 @@ jobs:
           }
           Write-Host 'TestWindowsSchedulerNativeIntegration ran and passed.'
 
+      # Real Windows connect flow integration for cmd/toktrail. Same rules as
+      # the scheduler gate above: the named test must actually run and pass,
+      # and the step collects its result independently of the other gates.
       - name: Windows connect native integration test
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         shell: pwsh
         env:
           TOKTRAIL_WINDOWS_CONNECT_E2E: '1'
@@ -117,22 +146,96 @@ jobs:
           }
           Write-Host 'TestWindowsConnectNativeIntegration ran and passed.'
 
+      # Windows-only cancel-resource stress for the three SQLite source
+      # packages (hermessqlite, openclawsqlite, zcodesqlite): the dedicated
+      # TestSQLiteCancellationReleasesDatabase test in each package is
+      # repeated 50 times via -count=50 in one parallel go test invocation.
+      # The -run pattern names the single lightweight target test exactly, so
+      # only that test repeats. The verification below counts only top-level
+      # pass events for that exact test name — subtest events carry
+      # "Test<name>/sub" names and cannot inflate the count — and requires
+      # exactly 50 passes in each of the three explicitly named packages,
+      # rejecting any unexpected package. A -run pattern that matches no
+      # test, a package whose test skips, or a partially run loop therefore
+      # fails this step; a vacuous `go test` exit 0 can never pass this gate.
+      # -timeout=5m applies per package test binary and the three binaries
+      # run in parallel, keeping the step within a few minutes. Like the
+      # other gate steps it collects its result independently and writes its
+      # own log file.
+      #
+      # Naming contract: $stressTest below is the single place the test name
+      # lives; it must match the test landed by the test owner in all three
+      # packages. A rename is a one-variable change here and in ci.yml.
+      - name: Windows sqlite cancel-resource stress test
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = 'windows-sqlite-cancel-stress.jsonl'
+          $stressTest = 'TestSQLiteCancellationReleasesDatabase'
+          $runPattern = '^' + $stressTest + '$'
+          go test ./internal/source/hermessqlite ./internal/source/openclawsqlite ./internal/source/zcodesqlite -run $runPattern -count=50 -timeout=5m -v -json 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $passes = @(Get-Content -LiteralPath $log |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_.Action -eq 'pass' -and $_.Test -eq $stressTest })
+          $expectedPackages = @(
+            'toktrail-collector/internal/source/hermessqlite',
+            'toktrail-collector/internal/source/openclawsqlite',
+            'toktrail-collector/internal/source/zcodesqlite'
+          )
+          $counts = @{}
+          foreach ($p in $passes) {
+            if (-not $counts.ContainsKey($p.Package)) { $counts[$p.Package] = 0 }
+            $counts[$p.Package]++
+          }
+          $failed = $false
+          foreach ($pkg in $expectedPackages) {
+            $n = 0
+            if ($counts.ContainsKey($pkg)) { $n = $counts[$pkg] }
+            if ($n -ne 50) {
+              Write-Host "::error::Expected exactly 50 passes for $stressTest in package $pkg, found $n. A skipped, unmatched, or partially run stress test must fail this gate."
+              $failed = $true
+            }
+          }
+          foreach ($pkg in $counts.Keys) {
+            if ($expectedPackages -notcontains $pkg) {
+              Write-Host "::error::Unexpected package $pkg reported passes for $stressTest; the expected package list is out of sync."
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+          Write-Host 'TestSQLiteCancellationReleasesDatabase passed 50 iterations in each of the 3 SQLite source packages.'
+
+      # Smoke entry point for Windows. The script is owned outside this
+      # workflow, but a missing script must fail the gate (no silent skip),
+      # and the script's own exit code is propagated as the step result. The
+      # output is teed to its own log file so a smoke failure leaves evidence
+      # that is independent of the go test logs; like every gate step it runs
+      # even when an earlier gate already failed.
       - name: Windows smoke
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         shell: pwsh
         run: |
           if (-not (Test-Path -LiteralPath 'scripts/windows-smoke.ps1')) {
             Write-Host '::error::scripts/windows-smoke.ps1 is missing; the Windows gate requires the smoke script.'
             exit 1
           }
-          pwsh -File scripts/windows-smoke.ps1
+          pwsh -File scripts/windows-smoke.ps1 2>&1 | Tee-Object -FilePath 'windows-smoke-output.log'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Failure diagnostics: attach only the captured per-check logs, redact
+      # known credential shapes as defense in depth, and document the
+      # sensitivity policy inside the artifact itself. Nothing from the
+      # workspace, caches, or state directories is uploaded. The step runs
+      # whenever a Windows step failed, but only when the preparation steps
+      # succeeded — a failed checkout/setup-go produced no logs to collect.
       - name: Prepare Windows failure diagnostics
-        if: failure() && runner.os == 'Windows'
+        if: ${{ failure() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         shell: pwsh
         run: |
-          $logs = @('windows-test-output.jsonl', 'windows-scheduler-e2e.jsonl', 'windows-connect-e2e.jsonl') |
+          $logs = @('windows-test-output.jsonl', 'windows-scheduler-e2e.jsonl', 'windows-connect-e2e.jsonl', 'windows-sqlite-cancel-stress.jsonl', 'windows-smoke-output.log') |
             Where-Object { Test-Path -LiteralPath $_ }
           if (-not $logs) { Write-Host 'No Windows test logs captured; nothing to prepare.'; exit 0 }
           $patterns = @(
@@ -157,7 +260,7 @@ jobs:
           Set-Content -LiteralPath 'DIAGNOSTICS-README.txt' -Value $readme -Encoding utf8
 
       - name: Upload Windows failure diagnostics
-        if: failure() && runner.os == 'Windows'
+        if: ${{ failure() && runner.os == 'Windows' && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
@@ -166,6 +269,8 @@ jobs:
             windows-test-output.jsonl
             windows-scheduler-e2e.jsonl
             windows-connect-e2e.jsonl
+            windows-sqlite-cancel-stress.jsonl
+            windows-smoke-output.log
           if-no-files-found: warn
           retention-days: 7
 

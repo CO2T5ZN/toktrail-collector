@@ -1,20 +1,26 @@
 package openclawsqlite
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	_ "modernc.org/sqlite"
 
 	"toktrail-collector/internal/source/adapter"
 )
+
+// closeOpenClawDB closes a fixture database and fails the test if the close
+// leaks an error, so fixture helpers never paper over resource problems.
+func closeOpenClawDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture database: %v", err)
+	}
+}
 
 func makeOpenClawDB(t *testing.T, path string, compressed bool) {
 	t.Helper()
@@ -25,7 +31,7 @@ func makeOpenClawDB(t *testing.T, path string, compressed bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeOpenClawDB(t, db)
 	extra := ""
 	if compressed {
 		extra = ", event_zstd BLOB, event_utf8_bytes INTEGER, navigation_json TEXT"
@@ -47,7 +53,7 @@ func insertOpenClawEvent(t *testing.T, path, session string, seq int, createdAt 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeOpenClawDB(t, db)
 	_, err = db.Exec(`INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)`, session, seq, event, createdAt)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +66,7 @@ func insertOpenClawCompressed(t *testing.T, path, session string, seq int, creat
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeOpenClawDB(t, db)
 	_, err = db.Exec(`INSERT INTO transcript_events (session_id, seq, event_json, created_at, event_zstd, event_utf8_bytes, navigation_json) VALUES (?, ?, NULL, ?, ?, ?, '{}')`, session, seq, createdAt, []byte{0x28, 0xb5, 0x2f, 0xfd}, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -179,65 +185,5 @@ func TestAdapterLoadWithoutContextKeepsLegacyBehavior(t *testing.T) {
 	}
 	if len(res.Records) != 1 || res.Records[0]["model"] != "glm" {
 		t.Fatalf("nil Context must keep the uncancellable background scan: %#v", res)
-	}
-}
-
-func TestAdapterLoadHonorsCancelledContext(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "openclaw-agent.sqlite")
-	makeOpenClawDB(t, path, false)
-	insertOpenClawEvent(t, path, "sess-1", 1, 1790000001000, `{"timestamp":"2026-10-20T01:00:00Z","message":{"role":"assistant","model":"glm","usage":{"input":100,"output":30,"cacheRead":20,"cacheWrite":5}}}`)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	res, err := Adapter().Load(adapter.Options{Input: path, Context: ctx})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
-	if len(res.Records) != 0 || res.Quarantined != 0 || len(res.Issues) != 0 {
-		t.Fatalf("cancelled load must fail without partial data: %#v", res)
-	}
-}
-
-func TestAdapterLoadDeadlineMidScanFailsWithoutPartialData(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "openclaw-agent.sqlite")
-	makeOpenClawDB(t, path, false)
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	insert, err := tx.Prepare(`INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	event := `{"timestamp":"2026-10-20T01:00:00Z","message":{"role":"assistant","model":"glm","usage":{"input":100,"output":30,"cacheRead":20,"cacheWrite":5}}}`
-	const rowCount = 20000
-	for i := 0; i < rowCount; i++ {
-		if _, err := insert.Exec("sess-1", i+1, event, int64(1790000001000+i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	insert.Close()
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// The deadline lands mid-scan: the 20k-row query and row loop take far
-	// longer than 5ms, so cancellation must abort the load (whichever check
-	// fires first) and never return the rows scanned so far.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	res, err := Adapter().Load(adapter.Options{Input: path, Context: ctx})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
-	}
-	if len(res.Records) != 0 || res.Quarantined != 0 || len(res.Issues) != 0 {
-		t.Fatalf("deadline-exceeded load must fail without partial data: %#v", res)
 	}
 }
