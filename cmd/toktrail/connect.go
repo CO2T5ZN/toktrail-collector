@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 	"toktrail-collector/internal/app/collection"
@@ -45,6 +47,7 @@ flags:
   --progress-json           emit collection progress events as JSON Lines on stderr (never stdout); filter lines by the JSON "type":"collection_progress" discriminator
   --json                    print the run's stable result (stop_reason and phase counts) as a single JSON object on stdout; human output and prompts move to stderr
   --verbose                 show detailed per-tool, per-batch and per-pass output (never secrets: no URLs, tickets or credentials)
+  --replace-state           when this machine's existing local TokTrail data belongs to a different account or device than the connect link authorizes, archive it (nothing is retransmitted) and start fresh under this link without asking; without this flag an interactive confirmation asks first
 `
 
 // errConnectFlagValue is the fixed, value-free error a failed connect
@@ -95,6 +98,7 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 	progressJSON := fs.Bool("progress-json", false, "emit collection progress events as JSON Lines on stderr (never stdout); stderr may also carry human text and prompts — filter lines by the JSON \"type\":\"collection_progress\" discriminator")
 	jsonOut := fs.Bool("json", false, "print the run's stable §6.5 result (stop_reason and phase counts) as a single JSON object on stdout; human output and prompts move to stderr")
 	verbose := fs.Bool("verbose", false, "show detailed per-tool, per-batch and per-pass output (never secrets: no URLs, tickets or credentials)")
+	replaceState := fs.Bool("replace-state", false, "when this machine's existing local TokTrail data belongs to a different account or device than the connect link authorizes, archive it (nothing is retransmitted) and start fresh under this link without asking")
 	if err := fs.Parse(args); err != nil {
 		// Flag parsing failed before the flags were readable; a literal
 		// --json in the raw arguments is the best-effort signal to still
@@ -207,17 +211,18 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 	// belong on the human stream, never on the JSON machine stream.
 	cursorOpts.Out = human
 	result, err := connect.Run(ctx, connect.Options{
-		URL:             connectURL,
-		StateDir:        dir,
-		DeviceName:      *deviceName,
-		Interval:        *interval,
-		SchedulerRunner: connectSchedulerRunner,
-		Cursor:          cursorOpts,
-		CursorConfirm:   cursorConfirmResume(nil, hs),
-		Out:             human,
-		Verbose:         *verbose,
-		MaxTotalBatches: *maxTotalBatches,
-		Progress:        progress,
+		URL:                 connectURL,
+		StateDir:            dir,
+		DeviceName:          *deviceName,
+		Interval:            *interval,
+		SchedulerRunner:     connectSchedulerRunner,
+		Cursor:              cursorOpts,
+		CursorConfirm:       cursorConfirmResume(nil, hs),
+		StateReplaceConfirm: stateReplaceConfirmFor(*replaceState, hs),
+		Out:                 human,
+		Verbose:             *verbose,
+		MaxTotalBatches:     *maxTotalBatches,
+		Progress:            progress,
 	})
 	// The final result block: the same closed-set verdict the --json
 	// object carries, rendered as concise natural language. It never
@@ -255,6 +260,17 @@ func runFailureDisplayText(err error, fallback string) string {
 		return "the installation command is outdated; generate a new command and try again"
 	}
 	switch {
+	case errors.Is(err, connect.ErrStateAuthorizationMismatch),
+		errors.Is(err, connect.ErrStateOwnershipMismatch),
+		errors.Is(err, connect.ErrUnboundSyncedHistory),
+		errors.Is(err, connect.ErrRebindIdentityChange):
+		// The detailed error text embeds server-controlled identifiers
+		// and never reaches the display; this fixed phrase carries the
+		// actionable core: the local synced history cannot be moved to
+		// the account/device this link authorizes (for example when the
+		// previous account was deleted server-side), so the user must
+		// start from a fresh state directory.
+		return "this machine's existing TokTrail data belongs to a different account or device than this connect link authorizes, so it cannot be reused as-is; rerun connect and confirm the state replacement at the prompt (or pass --replace-state) to archive the existing data and start fresh under this link, or use --state-dir with a new directory"
 	case errors.Is(err, os.ErrPermission):
 		// The reason only: main's unified line already carries the
 		// "connect failed:"/"resync failed:" prefix.
@@ -272,6 +288,60 @@ func runFailureDisplayText(err error, fallback string) string {
 func isNetworkUnreachable(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr)
+}
+
+// stateReplaceConfirmFor builds the state-replacement confirmation the
+// connect run uses at its ownership guards: --replace-state pre-confirms
+// (the non-interactive override, printing the fixed notice and the
+// forced-by line), anything else gets the interactive prompt with
+// heartbeat gating resumed the moment it returns. A declined or
+// unavailable prompt keeps the guards' fail-closed refusal.
+func stateReplaceConfirmFor(forced bool, hs *humanStream) cursorsync.ConfirmFunc {
+	if forced {
+		return func(notice string, out io.Writer) (bool, error) {
+			fmt.Fprintln(out, notice)
+			fmt.Fprintln(out, "state replacement forced by --replace-state")
+			return true, nil
+		}
+	}
+	return cursorConfirmResume(stateReplacePrompt, hs)
+}
+
+// stateReplacePrompt asks the interactive state-replacement question.
+// It mirrors cursorsync.DefaultConfirm's safety shape: a bounded stdin
+// read (the answer is never echoed; an over-long line is refused), only
+// an explicit y/yes confirms, and an unavailable stdin is an error the
+// connect flow treats as a decline (the ownership guards then fail
+// closed with their actionable guidance).
+func stateReplacePrompt(notice string, out io.Writer) (bool, error) {
+	fmt.Fprintln(out, notice)
+	fmt.Fprint(out, "Replace the existing local TokTrail state and start fresh under this connect link? [y/N] ")
+	line, err := readBoundedStdinLine(64)
+	if err != nil {
+		return false, fmt.Errorf("no interactive input available: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// readBoundedStdinLine reads one line from stdin, at most max bytes
+// (plus the newline). An over-long line is an error; the content read is
+// never included in the error (an answer line may quote anything pasted
+// into the terminal).
+func readBoundedStdinLine(max int) (string, error) {
+	br := bufio.NewReader(io.LimitReader(os.Stdin, int64(max)+1))
+	line, err := br.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	if len(line) > max {
+		return "", fmt.Errorf("input exceeds %d bytes and was refused", max)
+	}
+	return line, nil
 }
 
 // cursorConfirmResume wraps the run's interactive confirmation hook so

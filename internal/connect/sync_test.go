@@ -475,6 +475,9 @@ func runSyncConnectWithOutput(t *testing.T, cfg *syncConfigMock, stateDir, homeD
 	if extra.CursorConfirm != nil {
 		opt.CursorConfirm = extra.CursorConfirm
 	}
+	if extra.StateReplaceConfirm != nil {
+		opt.StateReplaceConfirm = extra.StateReplaceConfirm
+	}
 	if extra.Retry != nil {
 		opt.Retry = extra.Retry
 	}
@@ -978,6 +981,9 @@ func TestConnectFailsClosedOnIdentityMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "already bound to a different authorization") {
 		t.Fatalf("an identity mismatch must fail closed, got: %v", err)
 	}
+	if !errors.Is(err, ErrStateAuthorizationMismatch) {
+		t.Fatalf("the refusal must carry ErrStateAuthorizationMismatch for display classification, got: %v", err)
+	}
 	if !strings.Contains(err.Error(), "separate --state-dir") {
 		t.Fatalf("the error must tell the user to use a separate state directory, got: %v", err)
 	}
@@ -1009,6 +1015,9 @@ func TestConnectFailsClosedOnDeviceChangeRebind(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "changed the device identity") {
 		t.Fatalf("a device-changing rebind over history must fail closed, got: %v", err)
 	}
+	if !errors.Is(err, ErrRebindIdentityChange) {
+		t.Fatalf("the refusal must carry ErrRebindIdentityChange for display classification, got: %v", err)
+	}
 	if !strings.Contains(err.Error(), "double count") {
 		t.Fatalf("the error must explain the double-counting risk, got: %v", err)
 	}
@@ -1025,6 +1034,9 @@ func TestConnectFailsClosedOnDeviceChangeRebind(t *testing.T) {
 	_, err = runSyncConnect(t, cfg, stateDir, homeDir, ticket)
 	if err == nil || !strings.Contains(err.Error(), "belongs to device dev-old-1") {
 		t.Fatalf("the retry must be blocked by the ownership guard, got: %v", err)
+	}
+	if !errors.Is(err, ErrStateOwnershipMismatch) {
+		t.Fatalf("the retry refusal must carry ErrStateOwnershipMismatch for display classification, got: %v", err)
 	}
 	if mock.totalIngests() != 0 {
 		t.Fatalf("the retry must not retransmit anything, got %d posts", mock.totalIngests())
@@ -1049,6 +1061,171 @@ func TestConnectFailsClosedOnUnboundSyncedHistory(t *testing.T) {
 	}
 	if mock.bindCount() != 0 {
 		t.Fatalf("no bind may run over unattributable history, got %d calls", mock.bindCount())
+	}
+}
+
+// findReplacedArchive returns the newest .replaced-* sibling of the
+// state directory, or "" when none exists.
+func findReplacedArchive(stateDir string) string {
+	entries, err := os.ReadDir(filepath.Dir(stateDir))
+	if err != nil {
+		return ""
+	}
+	base := filepath.Base(stateDir)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), base+".replaced-") {
+			return filepath.Join(filepath.Dir(stateDir), entry.Name())
+		}
+	}
+	return ""
+}
+
+// TestConnectStateReplaceOnAuthorizationMismatch verifies the confirmed
+// state replacement over an authorization mismatch: the latest explicit
+// connect link wins, the old state (bound to a different
+// server/subject) is archived — its synced history is NEVER
+// retransmitted (the anti-double-count invariant) — and the run
+// completes with a fresh binding under the link's authorization.
+func TestConnectStateReplaceOnAuthorizationMismatch(t *testing.T) {
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	mock := startSyncToktrailMock(t, "dev-repl-1")
+	cfg := startSyncConfigMock(t, mock.URL, []string{"Codex"}, intPtr(30))
+
+	seedBoundState(t, stateDir, "http://127.0.0.1:1", "dev-repl-old")
+	seedCodexGrant(t, stateDir, homeDir)
+	seedBatch(t, stateDir, homeDir, "rp-synced-1", outbox.StatusSynced,
+		syncRecord("rp-key-1", syncTestNow.Add(-time.Hour).Format(time.RFC3339)))
+
+	confirmCalls := 0
+	res, err := runSyncConnectWithOptions(t, cfg, stateDir, homeDir, strings.Repeat("e", 64), Options{
+		StateReplaceConfirm: func(notice string, out io.Writer) (bool, error) {
+			confirmCalls++
+			if !strings.Contains(notice, "different account or device") {
+				t.Errorf("the notice must be the closed-set replacement text, got %q", notice)
+			}
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("a confirmed state replacement must complete the connect, got: %v", err)
+	}
+	if confirmCalls != 1 {
+		t.Fatalf("the confirmation must be asked exactly once, got %d calls", confirmCalls)
+	}
+	if mock.bindCount() != 1 {
+		t.Fatalf("the fresh state must bind exactly once, got %d calls", mock.bindCount())
+	}
+	if res.DeviceID != "dev-repl-1" {
+		t.Fatalf("the run must bind the link's device, got %q", res.DeviceID)
+	}
+	if got := mock.ingestCount("rp-synced-1"); got != 0 {
+		t.Fatalf("the archived history must never be retransmitted, got %d posts", got)
+	}
+	if ids, err := syncedBatchIDs(stateDir); err != nil || len(ids) != 0 {
+		t.Fatalf("the active state must hold no synced history after replacement, got %v (%v)", ids, err)
+	}
+	archive := findReplacedArchive(stateDir)
+	if archive == "" {
+		t.Fatal("the old state must be archived to a sibling directory")
+	}
+	if _, err := os.Stat(filepath.Join(archive, "outbox.json")); err != nil {
+		t.Fatalf("the archive must hold the old outbox: %v", err)
+	}
+	st, err := statedir.New(stateDir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DeviceID != "dev-repl-1" || st.ServerURL != mock.URL || st.ExternalSubjectID != "sub-sync" {
+		t.Fatalf("the active state must be freshly bound to the link, got %+v", st)
+	}
+}
+
+// TestConnectStateReplaceDeclinedKeepsFailClosed verifies that a
+// declined (or failed) confirmation keeps the ownership guards'
+// fail-closed refusal: no bind, no archive, the state untouched.
+func TestConnectStateReplaceDeclinedKeepsFailClosed(t *testing.T) {
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	mock := startSyncToktrailMock(t, "dev-repl-2")
+	cfg := startSyncConfigMock(t, mock.URL, []string{"Codex"}, intPtr(30))
+
+	seedBoundState(t, stateDir, "http://127.0.0.1:1", "dev-repl-old-2")
+	seedBatch(t, stateDir, homeDir, "rp2-synced-1", outbox.StatusSynced,
+		syncRecord("rp2-key-1", syncTestNow.Add(-time.Hour).Format(time.RFC3339)))
+
+	_, err := runSyncConnectWithOptions(t, cfg, stateDir, homeDir, strings.Repeat("9", 64), Options{
+		StateReplaceConfirm: func(notice string, out io.Writer) (bool, error) {
+			return false, nil
+		},
+	})
+	if !errors.Is(err, ErrStateAuthorizationMismatch) {
+		t.Fatalf("a declined replacement must keep the fail-closed refusal, got: %v", err)
+	}
+	if mock.bindCount() != 0 {
+		t.Fatalf("no bind may happen on a declined replacement, got %d calls", mock.bindCount())
+	}
+	if archive := findReplacedArchive(stateDir); archive != "" {
+		t.Fatalf("a declined replacement must not archive anything, found %s", archive)
+	}
+	st, err := statedir.New(stateDir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DeviceID != "dev-repl-old-2" {
+		t.Fatalf("the state must be untouched by a declined replacement, got %+v", st)
+	}
+}
+
+// TestConnectStateReplaceOnRebindIdentityChange verifies the confirmed
+// replacement over a device-identity-changing rebind (same account, the
+// server-side device was deleted so the bind returns a fresh device):
+// the NEW binding survives, the old synced history is archived — never
+// retransmitted — and the run completes under the new device.
+func TestConnectStateReplaceOnRebindIdentityChange(t *testing.T) {
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	mock := startSyncToktrailMock(t, "dev-new-1") // the rebind returns a DIFFERENT device
+	cfg := startSyncConfigMock(t, mock.URL, []string{"Codex"}, intPtr(30))
+
+	seedBoundState(t, stateDir, mock.URL, "dev-old-1")
+	seedCodexGrant(t, stateDir, homeDir)
+	seedBatch(t, stateDir, homeDir, "dc2-synced-1", outbox.StatusSynced,
+		syncRecord("dc2-key-1", syncTestNow.Add(-time.Hour).Format(time.RFC3339)))
+
+	res, err := runSyncConnectWithOptions(t, cfg, stateDir, homeDir, strings.Repeat("f", 64), Options{
+		StateReplaceConfirm: func(notice string, out io.Writer) (bool, error) {
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("a confirmed replacement must keep the new binding and complete, got: %v", err)
+	}
+	if res.DeviceID != "dev-new-1" {
+		t.Fatalf("the new device binding must survive, got %q", res.DeviceID)
+	}
+	if got := mock.ingestCount("dc2-synced-1"); got != 0 {
+		t.Fatalf("the archived history must never be retransmitted, got %d posts", got)
+	}
+	if ids, err := syncedBatchIDs(stateDir); err != nil || len(ids) != 0 {
+		t.Fatalf("the active state must hold no synced history after replacement, got %v (%v)", ids, err)
+	}
+	st, err := statedir.New(stateDir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DeviceID != "dev-new-1" {
+		t.Fatalf("the active device state must be the NEW binding, got %+v", st)
+	}
+	archive := findReplacedArchive(stateDir)
+	if archive == "" {
+		t.Fatal("the old history must be archived to a sibling directory")
+	}
+	if _, err := os.Stat(filepath.Join(archive, "outbox.json")); err != nil {
+		t.Fatalf("the archive must hold the old outbox: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(archive, filepath.Base(statedir.New(stateDir).Path()))); !os.IsNotExist(err) {
+		t.Fatalf("the active device state must stay out of the archive, err=%v", err)
 	}
 }
 

@@ -52,6 +52,17 @@ type Options struct {
 	// CursorConfirm overrides the first-enable confirmation prompt
 	// (tests). Nil uses cursorsync.DefaultConfirm.
 	CursorConfirm cursorsync.ConfirmFunc
+	// StateReplaceConfirm overrides the state-replacement confirmation
+	// prompt shown when the ownership guards refuse to move this state
+	// directory's history to the authorization this connect link
+	// carries (a different account, or a changed device identity). Nil
+	// disables the escape hatch entirely: the guards fail closed with
+	// their sentinel errors. A hook returning true archives the current
+	// state contents to a timestamped sibling directory (nothing is
+	// retransmitted — the anti-double-count invariant) and the run
+	// continues fresh under this link; false or an error keeps the
+	// fail-closed refusal.
+	StateReplaceConfirm cursorsync.ConfirmFunc
 	// Retry optionally overrides the run's bounded retry policy for
 	// transient ingest send failures. Nil (production) makes Run build
 	// one: syncretry.New(WithJitter(FullJitter), WithRunDeadline(<the

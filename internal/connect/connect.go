@@ -51,6 +51,29 @@ func sourceConfiguredLabel(sourceInstanceID string) string {
 	return "configured"
 }
 
+// Ownership fail-closed sentinels. The four guards below refuse to move a
+// state directory's synced history to a different authorization or device
+// identity; each wraps one of these sentinels so the command layer can
+// surface a fixed, actionable display phrase (the detailed error text
+// embeds server-controlled identifiers and must never reach the human
+// display verbatim). errors.Is stays matchable through every wrap.
+var (
+	// ErrStateAuthorizationMismatch: the state directory is bound to a
+	// different server/application/subject than this connect link
+	// authorizes (e.g. the previous account was deleted and the link
+	// belongs to a new one).
+	ErrStateAuthorizationMismatch = errors.New("state bound to a different authorization")
+	// ErrStateOwnershipMismatch: the durable ownership record names a
+	// different device than the state is currently bound as.
+	ErrStateOwnershipMismatch = errors.New("synced history owned by a different device")
+	// ErrUnboundSyncedHistory: the state directory holds synced batches
+	// but no bound device, so their owner cannot be attributed.
+	ErrUnboundSyncedHistory = errors.New("unbound state holds synced history")
+	// ErrRebindIdentityChange: a rebind changed the device identity over
+	// an existing synced history.
+	ErrRebindIdentityChange = errors.New("rebind changed the device identity over synced history")
+)
+
 // Run coordinates the full connect orchestration:
 //  1. Fetching server configuration via one-time ticket over HTTPS / loopback HTTP.
 //  2. Binding device credentials (or skipping if already bound for this ticket/url receipt).
@@ -236,21 +259,71 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			return err
 		}
 		priorSynced := len(priorSyncedIDs)
+		// replaceState is the explicit escape hatch for the ownership
+		// guards below. The guards exist because the outbox cannot
+		// attribute its synced history across authorizations or device
+		// identities, and silently retransmitting it would double count;
+		// but the user's LATEST explicit authorization should still be
+		// able to win. With a confirmation hook present (the interactive
+		// prompt, or --replace-state), a confirmed replacement archives
+		// the state contents to a timestamped sibling directory — the
+		// old history is never retransmitted, so the anti-double-count
+		// invariant holds — and the run continues from a fresh state
+		// under this connect link. Without a hook, or on a declined or
+		// failed confirmation, the guard fails closed exactly as
+		// before. The lock file stays at its original path so this run's
+		// flock keeps excluding every concurrent process.
+		replaceState := func() (bool, error) {
+			if opt.StateReplaceConfirm == nil {
+				return false, nil
+			}
+			confirmed, cerr := opt.StateReplaceConfirm(stateReplaceNotice, opt.Out)
+			if cerr != nil || !confirmed {
+				return false, nil
+			}
+			archivePath, aerr := archiveStateContents(stateDir, map[string]bool{stateLockFileName: true}, nowFn().UTC())
+			if aerr != nil {
+				return false, aerr
+			}
+			if archivePath != "" {
+				d.phase("existing local state archived; starting fresh under this connect link")
+				d.detail("previous state archived to %s", archivePath)
+			}
+			st = statedir.DeviceState{}
+			priorDeviceID = ""
+			priorSyncedIDs = nil
+			priorSynced = 0
+			return true, nil
+		}
 		if priorDeviceID != "" {
 			if strings.TrimRight(strings.TrimSpace(st.ServerURL), "/") != strings.TrimRight(cfg.ServerURL, "/") ||
 				strings.TrimSpace(st.ApplicationID) != cfg.ApplicationID ||
 				strings.TrimSpace(st.ExternalSubjectID) != cfg.SubjectID {
-				return fmt.Errorf("this state directory is already bound to a different authorization (server=%s applicationId=%s subjectId=%s) than this connect link authorizes (server=%s applicationId=%s subjectId=%s); the local outbox does not record per-subject ownership, so existing history cannot be moved to a new account automatically — use a separate --state-dir for this connect link",
-					strings.TrimSpace(st.ServerURL), strings.TrimSpace(st.ApplicationID), strings.TrimSpace(st.ExternalSubjectID),
-					cfg.ServerURL, cfg.ApplicationID, cfg.SubjectID)
+				replaced, rerr := replaceState()
+				if rerr != nil {
+					return rerr
+				}
+				if !replaced {
+					return fmt.Errorf("%w: this state directory is already bound to a different authorization (server=%s applicationId=%s subjectId=%s) than this connect link authorizes (server=%s applicationId=%s subjectId=%s); the local outbox does not record per-subject ownership, so existing history cannot be moved to a new account automatically — use a separate --state-dir for this connect link, or confirm the state replacement",
+						ErrStateAuthorizationMismatch,
+						strings.TrimSpace(st.ServerURL), strings.TrimSpace(st.ApplicationID), strings.TrimSpace(st.ExternalSubjectID),
+						cfg.ServerURL, cfg.ApplicationID, cfg.SubjectID)
+				}
 			}
 			ownership, hasOwnership, err := loadOwnership(stateDir)
 			if err != nil {
 				return err
 			}
 			if hasOwnership && ownership.DeviceID != priorDeviceID {
-				return fmt.Errorf("the synced history in this state directory belongs to device %s, but this collector is bound as %s; cross-device de-duplication is not guaranteed, so connect refuses to retransmit it (avoiding double counting) — use a separate --state-dir, or remove %s only if you accept abandoning the ownership record",
-					ownership.DeviceID, priorDeviceID, ownershipPath(stateDir))
+				replaced, rerr := replaceState()
+				if rerr != nil {
+					return rerr
+				}
+				if !replaced {
+					return fmt.Errorf("%w: the synced history in this state directory belongs to device %s, but this collector is bound as %s; cross-device de-duplication is not guaranteed, so connect refuses to retransmit it (avoiding double counting) — use a separate --state-dir, remove %s only if you accept abandoning the ownership record, or confirm the state replacement",
+						ErrStateOwnershipMismatch,
+						ownership.DeviceID, priorDeviceID, ownershipPath(stateDir))
+				}
 			}
 			// Record ownership before any bind that could change the
 			// device identity, so the guard above also covers retries
@@ -264,8 +337,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			// An unbound state directory that still holds synced history
 			// cannot attribute it: binding a new device over it would
 			// retransmit another device's archives under the new
-			// identity (double counting). Fail closed.
-			return fmt.Errorf("this state directory holds %d synced batch(es) but no bound device; the history's owning device cannot be attributed, so connect refuses to bind a new device over it — use a separate --state-dir for this connect link", priorSynced)
+			// identity (double counting). Fail closed — or, with an
+			// explicit confirmation, archive and start fresh.
+			replaced, rerr := replaceState()
+			if rerr != nil {
+				return rerr
+			}
+			if !replaced {
+				return fmt.Errorf("%w: this state directory holds %d synced batch(es) but no bound device; the history's owning device cannot be attributed, so connect refuses to bind a new device over it — use a separate --state-dir for this connect link, or confirm the state replacement",
+					ErrUnboundSyncedHistory, priorSynced)
+			}
 		}
 
 		deviceName := opt.DeviceName
@@ -344,8 +425,35 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			// instead of risking double counting. The ownership guard
 			// recorded above makes the refusal durable across retries.
 			if priorSynced > 0 && bindRes.State.DeviceID != priorDeviceID {
-				return fmt.Errorf("rebinding this connect link changed the device identity from %s to %s; the %d synced batch(es) in this state directory belong to %s and connect will not retransmit them under the new device (cross-device de-duplication is not guaranteed, so retransmitting would double count) — use a separate --state-dir for the new device",
-					priorDeviceID, bindRes.State.DeviceID, priorSynced, priorDeviceID)
+				// The bind already committed the NEW device identity
+				// (bind.Run saved it), so a confirmed replacement here
+				// archives the history-bearing files but KEEPS the
+				// freshly bound device state: the old synced batches
+				// leave the active state (never retransmitted — the
+				// anti-double-count invariant) while the new binding
+				// survives and the run continues.
+				replaced := false
+				if opt.StateReplaceConfirm != nil {
+					confirmed, cerr := opt.StateReplaceConfirm(stateReplaceNotice, opt.Out)
+					if cerr == nil && confirmed {
+						deviceStateName := filepath.Base(statedir.New(stateDir).Path())
+						archivePath, aerr := archiveStateContents(stateDir, map[string]bool{stateLockFileName: true, deviceStateName: true}, nowFn().UTC())
+						if aerr != nil {
+							return aerr
+						}
+						if archivePath != "" {
+							d.phase("existing local history archived; keeping the new device binding")
+							d.detail("previous state archived to %s", archivePath)
+						}
+						replaced = true
+						priorSynced = 0
+					}
+				}
+				if !replaced {
+					return fmt.Errorf("%w: rebinding this connect link changed the device identity from %s to %s; the %d synced batch(es) in this state directory belong to %s and connect will not retransmit them under the new device (cross-device de-duplication is not guaranteed, so retransmitting would double count) — use a separate --state-dir for the new device, or confirm the state replacement",
+						ErrRebindIdentityChange,
+						priorDeviceID, bindRes.State.DeviceID, priorSynced, priorDeviceID)
+				}
 			}
 			deviceID = bindRes.State.DeviceID
 			consentRev = bindRes.State.ConsentRevision

@@ -667,7 +667,7 @@ func TestRenderRunSummaryKnownDevicePendingWithUnknownAccount(t *testing.T) {
 func TestRenderRunSummaryVerboseDiagnostics(t *testing.T) {
 	s := RunSummary{
 		StopReason: collection.StopPartial, Binding: BindingSummary{Status: BindBound},
-		Collection: collection.Phases{Counts: collection.CountSummary{PendingObserved: true, PendingBatches: 2}},
+		Collection:      collection.Phases{Counts: collection.CountSummary{PendingObserved: true, PendingBatches: 2}},
 		IncompleteCodes: []string{"pending_batches", "history_remaining"},
 	}
 	var buf bytes.Buffer
