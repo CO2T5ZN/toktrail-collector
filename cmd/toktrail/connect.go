@@ -14,6 +14,7 @@ import (
 	"toktrail-collector/internal/app/collection"
 	"toktrail-collector/internal/app/cursorsync"
 
+	"toktrail-collector/internal/bind"
 	"toktrail-collector/internal/connect"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/scheduler"
@@ -249,6 +250,10 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 // network (net.Error, DNS included). Everything else keeps the
 // closed-set fallback phrase; no raw text, no paths, no URLs.
 func runFailureDisplayText(err error, fallback string) string {
+	var bindErr *bind.Error
+	if errors.As(err, &bindErr) && bindErr.Status() == 409 && bindErr.Category() == bind.CategoryTicketSuperseded {
+		return "the installation command is outdated; generate a new command and try again"
+	}
 	switch {
 	case errors.Is(err, os.ErrPermission):
 		// The reason only: main's unified line already carries the

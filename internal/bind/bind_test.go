@@ -162,6 +162,24 @@ func TestRunBindReturnsServerError(t *testing.T) {
 	}
 }
 
+func TestRunBindSupersededTicketUsesSafeCategory(t *testing.T) {
+	const ticket = "test-ticket-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{
+			"code": "ticket_superseded", "message": "untrusted " + ticket,
+		}})
+	}))
+	defer server.Close()
+	_, err := Run(t.Context(), statedir.New(t.TempDir()), Options{ServerURL: server.URL, Ticket: ticket, ExternalSubjectID: "user-1"})
+	var bindErr *Error
+	if !errors.As(err, &bindErr) || bindErr.Status() != http.StatusConflict || bindErr.Category() != CategoryTicketSuperseded {
+		t.Fatalf("expected superseded ticket category, got %v", err)
+	}
+	if strings.Contains(err.Error(), ticket) || strings.Contains(err.Error(), "untrusted") {
+		t.Fatalf("untrusted server text leaked: %v", err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

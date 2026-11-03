@@ -113,9 +113,10 @@ func (e *Error) Status() int { return e.status }
 
 // Fixed Error categories surfaced by Category.
 const (
-	CategoryTransport       = "transport"
-	CategoryInvalidResponse = "invalid_response"
-	CategoryOther           = "other"
+	CategoryTransport        = "transport"
+	CategoryInvalidResponse  = "invalid_response"
+	CategoryTicketSuperseded = "ticket_superseded"
+	CategoryOther            = "other"
 )
 
 // serverStatusCategories maps HTTP status codes to fixed category labels.
@@ -151,7 +152,8 @@ var serverStatusCategories = map[int]string{
 // Extend this table only with fixed literals vetted against the server
 // contract.
 var serverErrorCodeCategories = map[string]string{
-	"unauthorized": "unauthorized",
+	"unauthorized":      "unauthorized",
+	"ticket_superseded": CategoryTicketSuperseded,
 }
 
 // responseCategory resolves the fixed category for a refused bind. The
