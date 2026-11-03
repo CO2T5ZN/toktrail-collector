@@ -48,7 +48,7 @@ cmd/toktrail/            主 Collector CLI
 cmd/toktrail-installer/  用户安装与验签入口
 cmd/toktrail-release/    维护者 CLI 与旧命令兼容入口
 scripts/release.sh      本地与 CI 共用的构建编排
-.github/workflows/      测试与 tag 触发的草稿发布
+.github/workflows/      测试与 tag 触发的自动发布
 tools/release/          归档组装、签名、bootstrap 模板和发行 E2E
 internal/source/
   adapter/              共享记录契约、校验、Token 与隐私辅助逻辑
@@ -272,7 +272,7 @@ go run ./cmd/toktrail service install \
 
 ## 签名发布与安装
 
-GitHub Actions 和 `scripts/release.sh` 编排六平台构建；维护者工具负责归档与签名；独立安装器负责验签、SHA-256 校验和安全替换。Tag workflow 生成 GitHub Release 草稿供审阅。安装器与 bootstrap 脚本另支持显式原位 `upgrade`：复用原安装路径、默认保留旧版二进制为 `<binary>.previous`，不触碰 state/grants/outbox、设备绑定与调度注册，也不重新接入。详见 [Release and installation](docs/RELEASE.md)。
+GitHub Actions 和 `scripts/release.sh` 编排六平台构建；维护者工具负责归档与签名；独立安装器负责验签、SHA-256 校验和安全替换。Tag workflow 在完成所配置的环境审批、签名和验签后自动发布 GitHub Release；预发布 tag 会标为预发布且不会成为 Latest。安装器与 bootstrap 脚本另支持显式原位 `upgrade`：复用原安装路径、默认保留旧版二进制为 `<binary>.previous`，不触碰 state/grants/outbox、设备绑定与调度注册，也不重新接入。详见 [Release and installation](docs/RELEASE.md)。
 
 生产运营方需要自行提供发布签名密钥、可信公钥分发渠道、下载托管，以及所需的平台公证或代码签名。
 

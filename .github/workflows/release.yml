@@ -355,7 +355,7 @@ jobs:
             -capabilities "dist/$RELEASE_VERSION/capabilities.json" \
             -signature "dist/$RELEASE_VERSION/capabilities.json.sig" \
             -pubkey "$pin_file" -version "$RELEASE_VERSION"
-      - name: Create draft release for review
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
@@ -363,5 +363,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          release_flags=(--verify-tag --generate-notes --title "$RELEASE_VERSION")
+          # A prerelease must not replace the stable Latest version used by
+          # the website, even though it is published without manual review.
+          case "$RELEASE_VERSION" in
+            *-*) release_flags+=(--prerelease --latest=false) ;;
+          esac
           gh release create "$RELEASE_VERSION" "dist/$RELEASE_VERSION/"* \
-            --verify-tag --draft --generate-notes --title "$RELEASE_VERSION"
+            "${release_flags[@]}"

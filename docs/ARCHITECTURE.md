@@ -26,7 +26,7 @@ The collector separates source parsing, common collection orchestration, durable
 | `cmd/toktrail-release` | Maintainer commands and compatibility entry point; `build` delegates to the shell script |
 | `tools/release` | Maintainer-only archive assembly, manifest and capabilities signing, and pinned bootstrap generation; consumes built binaries |
 | `scripts/release.sh` | Shared local/CI cross-compilation and assembly entry point |
-| `.github/workflows/release.yml` | Tag validation, tests, six-target matrix, protected signing and draft GitHub Release |
+| `.github/workflows/release.yml` | Tag validation, tests, six-target matrix, protected signing and automatic GitHub Release publication |
 
 The dependency direction for source collection is:
 
