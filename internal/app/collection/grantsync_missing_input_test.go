@@ -13,6 +13,7 @@ package collection
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,31 +172,44 @@ func TestGrantSyncNeverInstalledRepeatsSteady(t *testing.T) {
 
 // TestGrantSyncProbePermissionErrorFailsClosed pins the honest-error
 // half: a default-directory probe that fails with anything other than
-// os.ErrNotExist — here a permission error on the tool's parent
-// directory — must fail the grant sync instead of masquerading as an
-// undetected tool.
+// os.ErrNotExist — here an injected permission error on the tool's
+// parent directory — must fail the grant sync instead of masquerading
+// as an undetected tool.
+//
+// The permission error is injected through the per-instance
+// Options.probeDefaultInput hook rather than a chmod-000 directory:
+// chmod does not make a directory unreadable to its owner on Windows
+// and is bypassed entirely under root, so a real-filesystem fault
+// would make this test pass or fail depending on the runner. The
+// injected PathError carries the same shape the real probe surfaces
+// (errors.Is(err, os.ErrPermission)) and exercises the identical
+// production classification. NOT covered here: an actual Windows ACL
+// denial reaching the probe — the Go standard library cannot install
+// deny ACLs, so that platform-specific wiring remains unverified.
 func TestGrantSyncProbePermissionErrorFailsClosed(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("permission checks are bypassed for root")
-	}
 	stateDir := t.TempDir()
 	server := grantProtocolServerStart(t)
 	server.setView(t, false, []string{"Qwen Code"}, 62)
 	bindDevice(t, stateDir, server.URL)
 	home := t.TempDir()
 
-	// The qwen tool's root directory exists but is unreadable, so the
-	// probe of ~/.qwen/projects fails with EACCES, not ENOENT.
+	// The qwen tool's root directory exists with its projects child, as
+	// it would on a machine where the directory became unreadable.
 	qwenRoot := filepath.Join(home, ".qwen")
 	if err := os.MkdirAll(filepath.Join(qwenRoot, "projects"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(qwenRoot, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(qwenRoot, 0o700) })
 
-	_, err := Run(t.Context(), Options{StateDir: stateDir, HomeDir: home})
+	_, err := Run(t.Context(), Options{
+		StateDir: stateDir,
+		HomeDir:  home,
+		probeDefaultInput: func(path string) (bool, error) {
+			// The probe of ~/.qwen/projects fails with EACCES — the
+			// same error the real probe surfaces for an unreadable
+			// parent — never with os.ErrNotExist.
+			return false, &fs.PathError{Op: "stat", Path: path, Err: os.ErrPermission}
+		},
+	})
 	if err == nil {
 		t.Fatal("a permission-denied default-directory probe must fail the run")
 	}

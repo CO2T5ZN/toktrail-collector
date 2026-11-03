@@ -2,6 +2,7 @@ package connect
 
 import (
 	"io"
+	"io/fs"
 	"net/http"
 	"time"
 
@@ -67,6 +68,16 @@ type Options struct {
 	// identical (no events, no goroutines). Invocations are serialized
 	// (never concurrent) but may originate from a heartbeat goroutine.
 	Progress func(collection.ProgressEvent)
+	// statDefaultDir overrides the default-directory probe's stat call
+	// for in-package tests: nil (production and every external caller)
+	// uses os.Stat. It exists so the fail-closed probe classification —
+	// anything other than os.ErrNotExist fails the run instead of
+	// masquerading as a not-detected tool — can be exercised with a
+	// deterministic injected error on every platform: chmod-based
+	// unreadable directories do not exist on Windows and are bypassed
+	// under root. Unexported on purpose: not part of the public API,
+	// and per-instance so concurrent tests cannot interfere.
+	statDefaultDir func(name string) (fs.FileInfo, error)
 }
 
 // BindStatus reports how far connect's binding phase got, so the §6.5

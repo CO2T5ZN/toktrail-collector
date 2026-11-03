@@ -10,7 +10,6 @@ package main
 // an httptest server, and a scripted hostile success receipt.
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -87,21 +86,12 @@ func TestSyncOutputNeverEchoesHostileReceiptStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Capture the actual CLI output of the sync command.
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = w
-	runErr := runSync([]string{"--server", server.URL, "--state-dir", stateDir, "--file", batchFile})
-	_ = w.Close()
-	os.Stdout = oldStdout
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatal(err)
-	}
-	output := buf.String()
+	// Capture the actual CLI output of the sync command through a
+	// concurrently drained pipe (a write-first-read-later capture
+	// deadlocks once the output exceeds the OS pipe buffer).
+	output, runErr := captureStdoutPiped(t, func() error {
+		return runSync([]string{"--server", server.URL, "--state-dir", stateDir, "--file", batchFile})
+	})
 
 	if runErr != nil {
 		t.Fatalf("the hostile-but-valid receipt must still succeed, got %v", runErr)

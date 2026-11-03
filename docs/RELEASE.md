@@ -6,8 +6,8 @@ The collector repository owns its distribution protocol, installer and release t
 
 | Location | Responsibility |
 | --- | --- |
-| `.github/workflows/ci.yml` | Linux/macOS/Windows vet and tests; signed-release E2E with a temporary test key |
-| `.github/workflows/release.yml` | Tag validation, tests, six-target build matrix, protected signing, verification and draft GitHub Release |
+| `.github/workflows/ci.yml` | Linux/macOS/Windows vet and tests; native Windows gate (structured test logs, Task Scheduler and connect integration, smoke script); signed-release E2E with a temporary test key |
+| `.github/workflows/release.yml` | Tag validation, Linux tests and signed E2E, native Windows gate on the tagged commit, six-target build matrix, protected signing, verification and draft GitHub Release |
 | `scripts/release.sh` | Shared local/CI build entry point; cross-compilation and assembly orchestration |
 | `tools/release` | Consume built binaries, create deterministic archives, assemble/sign the manifest, emit and sign the version-bound capabilities metadata, and render pinned bootstrap scripts |
 | `tools/release/templates` | Reviewable POSIX and PowerShell bootstrap templates, embedded by the assembly tool |
@@ -96,6 +96,35 @@ go run ./cmd/toktrail-release build -version v0.1.0 -dist dist -repo . -key /tru
 
 This command requires a source checkout and a POSIX shell. The recommended approach is to use `scripts/release.sh` directly.
 
+### Pre-release verification
+
+Before pushing a release tag, verify on a real Windows machine (PowerShell 7)
+what the release workflow's `windows-check` job will enforce on the tagged
+commit — the same gate every pull request already runs:
+
+```powershell
+$env:GOPROXY = 'off'
+go vet ./...
+go test ./... -count=1
+$env:TOKTRAIL_WINDOWS_SCHEDULER_E2E = '1'
+go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -v
+Remove-Item Env:TOKTRAIL_WINDOWS_SCHEDULER_E2E
+$env:TOKTRAIL_WINDOWS_CONNECT_E2E = '1'
+go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -v
+Remove-Item Env:TOKTRAIL_WINDOWS_CONNECT_E2E
+pwsh -File scripts/windows-smoke.ps1
+```
+
+Each command must exit zero, and the two integration runs must actually run
+their named test (not skip). Also run the Linux-side checks that the `check`
+job enforces — `go vet ./...`, `go test ./... -count=1`, and the
+`TOKTRAIL_RELEASE_E2E=1` signed-chain test from
+[CONTRIBUTING](../CONTRIBUTING.md) — then perform the local release build
+above. CI re-runs all of this on the tagged commit; verifying first avoids
+burning a tag on a gate failure. Workflow operation details, including
+failure-diagnostics artifacts and the pinned Go patch version, are in
+[CI and release gates](CI.md).
+
 ## GitHub release configuration
 
 Workflows are active when this collector directory is the Git repository root, matching the existing CI arrangement. GitHub does not execute a nested project's workflows from the larger local workspace.
@@ -106,7 +135,7 @@ Configure the repository's protected `release` environment with:
 - Variable `TOKTRAIL_RELEASE_PUBLIC_KEY`: independently configured trusted public-key PEM used to verify the assembled release. Public keys may be published in the repository; the verifier's trusted pin must be established independently of the downloaded release.
 - Environment reviewers and tag/deployment restrictions appropriate to the repository. Use repository settings to restrict which team can approve releases.
 
-Push a valid version tag such as `v0.1.0`. The workflow validates it with the shared Go version parser, runs vet, tests and signed E2E with a temporary test key, then builds six platform pairs in parallel. Build jobs have read-only repository permissions and receive no signing key. The final signing job (with manual approval when required reviewers are configured) assembles/signs using the private key, verifies every artifact against the independently pinned public key, and creates a **draft** GitHub Release. Only that job has `contents: write` permission. Review and publish the draft through the normal release process. Existing releases are not silently overwritten on rerun.
+Push a valid version tag such as `v0.1.0`. The workflow validates it with the shared Go version parser, runs vet, tests and signed E2E with a temporary test key, and runs the full native Windows gate (`windows-check`: the complete test suite on `windows-2025`, the real Task Scheduler and connect integration tests, and `scripts/windows-smoke.ps1`) on the tagged commit. `build` starts only after both `check` and `windows-check` pass, then builds six platform pairs in parallel. Build jobs have read-only repository permissions and receive no signing key. The final signing job (with manual approval when required reviewers are configured) assembles/signs using the private key, verifies every artifact against the independently pinned public key, and creates a **draft** GitHub Release. Only that job has `contents: write` permission. Review and publish the draft through the normal release process. Existing releases are not silently overwritten on rerun.
 
 The workflows assume `.github/workflows/` is at the repository root. When `toktrail-collector` is split into an independent Git repository, move `.github/workflows/ci.yml` and `.github/workflows/release.yml` from this directory to the repository root for GitHub to execute them.
 

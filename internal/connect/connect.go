@@ -551,7 +551,17 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				continue
 			}
 			targetDir := spec.ResolveDefaultInput(homeDir)
-			stat, err := os.Stat(targetDir)
+			statFn := os.Stat
+			if opt.statDefaultDir != nil {
+				// In-package test injection point: a deterministic stat
+				// outcome (e.g. a permission error) without chmod, so
+				// the fail-closed classification below is exercised on
+				// every platform (chmod-based unreadable directories do
+				// not exist on Windows and are bypassed under root).
+				// Production always uses os.Stat.
+				statFn = opt.statDefaultDir
+			}
+			stat, err := statFn(targetDir)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
 					// A permission or I/O failure must never masquerade

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -139,27 +140,32 @@ func noGrantRecorded(t *testing.T, stateDir, want string) {
 
 // TestConnectProbePermissionErrorFailsClosed pins the connect-side
 // honest-error half: a default-directory probe failing with anything
-// other than os.ErrNotExist — here EACCES on the tool's parent
-// directory — must fail the run with the probe error instead of
+// other than os.ErrNotExist — here an injected EACCES on the tool's
+// parent directory — must fail the run with the probe error instead of
 // reporting a fabricated not_detected status or silently skipping the
 // tool. A truly absent directory keeps the normal not_detected skip.
+//
+// The permission error is injected through the per-instance
+// Options.statDefaultDir hook rather than a chmod-000 directory:
+// chmod does not make a directory unreadable to its owner on Windows
+// and is bypassed entirely under root, so a real-filesystem fault
+// would make this test pass or fail depending on the runner. The
+// injected PathError carries the same shape os.Stat returns
+// (errors.Is(err, os.ErrPermission)) and exercises the identical
+// production classification. NOT covered here: an actual
+// Windows ACL denial reaching the probe — the Go standard library
+// cannot install deny ACLs, so that platform-specific wiring remains
+// unverified.
 func TestConnectProbePermissionErrorFailsClosed(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("permission checks are bypassed for root")
-	}
 	connectURL, toolStatusPosts := probeFailServers(t, []string{"Qwen Code"})
 
 	home := t.TempDir()
-	// The qwen tool's root directory exists but is unreadable: the
-	// probe of ~/.qwen/projects fails with EACCES, not ENOENT.
+	// The qwen tool's root directory exists with its projects child, as
+	// it would on a machine where the directory became unreadable.
 	qwenRoot := filepath.Join(home, ".qwen")
 	if err := os.MkdirAll(filepath.Join(qwenRoot, "projects"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(qwenRoot, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(qwenRoot, 0o700) })
 
 	stateDir := t.TempDir()
 	_, err := Run(context.Background(), Options{
@@ -167,6 +173,12 @@ func TestConnectProbePermissionErrorFailsClosed(t *testing.T) {
 		StateDir:   stateDir,
 		HomeDir:    home,
 		HTTPClient: http.DefaultClient,
+		statDefaultDir: func(name string) (fs.FileInfo, error) {
+			// Every probe of the qwen tree fails with EACCES — the
+			// same error os.Stat returns for an unreadable parent —
+			// never with ErrNotExist.
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: os.ErrPermission}
+		},
 	})
 	if err == nil {
 		t.Fatal("a permission-denied default-directory probe must fail connect")

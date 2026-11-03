@@ -1,4 +1,12 @@
 # Active when toktrail-collector is the Git repository root, as with ci.yml.
+#
+# Release gating: the `check` job validates the tag and runs the Linux test
+# suite plus the signed-release E2E with a temporary test key. The
+# `windows-check` job runs the full native Windows gate on the tagged commit —
+# the same gate every pull request runs (keep it in sync with the Windows leg
+# of the test job in ci.yml; see docs/CI.md). `build` depends on both, and
+# `publish` depends on `build`, so no artifact is built or published unless
+# every gate passed on the exact release commit.
 name: Release
 
 on:
@@ -14,6 +22,9 @@ concurrency:
 
 env:
   GOPROXY: 'off'
+  # Pinned Go patch version (final 1.24 patch release). Keep in sync with
+  # ci.yml and the go.mod language version; see docs/CI.md.
+  GO_VERSION: '1.24.13'
 
 jobs:
   check:
@@ -23,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Validate tag and test
         env:
@@ -37,8 +48,129 @@ jobs:
           TOKTRAIL_RELEASE_E2E: '1'
         run: go test ./tools/release -run '^TestEndToEndRelease$' -count=1 -v
 
+  # Native Windows gate for the tagged commit. Mirrors the Windows leg of the
+  # test job in ci.yml step for step: structured full-suite log, real Task
+  # Scheduler and connect integration tests behind env gates, and the
+  # scripts/windows-smoke.ps1 smoke script. No repository secret is read here.
+  windows-check:
+    name: Windows gate (native tests + integration)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false # Vendored dependencies do not require the module cache.
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (Windows structured log)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          go test ./... -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath 'windows-test-output.jsonl'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Windows scheduler native integration test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TOKTRAIL_WINDOWS_SCHEDULER_E2E: '1'
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = 'windows-scheduler-e2e.jsonl'
+          go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $passed = @(Get-Content -LiteralPath $log |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_.Action -eq 'pass' -and $_.Test -eq 'TestWindowsSchedulerNativeIntegration' })
+          if ($passed.Count -ne 1) {
+            Write-Host "::error::Expected exactly one PASS event for TestWindowsSchedulerNativeIntegration, found $($passed.Count). The -run pattern, the test name, or the TOKTRAIL_WINDOWS_SCHEDULER_E2E gate is out of sync; a skipped or unmatched test must fail this gate."
+            exit 1
+          }
+          Write-Host 'TestWindowsSchedulerNativeIntegration ran and passed.'
+
+      - name: Windows connect native integration test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TOKTRAIL_WINDOWS_CONNECT_E2E: '1'
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = 'windows-connect-e2e.jsonl'
+          go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $passed = @(Get-Content -LiteralPath $log |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_.Action -eq 'pass' -and $_.Test -eq 'TestWindowsConnectNativeIntegration' })
+          if ($passed.Count -ne 1) {
+            Write-Host "::error::Expected exactly one PASS event for TestWindowsConnectNativeIntegration, found $($passed.Count). The -run pattern, the test name, or the TOKTRAIL_WINDOWS_CONNECT_E2E gate is out of sync; a skipped or unmatched test must fail this gate."
+            exit 1
+          }
+          Write-Host 'TestWindowsConnectNativeIntegration ran and passed.'
+
+      - name: Windows smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'scripts/windows-smoke.ps1')) {
+            Write-Host '::error::scripts/windows-smoke.ps1 is missing; the Windows gate requires the smoke script.'
+            exit 1
+          }
+          pwsh -File scripts/windows-smoke.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare Windows failure diagnostics
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $logs = @('windows-test-output.jsonl', 'windows-scheduler-e2e.jsonl', 'windows-connect-e2e.jsonl') |
+            Where-Object { Test-Path -LiteralPath $_ }
+          if (-not $logs) { Write-Host 'No Windows test logs captured; nothing to prepare.'; exit 0 }
+          $patterns = @(
+            'ghp_[A-Za-z0-9]{36}',
+            'github_pat_[A-Za-z0-9_]{20,}',
+            'AKIA[0-9A-Z]{16}',
+            '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          )
+          foreach ($f in $logs) {
+            $text = Get-Content -LiteralPath $f -Raw
+            foreach ($p in $patterns) { $text = $text -replace $p, '[REDACTED]' }
+            Set-Content -LiteralPath $f -Value $text -Encoding utf8 -NoNewline
+          }
+          $readme = @(
+            'Windows release-gate failure diagnostics for run ${{ github.run_id }} (attempt ${{ github.run_attempt }}).',
+            'Contents: go test stdout/stderr captured from this job only.',
+            'The test suite uses synthetic fixtures in temporary runner',
+            'directories; no secrets, tokens, account data, or real user',
+            'state are expected in these logs. Known credential patterns',
+            'are redacted before upload as defense in depth.'
+          )
+          Set-Content -LiteralPath 'DIAGNOSTICS-README.txt' -Value $readme -Encoding utf8
+
+      - name: Upload Windows failure diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            DIAGNOSTICS-README.txt
+            windows-test-output.jsonl
+            windows-scheduler-e2e.jsonl
+            windows-connect-e2e.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+
   build:
-    needs: check
+    needs: [check, windows-check]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -50,7 +182,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Build collector and installer
         env:
@@ -77,7 +209,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - uses: actions/download-artifact@v4
         with:

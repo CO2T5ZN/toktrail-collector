@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -383,25 +382,13 @@ func writePeriodicDrainCursorPermit(t *testing.T, stateDir string) {
 }
 
 // capturePeriodicStdout runs fn with os.Stdout redirected to a pipe and
-// returns everything the command printed.
+// returns everything the command printed. The pipe is drained
+// concurrently (see pipe_capture_test.go): a verbose periodic run
+// writes far more than the OS pipe buffer, so a capture that only
+// started reading after fn returned would deadlock mid-write.
 func capturePeriodicStdout(t *testing.T, fn func() error) (string, error) {
 	t.Helper()
-	old := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = w
-	fnErr := fn()
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = old
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatal(err)
-	}
-	return buf.String(), fnErr
+	return captureStdoutPiped(t, fn)
 }
 
 func TestRunPeriodicDrainOnlySyntheticEndToEnd(t *testing.T) {

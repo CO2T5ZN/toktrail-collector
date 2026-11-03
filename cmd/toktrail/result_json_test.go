@@ -30,6 +30,7 @@ import (
 	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/cursor/auth"
 	"toktrail-collector/internal/local/grants"
+	"toktrail-collector/internal/local/progress"
 	"toktrail-collector/internal/local/runlock"
 	"toktrail-collector/internal/source/registry"
 )
@@ -494,23 +495,32 @@ func TestConnectJSONPromptStaysInteractiveAndOffStdout(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPeriodicJSONGrantFaultIsIncompleteNonZero pins F1 end to end: a
-// granted source whose input cannot be read makes the periodic run a
-// non-zero incomplete exit with stop_reason=fatal_error and the
+// granted source whose local preparation fails makes the periodic run
+// a non-zero incomplete exit with stop_reason=fatal_error and the
 // incomplete line on the human stream — while the source's skip is a
 // local fault, not a scope verdict.
+//
+// The fault is staged deterministically on every platform by planting
+// a corrupt message-progress.json in the state directory: the
+// claude-code-jsonl loader refuses to run over a corrupt progress
+// state (it never silently re-baselines, which would double count), so
+// export preparation for the granted source fails — the exact
+// GrantExportFailed classification an unreadable input produces, with
+// no chmod involved. The earlier chmod-000 staging could not run on
+// Windows (mode bits do not deny the owner) or under root, leaving the
+// CLI-level fault judgment untestable there; the unreadable-input
+// fault itself stays pinned at the collection layer
+// (TestRunSkipsUnreadableGrantedInputWithoutNetwork, unix-only by
+// necessity). Deleting the granted directory instead would stage the
+// DIFFERENT GrantInputInaccessible verdict, and a directory in place
+// of the session file is simply skipped by the scanner, so neither
+// reproduces this branch.
 func TestPeriodicJSONGrantFaultIsIncompleteNonZero(t *testing.T) {
 	stateDir, server := budgetCLIFixture(t)
-	// Replace the healthy empty-session grant with an unreadable one.
-	sessions := filepath.Join(t.TempDir(), "broken")
-	input := filepath.Join(sessions, "s.jsonl")
-	if err := os.MkdirAll(sessions, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(input, []byte("{}"), 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(input, 0o600) })
-	if _, err := grants.New(stateDir).Enable("claude-code-jsonl", sessions); err != nil {
+	// The fixture's healthy empty-session grant stays enabled; the
+	// fault comes from the source's local progress state.
+	progressPath := progress.New(stateDir).MessageProgressPath()
+	if err := os.WriteFile(progressPath, []byte("{not valid json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

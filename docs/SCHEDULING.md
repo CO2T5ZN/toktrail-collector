@@ -130,8 +130,10 @@ output, or logs.
 ## Tested coverage — and what is not tested here
 
 Covered by automated tests (temp directories, injected runners, and
-`httptest` servers only; **no test installs, modifies, or removes any
-real host scheduler job**):
+`httptest` servers only; **no default test run installs, modifies, or removes
+any real host scheduler job**. Opt-in Windows scheduler and connect integration
+checks may register temporary tasks on a disposable runner or an explicitly
+configured developer machine:
 
 - Rendered launchd plists, systemd service/timer units, and Windows Task
   XML: content, quoting, and path escaping, including paths with spaces
@@ -149,8 +151,15 @@ real host scheduler job**):
 Not verified here and required before production rollout on each platform:
 
 1. **Native runtime verification** of the rendered units/jobs on real
-   macOS launchd, Linux systemd user timers, and Windows Task Scheduler
-   (including load/enable/start semantics and per-user session behavior).
+   macOS launchd, Linux systemd user timers, and Windows Task Scheduler,
+   including actual execution and per-user session behavior. On Windows,
+   `TestWindowsSchedulerNativeIntegration` (gated by
+   `TOKTRAIL_WINDOWS_SCHEDULER_E2E=1`) registers, queries, and removes a real
+   per-user task on the `windows-2025` CI runner. The connect integration
+   also registers a real task, but neither test triggers the scheduled task.
+   Actual execution and logon behavior remain rollout prerequisites; see
+   [CI and release gates](CI.md). macOS and Linux native runtime verification
+   also remain external prerequisites.
 2. Real-platform quoting behavior beyond the API-level guarantees (for
    example, `schtasks`/`Register-ScheduledTask` argument passing for the
    exact production binary path).

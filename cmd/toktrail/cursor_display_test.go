@@ -11,7 +11,6 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -254,20 +253,9 @@ type cursorDisplayOutput struct {
 
 func captureCursorDisplayStdout(t *testing.T, fn func() error) cursorDisplayOutput {
 	t.Helper()
-	old := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = w
-	fnErr := fn()
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = old
-	b, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cursorDisplayOutput{text: string(b), err: fnErr}
+	// The pipe is drained concurrently while fn runs: reading only after
+	// fn returned would deadlock any output larger than the OS pipe
+	// buffer (see pipe_capture_test.go).
+	text, fnErr := captureStdoutPiped(t, fn)
+	return cursorDisplayOutput{text: text, err: fnErr}
 }

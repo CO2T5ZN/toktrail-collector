@@ -191,7 +191,7 @@ func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore gr
 		var added []string
 		var pending map[string]string
 		if view.DeviceGrantManaged {
-			added, pending, err = mergeManagedGrants(grantStore, view, homeDirOrDefault(opt.HomeDir))
+			added, pending, err = mergeManagedGrants(grantStore, view, homeDirOrDefault(opt.HomeDir), opt.probeDefaultInput)
 			if err != nil {
 				return info, managedconsent.Policy{}, err
 			}
@@ -430,7 +430,11 @@ func viewFromSelf(self synccmd.SelfStatus) (managedconsent.View, bool, error) {
 // tool names never become grants, and the server never supplies a path.
 // Tools that cannot be fully applied are reported as pending with a clear
 // reason so the revision is not acknowledged as applied.
-func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeDir string) ([]string, map[string]string, error) {
+//
+// probeDefaultInput overrides the per-tool default-directory probe for
+// in-package tests (nil probes the real filesystem via
+// defaultInputMissing); see Options.probeDefaultInput.
+func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeDir string, probeDefaultInput func(string) (bool, error)) ([]string, map[string]string, error) {
 	var tools []string
 	for _, tool := range view.AllowedTools {
 		if strings.TrimSpace(tool) != managedconsent.PausedToolSentinel {
@@ -449,6 +453,13 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 	}
 	var added []string
 	pending := map[string]string{}
+	// The default-directory probe, resolved once before the loop: the
+	// real filesystem probe unless an in-package test injected a
+	// deterministic override (see Options.probeDefaultInput).
+	probe := defaultInputMissing
+	if probeDefaultInput != nil {
+		probe = probeDefaultInput
+	}
 	for _, tool := range tools {
 		spec, ok := registry.LookupTool(tool)
 		if !ok {
@@ -495,7 +506,7 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 		// error, an I/O error, or a path that exists but is not a
 		// directory) must surface: classifying a real local fault as
 		// "not found" would disguise it as an uninstalled tool.
-		missing, probeErr := defaultInputMissing(def)
+		missing, probeErr := probe(def)
 		if probeErr != nil {
 			return nil, nil, fmt.Errorf("probe default directory for tool %q: %w", tool, probeErr)
 		}

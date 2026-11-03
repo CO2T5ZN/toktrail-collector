@@ -94,19 +94,16 @@ func TestWriteCollectionProgressJSON(t *testing.T) {
 }
 
 func TestPrintHelpIncludesConnect(t *testing.T) {
-	// Capture printHelp output
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	printHelp()
-
-	_ = w.Close()
-	os.Stdout = oldStdout
-
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	output := buf.String()
+	// Capture printHelp output through a concurrently drained pipe: the
+	// help text (~7 KiB) exceeds the OS pipe buffer on some platforms,
+	// so a write-first-read-later capture would deadlock.
+	output, err := captureStdoutPiped(t, func() error {
+		printHelp()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.Contains(output, "connect '<URL>'") {
 		t.Fatalf("expected printHelp to document connect '<URL>', got:\n%s", output)

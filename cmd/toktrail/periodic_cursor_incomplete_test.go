@@ -17,11 +17,8 @@ package main
 // server.
 
 import (
-	"bytes"
 	"errors"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -34,35 +31,13 @@ import (
 
 // capturePeriodicStdoutAndStderr runs fn with os.Stdout and os.Stderr
 // redirected to pipes and returns everything the command printed on
-// each stream (progress-json events go to stderr).
+// each stream (progress-json events go to stderr). Both pipes are
+// drained concurrently while fn runs: reading only after fn returned
+// would deadlock any output larger than the OS pipe buffer (see
+// pipe_capture_test.go).
 func capturePeriodicStdoutAndStderr(t *testing.T, fn func() error) (string, string, error) {
 	t.Helper()
-	oldOut, oldErr := os.Stdout, os.Stderr
-	rOut, wOut, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	rErr, wErr, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout, os.Stderr = wOut, wErr
-	fnErr := fn()
-	if err := wOut.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := wErr.Close(); err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout, os.Stderr = oldOut, oldErr
-	var bufOut, bufErr bytes.Buffer
-	if _, err := io.Copy(&bufOut, rOut); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.Copy(&bufErr, rErr); err != nil {
-		t.Fatal(err)
-	}
-	return bufOut.String(), bufErr.String(), fnErr
+	return captureStdoutStderrPiped(t, fn)
 }
 
 // armPeriodicCursorOnlyFixture prepares a cursor-only device (no local

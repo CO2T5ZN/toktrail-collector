@@ -205,6 +205,18 @@ type Options struct {
 	// SkipDeviceDrain only refreshes grants and counts pending device batches.
 	SkipDeviceDrain bool
 
+	// probeDefaultInput overrides the default-directory probe
+	// (defaultInputMissing) for in-package tests: nil (production and
+	// every external caller) probes the real filesystem. It exists so
+	// the fail-closed probe classification — anything other than
+	// os.ErrNotExist fails the grant sync instead of masquerading as a
+	// never-installed tool — can be exercised with a deterministic
+	// injected error on every platform: chmod-based unreadable
+	// directories do not exist on Windows and are bypassed under root.
+	// Unexported on purpose: not part of the public API, and per-instance
+	// so concurrent tests cannot interfere.
+	probeDefaultInput func(path string) (bool, error)
+
 	// emitter, when non-nil, is reused as this round's progress emitter
 	// instead of constructing one from Progress: the caller (connect's
 	// backlog passes) owns its lifecycle and its single deferred Stop, so

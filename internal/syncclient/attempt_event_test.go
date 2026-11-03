@@ -93,8 +93,12 @@ func TestAttemptEventSingleAttemptSuccess(t *testing.T) {
 	if ev.InterAttemptDelay != 0 {
 		t.Fatalf("inter-attempt delay = %s, want 0 on the first attempt", ev.InterAttemptDelay)
 	}
-	if ev.PrepareDuration <= 0 || ev.SelfCheckDuration <= 0 || ev.HTTPDuration <= 0 || ev.ACKDuration <= 0 {
-		t.Fatalf("all reached stage durations must be positive: %#v", ev)
+	// The Observed bits state the stages RAN, not that a positive
+	// duration was measured: a fast stage on a coarse monotonic clock
+	// (Windows) can legitimately measure as zero, so only negativity —
+	// impossible for monotonic diffs — would be a bug.
+	if ev.PrepareDuration < 0 || ev.SelfCheckDuration < 0 || ev.HTTPDuration < 0 || ev.ACKDuration < 0 {
+		t.Fatalf("reached stage durations must be non-negative: %#v", ev)
 	}
 	if ev.PrepareDuration < ev.SelfCheckDuration {
 		t.Fatalf("prepare (%s) must include the self check (%s)", ev.PrepareDuration, ev.SelfCheckDuration)
@@ -162,8 +166,11 @@ func TestAttemptEventRetryableFailureThenAckedOnRetry(t *testing.T) {
 	if first.ReceiptKnown || first.Accepted != 0 || first.Rejected != 0 || first.BatchReplay {
 		t.Fatalf("a lost body must leave the receipt unknown: %#v", first)
 	}
-	if first.HTTPDuration <= 0 || first.PrepareDuration <= 0 || first.SelfCheckDuration <= 0 {
-		t.Fatalf("reached durations must be positive: %#v", first)
+	// Non-negative, not positive: a fast stage on a coarse monotonic
+	// clock (Windows) can measure as zero; the Observed bits above are
+	// what prove the stages ran.
+	if first.HTTPDuration < 0 || first.PrepareDuration < 0 || first.SelfCheckDuration < 0 {
+		t.Fatalf("reached durations must be non-negative: %#v", first)
 	}
 	if second.Stage != StageAck || second.Result != ResultAcked {
 		t.Fatalf("second event stage/result = %s/%s, want ack/acked", second.Stage, second.Result)
@@ -451,7 +458,10 @@ func TestAttemptEventACKFailureKeepsValidatedReceipt(t *testing.T) {
 	if !ev.ReceiptKnown || ev.Accepted != 1 || ev.Rejected != 0 || ev.BatchReplay {
 		t.Fatalf("the validated receipt must stay known through an ACK failure: %#v", ev)
 	}
-	if !ev.Observed.Has(ObservedACK) || ev.ACKDuration <= 0 {
+	// Non-negative, not positive: a fast ACK commit on a coarse
+	// monotonic clock (Windows) can measure as zero; the ObservedACK
+	// bit is what proves the ACK ran.
+	if !ev.Observed.Has(ObservedACK) || ev.ACKDuration < 0 {
 		t.Fatalf("the ACK ran and must be observed: %#v", ev)
 	}
 	assertBatchPending(t, stateDir, "batch-event-ackfail-1")

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf16"
 )
 
 // ---------------------------------------------------------------------------
@@ -68,9 +67,12 @@ func (r *failingRunner) RunOutput(name string, args ...string) ([]byte, error) {
 }
 
 // testConfig builds a valid TaskConfig rooted at temp paths so tests never
-// touch the real home directory.
+// touch the real home directory. It also pins the Windows principal
+// identity so tests that simulate the Windows renderer render the same
+// task definition on every platform.
 func testConfig(t *testing.T) (TaskConfig, string, string) {
 	t.Helper()
+	stubWindowsPrincipalUser(t, "S-1-5-21-1000000000-1000000000-1000000000-1001")
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state dir with spaces & 'quotes'")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -90,6 +92,31 @@ func testConfig(t *testing.T) (TaskConfig, string, string) {
 		Interval: DefaultInterval,
 		HomeDir:  filepath.Join(root, "home"),
 	}, root, stateDir
+}
+
+// stubWindowsPrincipalUser installs a deterministic Windows principal
+// identity for tests that simulate the Windows renderer, which cannot
+// resolve a real Windows account SID on non-Windows hosts. The production
+// resolver is restored afterwards.
+func stubWindowsPrincipalUser(t *testing.T, id string) {
+	t.Helper()
+	orig := windowsPrincipalUserID
+	windowsPrincipalUserID = func() (string, error) { return id, nil }
+	t.Cleanup(func() { windowsPrincipalUserID = orig })
+}
+
+// parseXMLText checks that text is well-formed XML. The Windows task XML
+// declares UTF-16 (its on-disk encoding) while the in-memory text is
+// UTF-8, so a pass-through CharsetReader is installed: this validates
+// document structure, not the on-disk byte encoding (encodeFileContent
+// covers that).
+func parseXMLText(text string) error {
+	dec := xml.NewDecoder(strings.NewReader(text))
+	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		return input, nil
+	}
+	var doc any
+	return dec.Decode(&doc)
 }
 
 func planOrFatal(t *testing.T, cfg TaskConfig) Plan {
@@ -222,15 +249,59 @@ func TestWindowsTaskXMLParsesAndQuotesStateDir(t *testing.T) {
 	if len(plan.Files) != 1 || !plan.Files[0].Temp {
 		t.Fatalf("windows plan must write exactly one scratch (Temp) XML file: %#v", plan.Files)
 	}
-	var doc any
-	if err := xml.Unmarshal([]byte(plan.Files[0].Content), &doc); err != nil {
-		t.Fatalf("task XML does not parse: %v\n%s", err, plan.Files[0].Content)
+	file := plan.Files[0]
+	// The whole document must parse as XML even with metacharacters in
+	// the state directory path.
+	if err := parseXMLText(file.Content); err != nil {
+		t.Fatalf("task XML does not parse: %v\n%s", err, file.Content)
 	}
 	if len(plan.RemoveFiles) != 0 {
 		t.Fatalf("windows plan must not own persistent files: %#v", plan.RemoveFiles)
 	}
-	if !strings.Contains(plan.Files[0].Content, "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") {
+	if !strings.Contains(file.Content, "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") {
 		t.Fatal("overlapping instances must be refused by policy as well as the process lock")
+	}
+	// On disk the XML must be UTF-16LE with a BOM and a matching
+	// declaration: schtasks /Create /XML rejects UTF-8 task definitions
+	// with "unable to switch encoding", while UTF-16LE + BOM is the form
+	// schtasks itself exports via /Query /XML.
+	if file.Encoding != EncodingUTF16LE {
+		t.Fatalf("windows task XML must be written as UTF-16LE, got encoding %q", file.Encoding)
+	}
+	data, err := encodeFileContent(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 2 || data[0] != 0xFF || data[1] != 0xFE {
+		t.Fatal("encoded task XML must start with a UTF-16LE BOM (FF FE)")
+	}
+	if round := decodeUTF16LEOrUTF8(data); round != file.Content {
+		t.Fatalf("UTF-16LE encoding must round-trip the content exactly;\nround:\n%s", round)
+	}
+	if !strings.HasPrefix(file.Content, `<?xml version="1.0" encoding="UTF-16"?>`) {
+		t.Fatalf("declaration must match the UTF-16 on-disk encoding:\n%s", file.Content)
+	}
+	// The principal must name a concrete account: the schema types UserId
+	// as nonEmptyString, and LogonType is only meaningful with a UserId.
+	if strings.Contains(file.Content, "<UserId></UserId>") {
+		t.Fatal("empty UserId element is invalid per the Task Scheduler schema (nonEmptyString)")
+	}
+	if !strings.Contains(file.Content, "<UserId>S-1-5-21-1000000000-1000000000-1000000000-1001</UserId>") {
+		t.Fatalf("principal must carry the resolved user id:\n%s", file.Content)
+	}
+	if !strings.Contains(file.Content, "<LogonType>InteractiveToken</LogonType>") {
+		t.Fatal("principal must keep the interactive-token (no stored credentials) semantics")
+	}
+	if !strings.Contains(file.Content, "<RunLevel>LeastPrivilege</RunLevel>") {
+		t.Fatal("principal must keep least-privilege semantics")
+	}
+	// Repetition intervals are xs:duration values with uppercase
+	// designators; the schema bounds them to PT1M..P31D.
+	if !strings.Contains(file.Content, "<Interval>PT30M</Interval>") {
+		t.Fatalf("repetition interval must be an uppercase-designator duration (PT30M):\n%s", file.Content)
+	}
+	if !strings.Contains(file.Content, xmlEscape(stateDir)) {
+		t.Fatal("state dir missing from task XML")
 	}
 	// The schtasks command must pass the XML file and task name as
 	// separate argv entries.
@@ -246,7 +317,100 @@ func TestWindowsTaskXMLParsesAndQuotesStateDir(t *testing.T) {
 	if !containsArg(cmd.Args, "/XML") || !containsArg(cmd.Args, "/TN") {
 		t.Fatalf("schtasks must use /XML and /TN, got %#v", cmd.Args)
 	}
-	_ = stateDir
+}
+
+func TestWindowsTaskXMLEncodingStaysUTF8Elsewhere(t *testing.T) {
+	// Non-Windows plans and the zero encoding keep the exact UTF-8 bytes
+	// of the content on disk (other platforms' behavior is unchanged).
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	plan := planOrFatal(t, cfg)
+	if plan.Files[0].Encoding != "" && plan.Files[0].Encoding != EncodingUTF8 {
+		t.Fatalf("launchd plist must keep the default UTF-8 encoding, got %q", plan.Files[0].Encoding)
+	}
+	data, err := encodeFileContent(plan.Files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != plan.Files[0].Content {
+		t.Fatal("UTF-8 encoding must be byte-identical to the content")
+	}
+	// An unknown encoding must fail closed before any bytes are written.
+	_, err = encodeFileContent(FileWrite{Path: "x", Content: "x", Encoding: "latin-1"})
+	if err == nil {
+		t.Fatal("unsupported file encoding must fail closed")
+	}
+}
+
+func TestFormatWindowsIntervalUppercaseDurationDesignators(t *testing.T) {
+	cases := map[time.Duration]string{
+		MinInterval:            "PT1M",
+		DefaultInterval:        "PT30M",
+		90 * time.Second:       "PT1M", // sub-minute remainder keeps the historical truncation
+		7 * 24 * time.Hour:     "PT10080M",
+		windowsMaxTaskInterval: "PT44640M",
+	}
+	for in, want := range cases {
+		if got := formatWindowsInterval(in); got != want {
+			t.Errorf("formatWindowsInterval(%s) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestWindowsIntervalRangeFailsClosed(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	cfg.Interval = windowsMaxTaskInterval + time.Minute
+	runner := &recordingRunner{}
+	if _, err := RenderInstall(cfg); err == nil {
+		t.Fatal("expected render to fail closed for an interval above the Task Scheduler maximum of 31 days")
+	}
+	if _, err := Install(InstallOptions{Config: cfg, Runner: runner}); err == nil {
+		t.Fatal("expected install to fail closed for an out-of-range interval")
+	}
+	if len(runner.runs) != 0 {
+		t.Fatalf("no command may run for an out-of-range interval: %v", runner.runs)
+	}
+	// In-range non-whole-minute intervals keep the historical truncation
+	// behavior (90s schedules as PT1M) instead of newly failing.
+	cfg.Interval = 90 * time.Second
+	plan, err := RenderInstall(cfg)
+	if err != nil {
+		t.Fatalf("in-range non-whole-minute interval must keep rendering: %v", err)
+	}
+	if !strings.Contains(plan.Files[0].Content, "<Interval>PT1M</Interval>") {
+		t.Fatalf("sub-minute remainder must truncate to whole minutes:\n%s", plan.Files[0].Content)
+	}
+}
+
+func TestWindowsPrincipalResolutionFailsClosed(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	orig := windowsPrincipalUserID
+	t.Cleanup(func() { windowsPrincipalUserID = orig })
+	// A resolver failure must abort the render before any file or command.
+	windowsPrincipalUserID = func() (string, error) { return "", errors.New("no process token") }
+	runner := &recordingRunner{}
+	if _, err := RenderInstall(cfg); err == nil {
+		t.Fatal("expected render to fail when the principal identity cannot be resolved")
+	}
+	if _, err := Install(InstallOptions{Config: cfg, Runner: runner}); err == nil {
+		t.Fatal("expected install to fail when the principal identity cannot be resolved")
+	}
+	if len(runner.runs) != 0 {
+		t.Fatalf("no command may run without a principal identity: %v", runner.runs)
+	}
+	// An empty identity violates the schema's nonEmptyString UserId and
+	// must also fail closed.
+	windowsPrincipalUserID = func() (string, error) { return "  ", nil }
+	if _, err := RenderInstall(cfg); err == nil {
+		t.Fatal("expected render to fail on an empty principal identity")
+	}
+	// Uninstall never renders XML, so it must keep working without an
+	// identity (uninstalling must never be blocked by principal issues).
+	if _, err := RenderUninstall(cfg); err != nil {
+		t.Fatalf("uninstall must not need the principal identity: %v", err)
+	}
 }
 
 func containsArg(args []string, target string) bool {
@@ -428,6 +592,54 @@ func TestInstallWindowsDeletesTempXMLEvenOnFailure(t *testing.T) {
 		if _, statErr := os.Stat(file.Path); !os.IsNotExist(statErr) {
 			t.Fatalf("temp XML survived failed install: %s", file.Path)
 		}
+	}
+}
+
+// captureXMLRunner captures the on-disk bytes of the scratch XML at the
+// moment schtasks /Create runs, proving the file handed to schtasks is
+// UTF-16LE with a BOM (not the readable UTF-8 text kept in memory).
+type captureXMLRunner struct {
+	recordingRunner
+	xmlPath  string
+	captured []byte
+	sawFile  bool
+}
+
+func (r *captureXMLRunner) Run(name string, args ...string) error {
+	_, err := r.RunOutput(name, args...)
+	return err
+}
+
+func (r *captureXMLRunner) RunOutput(name string, args ...string) ([]byte, error) {
+	if name == "schtasks" && containsArg(args, "/Create") {
+		if data, err := os.ReadFile(r.xmlPath); err == nil {
+			r.sawFile = true
+			r.captured = data
+		}
+	}
+	return r.recordingRunner.RunOutput(name, args...)
+}
+
+func TestInstallWritesWindowsXMLAsUTF16LEOnDisk(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	plan := planOrFatal(t, cfg)
+	runner := &captureXMLRunner{xmlPath: plan.Files[0].Path}
+	if _, err := Install(InstallOptions{Config: cfg, Runner: runner}); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	if !runner.sawFile {
+		t.Fatal("schtasks /Create must run while the scratch XML exists on disk")
+	}
+	if len(runner.captured) < 2 || runner.captured[0] != 0xFF || runner.captured[1] != 0xFE {
+		head := runner.captured
+		if len(head) > 4 {
+			head = head[:4]
+		}
+		t.Fatalf("scratch XML on disk must start with a UTF-16LE BOM (FF FE), got % X", head)
+	}
+	if decoded := decodeUTF16LEOrUTF8(runner.captured); decoded != plan.Files[0].Content {
+		t.Fatal("scratch XML on disk must be exactly the UTF-16LE encoding of the rendered definition")
 	}
 }
 
@@ -737,18 +949,6 @@ func TestIsInstalledAndOwnedFileCheckWindows(t *testing.T) {
 	if installed || err == nil {
 		t.Fatalf("malformed UTF-16 output must fail ownership check without panic: installed=%v, err=%v", installed, err)
 	}
-}
-
-func encodeUTF16LEWithBOM(s string) []byte {
-	u16 := utf16.Encode([]rune(s))
-	b := make([]byte, 2+2*len(u16))
-	b[0] = 0xFF
-	b[1] = 0xFE
-	for i, v := range u16 {
-		b[2+2*i] = byte(v)
-		b[2+2*i+1] = byte(v >> 8)
-	}
-	return b
 }
 
 func TestWritePlanIsSafeDryRun(t *testing.T) {

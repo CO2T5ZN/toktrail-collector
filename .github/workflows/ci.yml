@@ -7,12 +7,23 @@
 # repository.
 #
 # Design notes:
-# - Run go vet and go test on Linux, macOS, and Windows.
-# - Vendored dependencies allow the workflow to run with GOPROXY=off and
-#   validate offline buildability.
-# - The release end-to-end test is gated by TOKTRAIL_RELEASE_E2E=1 and runs only
-#   on Linux. It generates a temporary TEST signing key and builds all platform
-#   artifacts without reading any production signing secret.
+# - Run go vet and go test on Linux, macOS, and Windows with GOPROXY=off, so
+#   the vendored offline build path is what CI actually validates.
+# - The Windows leg of the matrix job is the native Windows gate: the full
+#   test suite is captured as `go test -json` events (structured failure
+#   logs), the real Task Scheduler and connect integration tests run behind
+#   explicit env gates, and scripts/windows-smoke.ps1 must exist and pass.
+#   Every Windows step checks and propagates the raw PowerShell exit code of
+#   the underlying command instead of relying on shell defaults.
+# - The release end-to-end test is gated by TOKTRAIL_RELEASE_E2E=1 and runs
+#   only on Linux. It generates a temporary TEST signing key and builds all
+#   platform artifacts without reading any production signing secret.
+# - No job in this workflow reads any repository secret.
+#
+# Branch protection: "Vet + test (<os>)" is the stable check name of the
+# matrix job. Do not rename this job or the matrix OS list. The Windows gate
+# steps live inside this existing job so required-check configuration keeps
+# working unchanged; every pull request therefore runs the full Windows gate.
 
 name: CI
 
@@ -33,12 +44,16 @@ concurrency:
 env:
   # Quote off so YAML 1.1 parsers do not treat it as boolean false.
   GOPROXY: 'off'
+  # Pinned Go patch version (final 1.24 patch release). Bump deliberately,
+  # together with release.yml and the go.mod language version; see docs/CI.md.
+  GO_VERSION: '1.24.13'
 
 jobs:
   test:
     name: Vet + test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Keep the check name stable while pinning the Windows OS release.
+    runs-on: ${{ matrix.os == 'windows-latest' && 'windows-2025' || matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -50,14 +65,133 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ env.GO_VERSION }}
           cache: false # Vendored dependencies do not require the module cache.
 
       - name: go vet
         run: go vet ./...
 
       - name: go test
+        if: runner.os != 'Windows'
         run: go test ./... -count=1
+
+      # Windows full suite, captured as structured `go test -json` events and
+      # teed to a log file that is uploaded as a diagnostics artifact on
+      # failure. A PowerShell pipeline does not fail the step by itself, so
+      # the go test exit code is checked and propagated explicitly.
+      - name: go test (Windows structured log)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          go test ./... -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath 'windows-test-output.jsonl'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Real Windows Task Scheduler integration: registers, queries, and removes a
+      # real per-user task on the runner. Opt-in via the env gate so the plain
+      # suite above stays hermetic. The pass-count check below fails this step
+      # when the -run pattern does not match the agreed test name or when the
+      # test skips instead of passing (go test alone would exit 0 either way).
+      - name: Windows scheduler native integration test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TOKTRAIL_WINDOWS_SCHEDULER_E2E: '1'
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = 'windows-scheduler-e2e.jsonl'
+          go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $passed = @(Get-Content -LiteralPath $log |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_.Action -eq 'pass' -and $_.Test -eq 'TestWindowsSchedulerNativeIntegration' })
+          if ($passed.Count -ne 1) {
+            Write-Host "::error::Expected exactly one PASS event for TestWindowsSchedulerNativeIntegration, found $($passed.Count). The -run pattern, the test name, or the TOKTRAIL_WINDOWS_SCHEDULER_E2E gate is out of sync; a skipped or unmatched test must fail this gate."
+            exit 1
+          }
+          Write-Host 'TestWindowsSchedulerNativeIntegration ran and passed.'
+
+      # Real Windows connect flow integration for cmd/toktrail. Same rules as
+      # the scheduler gate above: the named test must actually run and pass.
+      - name: Windows connect native integration test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TOKTRAIL_WINDOWS_CONNECT_E2E: '1'
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = 'windows-connect-e2e.jsonl'
+          go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $passed = @(Get-Content -LiteralPath $log |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object { $_.Action -eq 'pass' -and $_.Test -eq 'TestWindowsConnectNativeIntegration' })
+          if ($passed.Count -ne 1) {
+            Write-Host "::error::Expected exactly one PASS event for TestWindowsConnectNativeIntegration, found $($passed.Count). The -run pattern, the test name, or the TOKTRAIL_WINDOWS_CONNECT_E2E gate is out of sync; a skipped or unmatched test must fail this gate."
+            exit 1
+          }
+          Write-Host 'TestWindowsConnectNativeIntegration ran and passed.'
+
+      # Smoke entry point for Windows. The script is owned outside this
+      # workflow, but a missing script must fail the gate (no silent skip),
+      # and the script's own exit code is propagated as the step result.
+      - name: Windows smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'scripts/windows-smoke.ps1')) {
+            Write-Host '::error::scripts/windows-smoke.ps1 is missing; the Windows gate requires the smoke script.'
+            exit 1
+          }
+          pwsh -File scripts/windows-smoke.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Failure diagnostics: attach only the captured go test logs, redact
+      # known credential shapes as defense in depth, and document the
+      # sensitivity policy inside the artifact itself. Nothing from the
+      # workspace, caches, or state directories is uploaded.
+      - name: Prepare Windows failure diagnostics
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $logs = @('windows-test-output.jsonl', 'windows-scheduler-e2e.jsonl', 'windows-connect-e2e.jsonl') |
+            Where-Object { Test-Path -LiteralPath $_ }
+          if (-not $logs) { Write-Host 'No Windows test logs captured; nothing to prepare.'; exit 0 }
+          $patterns = @(
+            'ghp_[A-Za-z0-9]{36}',
+            'github_pat_[A-Za-z0-9_]{20,}',
+            'AKIA[0-9A-Z]{16}',
+            '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          )
+          foreach ($f in $logs) {
+            $text = Get-Content -LiteralPath $f -Raw
+            foreach ($p in $patterns) { $text = $text -replace $p, '[REDACTED]' }
+            Set-Content -LiteralPath $f -Value $text -Encoding utf8 -NoNewline
+          }
+          $readme = @(
+            'Windows CI failure diagnostics for run ${{ github.run_id }} (attempt ${{ github.run_attempt }}).',
+            'Contents: go test stdout/stderr captured from this CI job only.',
+            'The test suite uses synthetic fixtures in temporary runner',
+            'directories; no secrets, tokens, account data, or real user',
+            'state are expected in these logs. Known credential patterns',
+            'are redacted before upload as defense in depth.'
+          )
+          Set-Content -LiteralPath 'DIAGNOSTICS-README.txt' -Value $readme -Encoding utf8
+
+      - name: Upload Windows failure diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            DIAGNOSTICS-README.txt
+            windows-test-output.jsonl
+            windows-scheduler-e2e.jsonl
+            windows-connect-e2e.jsonl
+          if-no-files-found: warn
+          retention-days: 7
 
   release-e2e:
     name: Release end-to-end (Linux, temporary TEST key)
@@ -72,8 +206,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
-          cache: false
+          go-version: ${{ env.GO_VERSION }}
+          cache: false # Vendored dependencies do not require the module cache.
 
       # Full chain: keygen with a temporary TEST private key, build six platform
       # artifacts, sign, verify, install, and run. No production secret is

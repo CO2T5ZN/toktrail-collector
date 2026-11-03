@@ -23,6 +23,36 @@ The release end-to-end test is slower and must be enabled explicitly:
 GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
+### Local Windows testing
+
+CI runs the full gate on `windows-2025` for every pull request: the whole
+test suite, the real Task Scheduler and connect integration tests behind
+env gates, and `scripts/windows-smoke.ps1`. To mirror it in PowerShell 7:
+
+```powershell
+$env:GOPROXY = 'off'
+go vet ./...
+go test ./... -count=1
+
+# Real Task Scheduler integration; registers and removes a real per-user task.
+$env:TOKTRAIL_WINDOWS_SCHEDULER_E2E = '1'
+go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -v
+Remove-Item Env:TOKTRAIL_WINDOWS_SCHEDULER_E2E
+
+# Real connect flow integration.
+$env:TOKTRAIL_WINDOWS_CONNECT_E2E = '1'
+go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -v
+Remove-Item Env:TOKTRAIL_WINDOWS_CONNECT_E2E
+
+pwsh -File scripts/windows-smoke.ps1
+```
+
+Without the env gates these integration tests skip locally; CI additionally
+verifies they really ran and passed (an unmatched `-run` pattern alone fails
+the gate). See [CI and release gates](docs/CI.md) for the full workflow
+documentation, including failure-diagnostics artifacts and the pinned Go
+version.
+
 ## Architecture
 
 Read [Architecture and adapter extension](docs/ARCHITECTURE.md) before adding a source. Parsers and their fixtures belong to the source package. Shared orchestration must use registry descriptors rather than switch on source identifiers.
@@ -59,6 +89,7 @@ Before opening a pull request, verify:
 - [ ] No secrets, real logs, local state, release keys, or cache directories are included.
 - [ ] New adapters include privacy projection tests.
 - [ ] Changes to release logic include manifest, archive, or installer tests as appropriate.
+- [ ] Changes touching scheduler, connect, or Windows behavior were run through the local Windows gate above (CI will run them on `windows-2025` for every pull request, including `scripts/windows-smoke.ps1`, which must exist and pass).
 - [ ] Documentation is updated when behavior or command-line flags change.
 
 ## Release artifacts

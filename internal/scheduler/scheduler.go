@@ -13,6 +13,11 @@
 //     injectable Runner), never through a shell; XML/unit values are
 //     escaped with proper escaping helpers. Paths with spaces and XML
 //     metacharacters are safe by construction.
+//   - The Windows task XML is written to disk as UTF-16LE with a BOM and
+//     a matching encoding="UTF-16" declaration, because schtasks
+//     /Create /XML rejects UTF-8 definitions with "unable to switch
+//     encoding"; unix files stay UTF-8 and dry runs display readable
+//     UTF-8 text either way.
 //   - Everything is validated before any scheduler file is mutated;
 //     a failed install rolls back every file it wrote (fail closed, no
 //     partial install survives).
@@ -144,7 +149,29 @@ type FileWrite struct {
 	// Temp marks scratch files (for example the Windows task XML handed to
 	// schtasks) that are deleted after the commands succeed.
 	Temp bool
+	// Encoding selects how Content is encoded on disk. The zero value
+	// writes the content as raw UTF-8 bytes (launchd plists, systemd
+	// units); EncodingUTF16LE writes the Windows task XML in the form
+	// schtasks requires. Content itself always stays readable UTF-8 so
+	// dry runs (WritePlan) display it.
+	Encoding FileEncoding
 }
+
+// FileEncoding selects the on-disk byte encoding of a planned file write.
+type FileEncoding string
+
+const (
+	// EncodingUTF8 (also the zero value) writes the content as raw UTF-8
+	// bytes. All unix scheduler files use it.
+	EncodingUTF8 FileEncoding = "utf-8"
+	// EncodingUTF16LE writes a UTF-16LE byte-order mark (0xFF 0xFE)
+	// followed by the text encoded as UTF-16LE code units. Windows
+	// schtasks /Create /XML rejects task definitions saved as UTF-8 with
+	// "unable to switch encoding" and accepts the UTF-16LE + BOM form it
+	// exports itself via `schtasks /Query /XML`, so the Windows task XML
+	// must use this encoding and declare encoding="UTF-16".
+	EncodingUTF16LE FileEncoding = "utf-16le"
+)
 
 type Command struct {
 	Name    string
@@ -428,6 +455,11 @@ func rollback(runner Runner, plan Plan, written []string) {
 }
 
 func writeFile(file FileWrite) error {
+	// Fail closed on an unsupported encoding before touching the disk.
+	data, err := encodeFileContent(file)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Dir(file.Path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
@@ -437,7 +469,7 @@ func writeFile(file FileWrite) error {
 		mode = 0o644
 	}
 	tmp := file.Path + ".toktrail-tmp"
-	if err := os.WriteFile(tmp, []byte(file.Content), mode); err != nil {
+	if err := os.WriteFile(tmp, data, mode); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, file.Path); err != nil {
@@ -445,6 +477,21 @@ func writeFile(file FileWrite) error {
 		return fmt.Errorf("install %s: %w", file.Path, err)
 	}
 	return nil
+}
+
+// encodeFileContent renders a planned file's disk bytes. The default (and
+// every unix scheduler file) is the raw UTF-8 bytes of the content; the
+// Windows task XML is encoded UTF-16LE with a BOM because that is the
+// only encoding schtasks /Create /XML accepts for task definitions.
+func encodeFileContent(file FileWrite) ([]byte, error) {
+	switch file.Encoding {
+	case "", EncodingUTF8:
+		return []byte(file.Content), nil
+	case EncodingUTF16LE:
+		return encodeUTF16LEWithBOM(file.Content), nil
+	default:
+		return nil, fmt.Errorf("write %s: unsupported file encoding %q", file.Path, file.Encoding)
+	}
 }
 
 // validatePlanPaths ensures every file the plan writes stays inside the
@@ -640,6 +687,23 @@ func decodeUTF16LEOrUTF8(b []byte) string {
 		return string(utf16.Decode(u16))
 	}
 	return string(b)
+}
+
+// encodeUTF16LEWithBOM encodes text as UTF-16LE with a byte-order mark —
+// the encoding Windows schtasks produces for task XML via /Query /XML and
+// the only one it reliably accepts for /Create /XML (a UTF-8 file fails
+// with "unable to switch encoding"). It is the inverse of
+// decodeUTF16LEOrUTF8 for well-formed input.
+func encodeUTF16LEWithBOM(s string) []byte {
+	u16 := utf16.Encode([]rune(s))
+	b := make([]byte, 2+2*len(u16))
+	b[0] = 0xFF
+	b[1] = 0xFE
+	for i, v := range u16 {
+		b[2+2*i] = byte(v)
+		b[3+2*i] = byte(v >> 8)
+	}
+	return b
 }
 
 func isTaskNotFound(err error) bool {
