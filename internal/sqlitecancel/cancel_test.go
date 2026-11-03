@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,6 +148,38 @@ func TestToktrailQueryCancelClosesRows(t *testing.T) {
 `
 )
 
+// injectHandoverHook accepts either Git LF or Windows CRLF checkouts. The
+// normalized copy is used only by the test overlay; the vendor file is intact.
+func injectHandoverHook(src []byte) ([]byte, error) {
+	src = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
+	if n := bytes.Count(src, []byte(handoverNeedle)); n != 1 {
+		return nil, fmt.Errorf("expected exactly one SQLITE_ROW rows-handover site in %s, found %d; the vendored driver changed shape and the overlay hook anchor must be updated", vendoredSqlite, n)
+	}
+	return bytes.Replace(src, []byte(handoverNeedle), []byte(handoverReplacement), 1), nil
+}
+
+func TestInjectHandoverHookLineEndings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  []byte
+	}{
+		{"LF", []byte(handoverNeedle)},
+		{"CRLF", bytes.ReplaceAll([]byte(handoverNeedle), []byte("\n"), []byte("\r\n"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := injectHandoverHook(tc.src)
+			if err != nil || !bytes.Equal(got, []byte(handoverReplacement)) {
+				t.Fatalf("hook injection failed: %v, got %q", err, got)
+			}
+		})
+	}
+	for _, src := range [][]byte{nil, []byte(handoverNeedle + handoverNeedle)} {
+		if _, err := injectHandoverHook(src); err == nil {
+			t.Fatal("missing or ambiguous handover site must fail")
+		}
+	}
+}
+
 // TestQueryCancelOverlayDeterministic builds the overlay copy of the
 // vendored driver and runs the deterministic in-package regression with
 // `go test -overlay`. It fails when the vendored driver either lost the
@@ -163,11 +196,25 @@ func TestQueryCancelOverlayDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading %s: %v", vendoredSqlite, err)
 	}
-	if n := bytes.Count(orig, []byte(handoverNeedle)); n != 1 {
-		t.Fatalf("expected exactly one SQLITE_ROW rows-handover site in %s, found %d; "+
-			"the vendored driver changed shape and the overlay hook anchor must be updated", vendoredSqlite, n)
+	for _, tc := range []struct {
+		name string
+		src  []byte
+	}{
+		{"LF", bytes.ReplaceAll(orig, []byte("\r\n"), []byte("\n"))},
+		{"CRLF", bytes.ReplaceAll(bytes.ReplaceAll(orig, []byte("\r\n"), []byte("\n")), []byte("\n"), []byte("\r\n"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runQueryCancelOverlay(t, repoRoot, tc.src)
+		})
 	}
-	hooked := bytes.Replace(orig, []byte(handoverNeedle), []byte(handoverReplacement), 1)
+}
+
+func runQueryCancelOverlay(t *testing.T, repoRoot string, src []byte) {
+	t.Helper()
+	hooked, err := injectHandoverHook(src)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	dir := t.TempDir()
 	sqliteGo := filepath.ToSlash(filepath.Join(dir, "sqlite.go"))
