@@ -5,9 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 
-	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/knowncache"
 	"toktrail-collector/internal/local/overrides"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/source/adapter"
@@ -38,7 +37,13 @@ func filterKnownDSHRecordsContext(ctx context.Context, stateDir string, records 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	known := make(map[string][]byte)
+	// Cached, ledger-validated baseline (see internal/local/knowncache); a
+	// cache that does not provably cover every batch falls back to reading
+	// the batch files exactly as before.
+	known, err := knowncache.LoadBaseline(ctx, stateDir, adapter.DeepSeekHarnessSource, "DeepSeek Harness")
+	if err != nil {
+		return nil, err
+	}
 	remember := func(raw []byte) error {
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.UseNumber()
@@ -59,45 +64,6 @@ func filterKnownDSHRecordsContext(ctx context.Context, stateDir string, records 
 		}
 		known[key] = canonical
 		return nil
-	}
-	outboxLedger, err := outbox.New(stateDir).Load()
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range outboxLedger.Batches {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if entry.Source != adapter.DeepSeekHarnessSource {
-			continue
-		}
-		switch entry.Status {
-		case outbox.StatusPending, outbox.StatusSynced, outbox.StatusReorganized:
-		default:
-			return nil, fmt.Errorf("unknown DeepSeek Harness outbox status %q", entry.Status)
-		}
-		raw, err := os.ReadFile(entry.File)
-		if err != nil {
-			return nil, fmt.Errorf("read DeepSeek Harness history batch %s: %w", entry.BatchID, err)
-		}
-		var batch struct {
-			BatchID string            `json:"batchId"`
-			Records []json.RawMessage `json:"records"`
-		}
-		if err := json.Unmarshal(raw, &batch); err != nil {
-			return nil, err
-		}
-		if batch.BatchID != entry.BatchID {
-			return nil, fmt.Errorf("DeepSeek Harness history batch identity mismatch")
-		}
-		for _, rec := range batch.Records {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if err := remember(rec); err != nil {
-				return nil, err
-			}
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

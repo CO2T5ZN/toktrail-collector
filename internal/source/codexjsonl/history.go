@@ -5,8 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/knowncache"
 	"toktrail-collector/internal/local/overrides"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/source/adapter"
@@ -30,7 +29,16 @@ func filterKnownCodexRecordsContext(ctx context.Context, stateDir string, record
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	known := make(map[string][]byte)
+	// The baseline (recordKey -> canonical bytes) is cached and validated
+	// against the outbox ledger; only a cache that provably covers every
+	// batch is trusted, and anything else falls back to reading the batch
+	// files exactly as before (see internal/local/knowncache).
+	known, err := knowncache.LoadBaseline(ctx, stateDir, "codex-jsonl", "Codex")
+	if err != nil {
+		return nil, err
+	}
+	// remember folds one more stored payload (a quarantine entry) into the
+	// baseline, keeping the byte-level "conflicting content" refusal.
 	remember := func(raw []byte) error {
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.UseNumber()
@@ -51,45 +59,6 @@ func filterKnownCodexRecordsContext(ctx context.Context, stateDir string, record
 		}
 		known[key] = canonical
 		return nil
-	}
-	outboxLedger, err := outbox.New(stateDir).Load()
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range outboxLedger.Batches {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if entry.Source != "codex-jsonl" {
-			continue
-		}
-		switch entry.Status {
-		case outbox.StatusPending, outbox.StatusSynced, outbox.StatusReorganized:
-		default:
-			return nil, fmt.Errorf("unknown Codex outbox status %q", entry.Status)
-		}
-		raw, err := os.ReadFile(entry.File)
-		if err != nil {
-			return nil, fmt.Errorf("read Codex history batch %s: %w", entry.BatchID, err)
-		}
-		var batch struct {
-			BatchID string            `json:"batchId"`
-			Records []json.RawMessage `json:"records"`
-		}
-		if err := json.Unmarshal(raw, &batch); err != nil {
-			return nil, err
-		}
-		if batch.BatchID != entry.BatchID {
-			return nil, fmt.Errorf("Codex history batch identity mismatch")
-		}
-		for _, rec := range batch.Records {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if err := remember(rec); err != nil {
-				return nil, err
-			}
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

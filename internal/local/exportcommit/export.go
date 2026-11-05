@@ -43,6 +43,10 @@ type exportJournal struct {
 	Input       string    `json:"input"`
 	RecordCount int       `json:"recordCount"`
 	CommittedAt time.Time `json:"committedAt"`
+	// OldestAt/NewestAt are the batch's record time bounds, persisted so the
+	// upload queue can prefer recent data.
+	OldestAt *time.Time `json:"oldestAt,omitempty"`
+	NewestAt *time.Time `json:"newestAt,omitempty"`
 	// MessageUpdates freezes the per-message pending intervals of interval
 	// sources (claude-code-jsonl) together with this batch, so a crash
 	// between batch write and progress write cannot double count.
@@ -138,6 +142,8 @@ func journalFromOptions(opt ExportOptions) (exportJournal, error) {
 		RecordCount:    prepared.Records,
 		CommittedAt:    opt.CommittedAt.UTC(),
 		MessageUpdates: prepared.MessageUpdates,
+		OldestAt:       prepared.OldestAt,
+		NewestAt:       prepared.NewestAt,
 	}
 	if journal.CommittedAt.IsZero() {
 		journal.CommittedAt = time.Now().UTC()
@@ -195,13 +201,20 @@ func applyJournal(stateDir string, journal exportJournal) error {
 	if err := writeBatchAtomically(journal.Output, []byte(journal.Payload)); err != nil {
 		return err
 	}
-	if _, err := outbox.New(stateDir).AddPending(outbox.AddBatchOptions{
+	addOpts := outbox.AddBatchOptions{
 		BatchID:     journal.BatchID,
 		File:        journal.Output,
 		Source:      journal.Source,
 		Input:       journal.Input,
 		RecordCount: journal.RecordCount,
-	}); err != nil {
+	}
+	if journal.OldestAt != nil {
+		addOpts.OldestRecordAt = *journal.OldestAt
+	}
+	if journal.NewestAt != nil {
+		addOpts.NewestRecordAt = *journal.NewestAt
+	}
+	if _, err := outbox.New(stateDir).AddPending(addOpts); err != nil {
 		return err
 	}
 	_, err := progress.New(stateDir).Advance(progress.AdvanceOptions{

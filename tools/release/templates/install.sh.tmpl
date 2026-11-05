@@ -177,5 +177,16 @@ if [ -n "$CONNECT_URL" ]; then
     *) ABS_INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)" || fail "cannot resolve install directory $INSTALL_DIR" ;;
   esac
   echo "==> connecting with the provided link"
-  "$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL"
+  # This script is normally run as `curl ... | sh`, so OUR stdin is the
+  # script itself. A child that reads stdin would consume the remaining
+  # script lines (or see EOF), and a confirmation prompt would answer for
+  # nobody. Never hand the script pipeline to the collector: give it the
+  # controlling terminal when one exists, and an empty stdin otherwise (the
+  # collector then reports "no interactive terminal" and names the manual
+  # command instead of guessing).
+  if ( : </dev/tty ) 2>/dev/null; then
+    "$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL" </dev/tty
+  else
+    "$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL" </dev/null
+  fi
 fi

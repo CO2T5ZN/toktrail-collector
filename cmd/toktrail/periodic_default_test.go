@@ -21,7 +21,7 @@ package main
 //     (never zeroed) and stops the rotation without spinning (a bounded
 //     number of server preflights);
 //   - periodicUploadPlan arms 100 POSTs inside a deadline of exactly
-//     the effective --sync-timeout window (2 minutes by default; an
+//     the effective --sync-timeout window (20 minutes by default; an
 //     explicit 5m / 30s widens or narrows it), keeps the explicit
 //     legacy bound unbudgeted, and combines explicit totals with the
 //     fair rotation.
@@ -657,12 +657,12 @@ func TestRunPeriodicPausedQueueKeepsPendingNoSpin(t *testing.T) {
 
 // TestPeriodicUploadPlanMatrix pins the flag-to-budget decision table
 // and the §6.2 default window: the default profile arms exactly 100
-// shared POSTs inside a deadline of the effective --sync-timeout (2
+// shared POSTs inside a deadline of the effective --sync-timeout (20
 // minutes by default — an explicit 5m or 30s value moves the deadline
 // with it), the explicit legacy bound alone stays unbudgeted, and an
 // explicit total arms the fair rotation in both shapes.
 func TestPeriodicUploadPlanMatrix(t *testing.T) {
-	t.Run("default_arms_100_posts_and_2_minute_window", func(t *testing.T) {
+	t.Run("default_arms_100_posts_and_default_window", func(t *testing.T) {
 		cur := time.Date(2026, 10, 31, 4, 0, 0, 0, time.UTC)
 		now := func() time.Time { return cur }
 		budget, fair := periodicUploadPlan(now, false, 0, collection.DefaultSharedPOSTWindow)
@@ -674,12 +674,12 @@ func TestPeriodicUploadPlanMatrix(t *testing.T) {
 		}
 		ctx := context.Background()
 		// Just inside the window: reserves are granted.
-		cur = time.Date(2026, 10, 31, 4, 1, 59, 0, time.UTC)
+		cur = time.Date(2026, 10, 31, 4, 19, 59, 0, time.UTC)
 		if err := budget.Reserve(ctx, "device"); err != nil {
-			t.Fatalf("a reserve inside the 2-minute window must be granted, got %v", err)
+			t.Fatalf("a reserve inside the default window must be granted, got %v", err)
 		}
 		// At and past the window: the deadline declines.
-		cur = time.Date(2026, 10, 31, 4, 2, 0, 0, time.UTC)
+		cur = time.Date(2026, 10, 31, 4, 20, 0, 0, time.UTC)
 		if err := budget.Reserve(ctx, "device"); !errors.Is(err, syncbudget.ErrDeadlineExceeded) {
 			t.Fatalf("a reserve at the elapsed window must decline with the deadline sentinel, got %v", err)
 		}

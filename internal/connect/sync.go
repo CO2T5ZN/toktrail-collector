@@ -791,6 +791,7 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 		CursorDrainOnly:       opt.CursorFreshlyEnabled || opt.CursorFirstSyncFailed != "",
 		CaptureSyncedBatchIDs: opt.CaptureResyncSnapshot,
 		Progress:              opt.Progress,
+		MaxParallelScans:      collection.DefaultMaxParallelScans,
 	}
 	if collectOpts.Cursor != nil {
 		collectOpts.Cursor.Budget = budget

@@ -627,7 +627,7 @@ func decimalOrNil(v *uint64) any {
 }
 
 func Adapter() adapter.Adapter {
-	return adapter.Adapter{Source: adapter.ClaudeCodeJSONLSource, Description: "Claude Code session JSONL", Load: Load, ValidateCommit: func(stateDir string) error {
+	return adapter.Adapter{Source: adapter.ClaudeCodeJSONLSource, Description: "Claude Code session JSONL", Load: LoadResuming, ValidateCommit: func(stateDir string) error {
 		if strings.TrimSpace(stateDir) == "" {
 			return nil
 		}

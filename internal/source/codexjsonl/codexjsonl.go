@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"toktrail-collector/internal/local/scanledger"
 	"toktrail-collector/internal/source/adapter"
 	"toktrail-collector/internal/source/jsonl"
 )
@@ -389,9 +390,67 @@ func codexDelta(prev, cur codexUsage) (codexUsage, bool) {
 	return codexUsage{Input: cur.Input - prev.Input, CacheRead: cur.CacheRead - prev.CacheRead, CacheWrite: cur.CacheWrite - prev.CacheWrite, Output: cur.Output - prev.Output}, true
 }
 
+// loadRecordsResuming is the production loader: it skips files whose
+// content is byte-identical to what a previous run already exported.
+//
+// A real Codex history is gigabytes of JSONL. Re-decoding all of it every
+// scheduled run is what made a periodic run expire before it reached an
+// export commit, so unchanged files contribute nothing but their state. A
+// skip is content-proven (whole-file SHA-256, see internal/local/scanledger)
+// and never relies on the modification time; any file whose digest differs,
+// or that cannot be digested, is parsed exactly as before.
+//
+// The returned ScanStates let the caller advance the ledger only after this
+// scan's records are committed, so a failed export can never cause a file to
+// be skipped with its records still unexported.
+func loadRecordsResuming(opt adapter.Options) (adapter.LoadResult, error) {
+	ctx := opt.ContextOrBackground()
+	paths, err := jsonl.FilesContext(ctx, opt.Input, jsonl.Options{})
+	if err != nil {
+		return adapter.LoadResult{}, err
+	}
+	var prior map[string]scanledger.FileState
+	if strings.TrimSpace(opt.StateDir) != "" {
+		if loaded, _, lerr := scanledger.New(opt.StateDir).Load(adapter.CodexJSONLSource); lerr == nil {
+			prior = loaded
+		}
+	}
+	states := make(map[string]scanledger.FileState, len(paths))
+	var records []adapter.Record
+	log := &codexIssueLog{}
+	for _, file := range paths {
+		if err := ctx.Err(); err != nil {
+			return adapter.LoadResult{}, err
+		}
+		current, unchanged, derr := scanledger.Inspect(file, prior)
+		if derr == nil && unchanged {
+			// Already exported, and provably unchanged: no records.
+			states[file] = current
+			continue
+		}
+		fileRecords, ferr := loadCodexJSONLFile(ctx, file, log)
+		if ferr != nil {
+			return adapter.LoadResult{}, ferr
+		}
+		records = append(records, fileRecords...)
+		if derr == nil {
+			states[file] = current
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		a := adapter.StringField(records[i], "occurredAt")
+		b := adapter.StringField(records[j], "occurredAt")
+		if a == b {
+			return adapter.StringField(records[i], "recordKey") < adapter.StringField(records[j], "recordKey")
+		}
+		return a < b
+	})
+	return adapter.LoadResult{Records: records, Issues: log.issues, ScanStates: states}, nil
+}
+
 func Adapter() adapter.Adapter {
 	return adapter.Adapter{Source: adapter.CodexJSONLSource, Description: "Codex session JSONL", Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-		return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
+		return loadRecordsResuming(opt)
 	}, FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
 		ctx := opt.ContextOrBackground()
 		if err := ctx.Err(); err != nil {

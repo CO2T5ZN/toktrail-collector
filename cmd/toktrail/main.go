@@ -445,7 +445,7 @@ func formatOptionalUint(v *uint64) string {
 // drains the device outbox and the account cursor queue in fair rotation
 // (one batch per queue per turn) until both queues are exhausted, a turn
 // makes no progress, the run is cancelled, or the shared budget of 100
-// POSTs within the --sync-timeout window (2 minutes by default) declines
+// POSTs within the --sync-timeout window (20 minutes by default) declines
 // — a decline with work left exits non-zero as an incomplete run.
 // ---------------------------------------------------------------------------
 
@@ -509,8 +509,9 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	stateDir := fs.String("state-dir", env("TOKTRAIL_HOME", ""), "local TokTrail state directory")
 	maxBatches := fs.Int("max-batches", collection.DefaultMaxSyncBatches, "max pending batches to upload per active queue per run (an explicit legacy bound; the default run instead drains until the shared upload budget stops it)")
 	maxTotalBatches := fs.Int("max-total-batches", 0, "max total ingest batch uploads shared across the device and cursor queues this run; when the budget is exhausted with work left, the run reports incomplete and exits non-zero (0=unset)")
-	syncTimeout := fs.Duration("sync-timeout", collection.DefaultSharedPOSTWindow, "overall periodic run timeout; the default shared upload budget's deadline follows this value (§6.2 default: 2 minutes)")
+	syncTimeout := fs.Duration("sync-timeout", collection.DefaultSharedPOSTWindow, "overall periodic run timeout, covering the source scan and the uploads; the default shared upload budget's deadline follows this value (§6.2 default: 20 minutes)")
 	drainOnly := fs.Bool("drain-only", false, "only drain existing device outbox batches; do not refresh grants, scan sources, or run account sources")
+	parallelScans := fs.Int("max-parallel-scans", collection.DefaultMaxParallelScans, "how many granted sources are read and parsed at the same time (filtering and uploads stay serialized; 1 = one at a time)")
 	progressJSON := fs.Bool("progress-json", false, "emit collection progress events as JSON Lines on stderr")
 	verbose := fs.Bool("verbose", false, "print the detailed per-phase run log (counts and closed status codes only; never credentials, URLs, tickets or raw records) instead of the default one-line status summary")
 	jsonOut := fs.Bool("json", false, "print the run's stable §6.5 result (stop_reason and phase counts) as a single JSON object on stdout; human output moves to stderr")
@@ -582,12 +583,25 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 	//     they are machine events and the default output stays one
 	//     line; only heartbeat events render, throttled).
 	var progress func(collection.ProgressEvent)
+	var heartbeat *periodicHumanHeartbeat
 	if *progressJSON {
 		progress = writeCollectionProgressJSON(stderrSink)
 	} else {
-		progress = newPeriodicHumanHeartbeat(human, started, time.Now).handle
+		// A terminal gets a single in-place status line; a redirected
+		// stream (the scheduled task's log, CI, a pipe) gets no periodic
+		// chatter at all beyond one low-frequency stall notice, so logs
+		// stay readable instead of filling with repeated "Still running"
+		// lines every thirty seconds.
+		heartbeat = newPeriodicHumanHeartbeatFor(human, started, time.Now, isTerminalWriter(stdout))
+		progress = heartbeat.handle
 	}
-	result, runErr, ctxErr, ran := runPeriodicRound(fs, human, progress, *serverURL, *stateDir, *maxBatches, *maxTotalBatches, *syncTimeout, *drainOnly, *verbose)
+	result, runErr, ctxErr, ran := runPeriodicRound(fs, human, progress, *serverURL, *stateDir, *maxBatches, *maxTotalBatches, *parallelScans, *syncTimeout, *drainOnly, *verbose)
+	if heartbeat != nil {
+		// Close the in-place status line before the summary is rendered:
+		// the summary must start on its own line, never appended to a
+		// half-finished progress line.
+		heartbeat.Close()
+	}
 	// One summary feeds both surfaces, so the concise human line and
 	// the --json verdict can never disagree: the classification is the
 	// closed-set walk (stop_reason, observation bits), never err==nil.
@@ -637,7 +651,7 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 // the collection round actually started (false for the pre-run
 // failures, so the summary reports not_run instead of a drained
 // queue).
-func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collection.ProgressEvent), serverURL, stateDir string, maxBatches, maxTotalBatches int, syncTimeout time.Duration, drainOnly, verbose bool) (collection.Result, error, error, bool) {
+func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collection.ProgressEvent), serverURL, stateDir string, maxBatches, maxTotalBatches, maxParallelScans int, syncTimeout time.Duration, drainOnly, verbose bool) (collection.Result, error, error, bool) {
 	if syncTimeout <= 0 {
 		err := fmt.Errorf("--sync-timeout must be positive")
 		return collection.Result{}, safeDisplayError(err, err.Error()), nil, false
@@ -705,6 +719,7 @@ func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collectio
 		Retry:            retry,
 		CollectorVersion: version,
 		Progress:         progress,
+		MaxParallelScans: maxParallelScans,
 	}
 	// Only an explicitly passed legacy bound reaches the collection: the
 	// flag's default value must not cap the fair drain.
@@ -1138,10 +1153,15 @@ func periodicPendingClause(drain collection.DrainSummary, account collection.Acc
 	if drain.PendingObserved && !account.PendingObserved {
 		if account.Outcome == cursorsync.RoundAbsent {
 			if drainOnly {
+				// A drain-only run never refreshes grants or scans the
+				// granted sources, so an empty device queue says nothing
+				// about whether new local records exist. The wording must
+				// not let "nothing pending" read as "collection is up to
+				// date".
 				if drain.PendingRemaining == 0 {
-					return "nothing pending (drain-only; the cursor queue was not read)"
+					return "device queue empty, nothing was scanned and the account queue was not read (drain-only)"
 				}
-				return fmt.Sprintf("%s pending (drain-only; the cursor queue was not read)", pluralBatches(drain.PendingRemaining))
+				return fmt.Sprintf("%s pending (drain-only; nothing was scanned and the account queue was not read)", pluralBatches(drain.PendingRemaining))
 			}
 			// An absent account round WITHOUT the drain-only flag: the
 			// mode is not inferable from the outcome, so the wording
@@ -1200,10 +1220,37 @@ type periodicHumanHeartbeat struct {
 	last     time.Time
 	now      func() time.Time
 	interval time.Duration
+	// inPlace renders the status on one terminal line (carriage return +
+	// clear-to-end-of-line) instead of appending a new line per update.
+	inPlace  bool
+	lineOpen bool
+	lineLen  int
 }
 
 func newPeriodicHumanHeartbeat(out io.Writer, started time.Time, now func() time.Time) *periodicHumanHeartbeat {
 	return &periodicHumanHeartbeat{out: out, started: started, now: now, interval: periodicHumanHeartbeatInterval}
+}
+
+// newPeriodicHumanHeartbeatFor wires the heartbeat for the real output
+// stream. A terminal refreshes one in-place line every few seconds; a
+// redirected stream (scheduled-task log, CI, pipe) prints only a
+// low-frequency stall notice, because a log gains nothing from a
+// repeated "still running" line every thirty seconds.
+func newPeriodicHumanHeartbeatFor(out io.Writer, started time.Time, now func() time.Time, tty bool) *periodicHumanHeartbeat {
+	if tty {
+		return &periodicHumanHeartbeat{out: out, started: started, now: now, interval: 5 * time.Second, inPlace: true}
+	}
+	return &periodicHumanHeartbeat{out: out, started: started, now: now, interval: 10 * time.Minute}
+}
+
+// Close finishes an in-place status line so the caller's next output
+// starts on a fresh line. It is safe to call when nothing was rendered.
+func (h *periodicHumanHeartbeat) Close() {
+	if h == nil || !h.lineOpen {
+		return
+	}
+	fmt.Fprint(h.out, "\n")
+	h.lineOpen = false
 }
 
 // handle is the progress callback: every non-heartbeat event is
@@ -1232,7 +1279,11 @@ func (h *periodicHumanHeartbeat) handle(event collection.ProgressEvent) {
 // is completed first and the heartbeat never shares a line.
 func (h *periodicHumanHeartbeat) render(event collection.ProgressEvent, now time.Time) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%s] Still running: %s elapsed", now.Format("2006-01-02 15:04:05"), formatDurationWords(now.Sub(h.started)))
+	if h.inPlace {
+		fmt.Fprintf(&b, "Still running: %s elapsed", formatDurationWords(now.Sub(h.started)))
+	} else {
+		fmt.Fprintf(&b, "[%s] Still running: %s elapsed", now.Format("2006-01-02 15:04:05"), formatDurationWords(now.Sub(h.started)))
+	}
 	if event.Stage != "" {
 		fmt.Fprintf(&b, ", %s", heartbeatStagePhrase(event.Stage))
 	}
@@ -1250,6 +1301,16 @@ func (h *periodicHumanHeartbeat) render(event collection.ProgressEvent, now time
 		}
 	} else {
 		b.WriteString(", pending unknown")
+	}
+	if h.inPlace {
+		// One terminal line: rewrite it in place. The timestamp is
+		// omitted (the line is continuously visible) and the previous
+		// longer line is cleared so no stale tail remains.
+		text := b.String()
+		fmt.Fprintf(h.out, "\r\x1b[K%s", text)
+		h.lineOpen = true
+		h.lineLen = len(text)
+		return
 	}
 	b.WriteString(".\n")
 	line := []byte(b.String())

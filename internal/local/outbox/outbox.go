@@ -53,6 +53,12 @@ type BatchEntry struct {
 	// changed without a revision bump (a server anomaly): the collector
 	// fails closed instead of reorganizing in a loop at one revision.
 	OriginConsentRevision int64 `json:"originConsentRevision,omitempty"`
+	// OldestRecordAt/NewestRecordAt bound the contained records' occurredAt
+	// times. They let the drain give recent data priority; older entries
+	// written before this field existed simply have no window and keep the
+	// historical oldest-first order.
+	OldestRecordAt time.Time `json:"oldestRecordAt,omitempty"`
+	NewestRecordAt time.Time `json:"newestRecordAt,omitempty"`
 }
 
 type AddBatchOptions struct {
@@ -64,6 +70,10 @@ type AddBatchOptions struct {
 	// OriginConsentRevision is set for batches created by a scope
 	// reorganization or quarantine recovery; zero for fresh exports.
 	OriginConsentRevision int64
+	// OldestRecordAt/NewestRecordAt are the exported records' occurredAt
+	// bounds (zero when unknown).
+	OldestRecordAt time.Time
+	NewestRecordAt time.Time
 }
 
 type Receipt struct {
@@ -123,6 +133,8 @@ func (s Store) AddPending(opt AddBatchOptions) (BatchEntry, error) {
 		Status:                StatusPending,
 		CreatedAt:             now,
 		OriginConsentRevision: opt.OriginConsentRevision,
+		OldestRecordAt:        opt.OldestRecordAt.UTC(),
+		NewestRecordAt:        opt.NewestRecordAt.UTC(),
 	}
 	if entry.BatchID == "" {
 		return BatchEntry{}, errors.New("missing batch id")
@@ -142,6 +154,10 @@ func (s Store) AddPending(opt AddBatchOptions) (BatchEntry, error) {
 			out.Batches[idx].Source = entry.Source
 			out.Batches[idx].Input = entry.Input
 			out.Batches[idx].RecordCount = entry.RecordCount
+			if !entry.NewestRecordAt.IsZero() {
+				out.Batches[idx].OldestRecordAt = entry.OldestRecordAt
+				out.Batches[idx].NewestRecordAt = entry.NewestRecordAt
+			}
 			out.Batches[idx].Status = StatusPending
 			out.Batches[idx].SyncedAt = time.Time{}
 			out.Batches[idx].ReceiptStatus = ""
@@ -170,6 +186,22 @@ func (s Store) NextPending() (BatchEntry, bool, error) {
 	}
 	for _, entry := range out.Batches {
 		if entry.Status == StatusPending {
+			return entry, true, nil
+		}
+	}
+	return BatchEntry{}, false, nil
+}
+
+// PendingByID returns the named pending batch. It lets a caller that already
+// chose a batch (for example by the drain's recent-data priority) hand that
+// exact choice to an uploader that would otherwise reselect the oldest one.
+func (s Store) PendingByID(batchID string) (BatchEntry, bool, error) {
+	out, err := s.Load()
+	if err != nil {
+		return BatchEntry{}, false, err
+	}
+	for _, entry := range out.Batches {
+		if entry.BatchID == strings.TrimSpace(batchID) && entry.Status == StatusPending {
 			return entry, true, nil
 		}
 	}

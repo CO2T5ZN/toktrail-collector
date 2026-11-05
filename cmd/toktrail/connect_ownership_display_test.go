@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"toktrail-collector/internal/connect"
+	"toktrail-collector/internal/syncbudget"
+	"toktrail-collector/internal/syncretry"
 )
 
 // The ownership fail-closed refusals must surface actionable guidance
@@ -58,5 +61,49 @@ func TestStateReplaceConfirmForForcedAndInteractive(t *testing.T) {
 	interactive := stateReplaceConfirmFor(false, nil)
 	if interactive == nil {
 		t.Fatal("without the flag the interactive prompt must be wired, not nil")
+	}
+}
+
+// netErrorProbe is a minimal net.Error for classification tests.
+type netErrorProbe struct {
+	msg     string
+	timeout bool
+}
+
+func (e netErrorProbe) Error() string   { return e.msg }
+func (e netErrorProbe) Timeout() bool   { return e.timeout }
+func (e netErrorProbe) Temporary() bool { return e.timeout }
+
+// The run's own deadline is not a network fault: the device may be
+// perfectly reachable, and telling the user to check connectivity sent
+// them to debug a healthy server. Every deadline shape maps to the
+// time-limit wording, and only genuine transport failures map to the
+// unreachable wording.
+func TestRunFailureDisplayTextClassifiesDeadlineAndNetwork(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"run context deadline", fmt.Errorf("sync: %w", context.DeadlineExceeded), "time limit was reached"},
+		{"shared budget deadline", fmt.Errorf("drain: %w", syncbudget.ErrDeadlineExceeded), "time limit was reached"},
+		{"retry past deadline", fmt.Errorf("upload: %w", syncretry.ErrRetryPastDeadline), "time limit was reached"},
+		{"single request timeout", fmt.Errorf("post: %w", netErrorProbe{msg: "i/o timeout", timeout: true}), "request timed out"},
+		{"dial failure", fmt.Errorf("post: %w", netErrorProbe{msg: "connection refused"}), "could not be reached"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runFailureDisplayText(tc.err, "generic fallback")
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("classification = %q, want it to contain %q", got, tc.want)
+			}
+			if tc.want == "time limit was reached" && strings.Contains(got, "could not be reached") {
+				t.Fatalf("a run deadline must never be reported as an unreachable server: %q", got)
+			}
+		})
+	}
+	// An unclassified error keeps the closed-set fallback.
+	if got := runFailureDisplayText(errors.New("opaque"), "generic fallback"); got != "generic fallback" {
+		t.Fatalf("unclassified errors keep the fallback, got %q", got)
 	}
 }

@@ -41,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"toktrail-collector/internal/app/cursorsync"
@@ -48,9 +49,11 @@ import (
 	"toktrail-collector/internal/local/cursorsource"
 	"toktrail-collector/internal/local/exportcommit"
 	"toktrail-collector/internal/local/grants"
+	"toktrail-collector/internal/local/knowncache"
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/runlock"
+	"toktrail-collector/internal/local/scanledger"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
 	"toktrail-collector/internal/source/pipeline"
@@ -59,6 +62,13 @@ import (
 	synccmd "toktrail-collector/internal/syncclient"
 	"toktrail-collector/internal/syncretry"
 )
+
+// DefaultMaxParallelScans bounds how many granted sources a collection round
+// reads and parses at the same time. Parsing dominates a first scan and is
+// read-only; filtering and commits stay serialized, so this only overlaps
+// work that cannot race. Three covers the three bundled local sources without
+// letting a device with many grants multiply peak memory.
+const DefaultMaxParallelScans = 3
 
 // DefaultMaxSyncBatches bounds one periodic run's drain so a large backlog
 // cannot make a scheduled task run unbounded; the next scheduled run
@@ -78,7 +88,19 @@ const DefaultSharedPOSTBudget = 100
 // budget, measured from the start of the periodic run: once it elapses,
 // every further reserve declines with syncbudget.ErrDeadlineExceeded and
 // a run with work left reports itself incomplete instead of running on.
-const DefaultSharedPOSTWindow = 2 * time.Minute
+//
+// The window also bounds the run context (main.go wires the same value),
+// so it covers the local source scan as well as the uploads. That is why
+// it is deliberately far above the old two minutes: a real history
+// directory produced a scan that could not finish in 120s, and an expired
+// window aborted the run before any export commit, leaving the next run
+// to repeat the same work. The window must therefore be large enough for
+// a real scan to reach its first export commit; a run that still cannot
+// finish reports its incomplete state and is continued by the next tick.
+// The value stays a finite guard against a pathological run (a hung
+// source, endless retries) and below the default 30-minute schedule
+// interval, so one run never collides with the next tick's lock.
+const DefaultSharedPOSTWindow = 20 * time.Minute
 
 // ErrRecordsRejected reports a settled-but-incomplete upload: a drained
 // batch's server receipt counted rejected records even though the upload
@@ -109,7 +131,13 @@ type Options struct {
 	StateDir   string
 	ServerURL  string
 	MaxBatches int
-	HTTPClient *http.Client
+	// MaxParallelScans bounds how many granted sources are read and parsed
+	// concurrently. Filtering (which may rewrite the quarantine store) and
+	// every export commit stay serialized in grant order, so this only
+	// overlaps the parsing work. 0 and 1 both mean "one source at a time",
+	// the historical behavior.
+	MaxParallelScans int
+	HTTPClient       *http.Client
 	// Budget, when set, limits actual device ingest POST attempts shared
 	// with other queues in the run.
 	Budget *syncbudget.Budget
@@ -714,42 +742,129 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 		historyFrom = devState.HistoryFrom
 	}
 
+	// Scan preparation runs in two stages so the expensive parsing can
+	// overlap without touching shared state:
+	//   1. classify the grants, then read+parse the eligible ones
+	//      concurrently (pipeline.LoadSource is read-only);
+	//   2. filter, commit and record each grant strictly in grant order
+	//      (filtering may rewrite the quarantine store, and commits must
+	//      stay deterministic).
+	// A single eligible grant, or MaxParallelScans<=1, keeps the original
+	// one-at-a-time path exactly.
+	type scanItem struct {
+		grant    grants.Grant
+		output   string
+		batchID  string
+		outcome  GrantOutcome
+		eligible bool
+		loaded   adapter.LoadResult
+		loadErr  error
+	}
+	items := make([]scanItem, len(enabledGrants))
+	var eligibleIdx []int
 	for idx, grant := range enabledGrants {
 		if err := ctx.Err(); err != nil {
 			return res, fmt.Errorf("collection stopped before source scan: %w", err)
 		}
-		outcome := GrantOutcome{Source: grant.Source, Input: grant.Input}
+		item := scanItem{grant: grant, outcome: GrantOutcome{Source: grant.Source, Input: grant.Input}}
 		if !policy.SourceAllowed(grant.Source) {
-			outcome.Skipped = "source not allowed by the server grant scope for this device"
-			outcome.Code = GrantNotAllowed
-			res.GrantOutcomes = append(res.GrantOutcomes, outcome)
+			item.outcome.Skipped = "source not allowed by the server grant scope for this device"
+			item.outcome.Code = GrantNotAllowed
+			items[idx] = item
 			continue
 		}
 		// Re-validate the granted input before reading it: the filesystem
 		// may have changed since the grant was recorded. A missing input
 		// skips that grant without failing the whole run.
 		if err := grants.ValidateInput(grant.Input); err != nil {
-			outcome.Skipped = fmt.Sprintf("input not accessible: %v", err)
-			outcome.Code = GrantInputInaccessible
-			res.GrantOutcomes = append(res.GrantOutcomes, outcome)
+			item.outcome.Skipped = fmt.Sprintf("input not accessible: %v", err)
+			item.outcome.Code = GrantInputInaccessible
+			items[idx] = item
 			continue
 		}
-		batchID, err := newBatchID(now, idx)
-		if err != nil {
-			return res, err
+		batchID, berr := newBatchID(now, idx)
+		if berr != nil {
+			return res, berr
 		}
-		output := filepath.Join(stateDir, "batches", batchID+".json")
+		item.batchID = batchID
+		item.output = filepath.Join(stateDir, "batches", batchID+".json")
+		item.eligible = true
+		items[idx] = item
+		eligibleIdx = append(eligibleIdx, idx)
+	}
+	// One recovery for the whole scan: adapters read the message baselines
+	// and the quarantine store, so a half-applied filter transaction must be
+	// completed before any of them loads.
+	if err := pipeline.RecoverPendingFilter(stateDir); err != nil {
+		return res, err
+	}
+	parallel := opt.MaxParallelScans > 1 && len(eligibleIdx) > 1
+	if parallel {
+		emitter.EnterStage("source_scan")
+		width := opt.MaxParallelScans
+		if width > len(eligibleIdx) {
+			width = len(eligibleIdx)
+		}
+		sem := make(chan struct{}, width)
+		var wg sync.WaitGroup
+		for _, idx := range eligibleIdx {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					items[idx].loadErr = ctx.Err()
+					return
+				}
+				defer func() { <-sem }()
+				items[idx].loaded, items[idx].loadErr = pipeline.LoadSource(adapter.Options{
+					Context:  ctx,
+					Source:   items[idx].grant.Source,
+					Input:    items[idx].grant.Input,
+					StateDir: stateDir,
+				})
+			}(idx)
+		}
+		wg.Wait()
+	}
+
+	for idx := range items {
+		item := &items[idx]
+		grant := item.grant
+		if !item.eligible {
+			res.GrantOutcomes = append(res.GrantOutcomes, item.outcome)
+			continue
+		}
+		outcome := item.outcome
 		sourceStart, sourceWall := startProgress(progress, "source_scan", grant.Source, grant.Input)
 		emitter.EnterStage("source_scan")
-		prepared, err := pipeline.PrepareExport(adapter.Options{
-			Context:     ctx,
-			Source:      grant.Source,
-			Input:       grant.Input,
-			Output:      output,
-			BatchID:     batchID,
-			StateDir:    stateDir,
-			HistoryFrom: historyFrom,
-		})
+		var prepared pipeline.PreparedExport
+		var err error
+		if parallel {
+			err = item.loadErr
+			if err == nil {
+				prepared, err = pipeline.PrepareFromLoaded(adapter.Options{
+					Context:     ctx,
+					Source:      grant.Source,
+					Input:       grant.Input,
+					Output:      item.output,
+					BatchID:     item.batchID,
+					StateDir:    stateDir,
+					HistoryFrom: historyFrom,
+				}, item.loaded)
+			}
+		} else {
+			prepared, err = pipeline.PrepareExport(adapter.Options{
+				Context:     ctx,
+				Source:      grant.Source,
+				Input:       grant.Input,
+				Output:      item.output,
+				BatchID:     item.batchID,
+				StateDir:    stateDir,
+				HistoryFrom: historyFrom,
+			})
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, err, ProgressEvent{})
@@ -764,6 +879,14 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 		if prepared.Records == 0 {
 			outcome.Skipped = "no new records since the last confirmed baselines"
 			outcome.Code = GrantNoNewRecords
+			// Nothing was exported because nothing new exists: every
+			// considered file is either unchanged since its records were
+			// committed or yields no records at all, so recording the
+			// observed states is safe and lets the next scan skip them.
+			if err := saveScanStates(stateDir, grant.Source, prepared.ScanStates); err != nil {
+				endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, err, ProgressEvent{})
+				return res, fmt.Errorf("save scan state for source %s: %w", grant.Source, err)
+			}
 			endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, nil, ProgressEvent{})
 			res.GrantOutcomes = append(res.GrantOutcomes, outcome)
 			continue
@@ -791,12 +914,28 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 				endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, err, ProgressEvent{})
 				return res, fmt.Errorf("commit export for source %s: %w", grant.Source, err)
 			}
+			// Extend the known-record cache with the batch just written, so
+			// the next scan does not have to re-read and re-canonicalise
+			// every historical batch file. A failure here is not fatal: the
+			// loader validates the cache against the outbox and rebuilds
+			// when it does not cover it.
+			if payload, rerr := os.ReadFile(committed.Output); rerr == nil {
+				_ = knowncache.AppendCommittedBatch(stateDir, grant.Source, committed.BatchID, payload)
+			}
 			outcome.Exported = true
 			outcome.Code = GrantExported
 			outcome.BatchID = committed.BatchID
 			outcome.Records += committed.Records
 			res.ExportedBatches++
 			res.ExportedRecords += committed.Records
+		}
+		// Every record this scan produced is committed now, so the files'
+		// content states may be advanced: the next scan skips them until
+		// their content changes. Advancing BEFORE the commit would drop
+		// records whenever an export failed, so it happens strictly after.
+		if err := saveScanStates(stateDir, grant.Source, prepared.ScanStates); err != nil {
+			endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, err, ProgressEvent{})
+			return res, fmt.Errorf("save scan state for source %s: %w", grant.Source, err)
 		}
 		endProgress(progress, "source_scan", grant.Source, grant.Input, sourceStart, sourceWall, nil, ProgressEvent{
 			ExportedBatches: len(chunks),
@@ -1242,6 +1381,57 @@ func newDeviceQueueDrain(res *Result, opt Options) *deviceQueueDrain {
 	}
 }
 
+// recentRecordWindow is how far back a batch's newest record may be for the
+// drain to treat it as current. It matches the leaderboard's 30-day view: data
+// a user can still see there should not wait behind older history.
+const recentRecordWindow = 30 * 24 * time.Hour
+
+// selectPendingBatch chooses the next device batch to upload.
+//
+// Ordering rules, in priority:
+//   - preferOldest forces the globally oldest pending batch (the
+//     anti-starvation turn);
+//   - otherwise a pending batch whose newest record falls inside
+//     recentWindow wins, newest data first;
+//   - otherwise the oldest pending batch (the historical order).
+//
+// Batches written before the record window existed carry no timestamps and
+// are therefore never "recent": they keep the historical oldest-first order
+// instead of being reordered by a guess.
+func selectPendingBatch(entries []outbox.BatchEntry, now time.Time, recentWindow time.Duration, preferOldest bool) (outbox.BatchEntry, bool) {
+	var pending []outbox.BatchEntry
+	for _, entry := range entries {
+		if entry.Status == outbox.StatusPending {
+			pending = append(pending, entry)
+		}
+	}
+	if len(pending) == 0 {
+		return outbox.BatchEntry{}, false
+	}
+	oldest := pending[0]
+	if preferOldest || recentWindow <= 0 {
+		return oldest, true
+	}
+	var best outbox.BatchEntry
+	found := false
+	for _, entry := range pending {
+		if entry.NewestRecordAt.IsZero() {
+			continue
+		}
+		if now.Sub(entry.NewestRecordAt) > recentWindow {
+			continue
+		}
+		if !found || entry.NewestRecordAt.After(best.NewestRecordAt) {
+			best = entry
+			found = true
+		}
+	}
+	if found {
+		return best, true
+	}
+	return oldest, true
+}
+
 // canStep reports whether the bound still allows another attempted
 // upload.
 func (d *deviceQueueDrain) canStep() bool {
@@ -1262,10 +1452,15 @@ func (d *deviceQueueDrain) nowFn() func() time.Time {
 // reorganization, or a recovery that re-pended records); a no-progress
 // step always marks the stepper finished, so no caller can spin on it.
 func (d *deviceQueueDrain) step(ctx context.Context) (progressed bool, err error) {
-	entry, ok, err := d.ledger.NextPending()
+	ledger, err := d.ledger.Load()
 	if err != nil {
 		return false, err
 	}
+	// Recent data first, oldest first every fourth upload: a device that
+	// rejoins with a large old backlog otherwise keeps today's usage queued
+	// behind hundreds of historical batches, while pure newest-first would
+	// starve the backlog whenever new data keeps arriving.
+	entry, ok := selectPendingBatch(ledger.Batches, d.nowFn()(), recentRecordWindow, d.uploads%4 == 3)
 	if !ok {
 		entries, qErr := quarantine.New(d.stateDir).Load()
 		if qErr != nil {
@@ -1359,13 +1554,14 @@ func (d *deviceQueueDrain) step(ctx context.Context) (progressed bool, err error
 	// this round's emitter; the heartbeat sees the attempt as in flight.
 	d.opt.emitter.BeginAttempt(ProgressQueueDevice)
 	syncResult, err := synccmd.Run(ctx, statedir.New(d.stateDir), synccmd.Options{
-		StateDir:    d.stateDir,
-		ServerURL:   d.opt.ServerURL,
-		HTTPClient:  d.opt.HTTPClient,
-		Budget:      d.opt.Budget,
-		BudgetQueue: "device",
-		Retry:       d.opt.Retry,
-		Progress:    deviceAttemptEvents(d.opt.emitter, entry.OriginConsentRevision != 0),
+		StateDir:      d.stateDir,
+		ServerURL:     d.opt.ServerURL,
+		HTTPClient:    d.opt.HTTPClient,
+		Budget:        d.opt.Budget,
+		BudgetQueue:   "device",
+		Retry:         d.opt.Retry,
+		PreferBatchID: entry.BatchID,
+		Progress:      deviceAttemptEvents(d.opt.emitter, entry.OriginConsentRevision != 0),
 	})
 	d.opt.emitter.EndAttempt()
 	d.res.Recovered += syncResult.Recovered
@@ -1854,4 +2050,14 @@ func newBatchID(now func() time.Time, grantIndex int) (string, error) {
 		return "", fmt.Errorf("generate batch id: %w", err)
 	}
 	return fmt.Sprintf("local-%s-%02d-%s", now().UTC().Format("20060102T150405Z"), grantIndex, hex.EncodeToString(buf[:])), nil
+}
+
+// saveScanStates persists the per-file content states a resumed scan
+// observed, AFTER that source's records were committed. It is a no-op for a
+// loader that reports no states (every source but the incremental ones).
+func saveScanStates(stateDir, source string, states map[string]scanledger.FileState) error {
+	if len(states) == 0 {
+		return nil
+	}
+	return scanledger.New(stateDir).Save(source, states)
 }

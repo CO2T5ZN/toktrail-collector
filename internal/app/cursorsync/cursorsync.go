@@ -28,10 +28,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/cursor/accountsource"
 	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/cursor/auth"
@@ -1870,25 +1870,22 @@ func Logout(opt Options, purge bool) (removedLicense, purgedCache bool, err erro
 	return removedLicense, purgedCache, nil
 }
 
-// DefaultConfirm prints the notice and reads a y/N answer from stdin. A
-// closed or non-interactive stdin fails with a clear message so an
+// DefaultConfirm prints the notice and reads a y/N answer from the
+// controlling terminal (internal/console). Reading the terminal — not
+// stdin — matters because the documented install runs the collector from
+// a `curl … | sh` pipeline: stdin then carries the install script, and a
+// prompt that read it would see EOF, or under incrementally parsing
+// shells the next script line, instead of the user's answer. Without a
+// terminal the call fails with console.ErrNoInteractiveTerminal, so an
 // unattended run can never complete the first-time confirmation by
-// itself. The answer read is strictly bounded (a confirmation is a few
-// bytes; anything longer is refused without echoing it) and only an
-// explicit yes/y confirms.
+// itself and a caller can tell "not confirmed" apart from "declined".
+// Only an explicit yes/y confirms.
 func DefaultConfirm(notice string, out io.Writer) (bool, error) {
+	if out == nil {
+		out = io.Discard
+	}
 	fmt.Fprintln(out, notice)
-	fmt.Fprint(out, "Enable Cursor usage collection on this machine? [y/N] ")
-	line, err := readBoundedLine(os.Stdin, 64)
-	if err != nil {
-		return false, fmt.Errorf("no interactive input available: %w", err)
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true, nil
-	default:
-		return false, nil
-	}
+	return console.Confirm(out, "Enable Cursor usage collection on this machine? [y/N] ")
 }
 
 // maxStdinTokenBytes bounds a manually supplied token: real Cursor tokens

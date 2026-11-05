@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"toktrail-collector/internal/local/progress"
+	"toktrail-collector/internal/local/scanledger"
 	"toktrail-collector/internal/source/adapter"
 )
 
@@ -24,6 +25,15 @@ type PreparedExport struct {
 	Output  string
 	Records int
 	Payload []byte
+	// OldestAt/NewestAt bound the records' occurredAt times (nil when no
+	// record carries a valid timestamp). The upload queue uses them to give
+	// recent data priority without ever reordering the batches themselves.
+	OldestAt *time.Time
+	NewestAt *time.Time
+	// ScanStates are the per-file content states this scan observed. They
+	// are persisted by the commit caller only after every chunk of this
+	// export is committed (see internal/local/scanledger).
+	ScanStates map[string]scanledger.FileState
 	// MessageUpdates carries the per-message pending intervals an interval
 	// source (claude-code-jsonl) produced alongside this batch; the commit
 	// transaction must persist them together with the batch.
@@ -32,11 +42,56 @@ type PreparedExport struct {
 
 func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	opt = withDefaults(opt)
-	ctx := opt.ContextOrBackground()
-	if err := ctx.Err(); err != nil {
+	if err := p.RecoverPendingFilter(opt.StateDir); err != nil {
 		return PreparedExport{}, err
 	}
+	loaded, err := p.LoadSource(opt)
+	if err != nil {
+		return PreparedExport{}, err
+	}
+	return p.PrepareFromLoaded(opt, loaded)
+}
+
+// RecoverPendingFilter completes any history-filter transaction an earlier
+// crash left half-applied. It must run BEFORE any adapter loads records
+// (adapters read the message baselines and, through their export filter, the
+// quarantine store, and both must reflect the converged post-recovery state).
+// A concurrent scan phase calls it once, sequentially, before starting its
+// workers.
+func (p *Pipeline) RecoverPendingFilter(stateDir string) error {
+	return recoverPendingFilterTxn(stateDir)
+}
+
+// LoadSource reads and parses one source without filtering. It is read-only
+// apart from an adapter's own content caches, so several sources may be
+// loaded concurrently; filtering, which may rewrite the quarantine store,
+// stays serialized in PrepareFromLoaded.
+func (p *Pipeline) LoadSource(opt adapter.Options) (adapter.LoadResult, error) {
+	opt = withDefaults(opt)
+	ctx := opt.ContextOrBackground()
+	if err := ctx.Err(); err != nil {
+		return adapter.LoadResult{}, err
+	}
 	if err := p.validateInput(opt); err != nil {
+		return adapter.LoadResult{}, err
+	}
+	loaded, err := p.registry.LoadRecordsForSource(opt)
+	if err != nil {
+		return adapter.LoadResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return adapter.LoadResult{}, err
+	}
+	return loaded, nil
+}
+
+// PrepareFromLoaded applies the source filters to an already loaded result
+// and produces the export payload. It is the state-touching half of
+// preparation (history cutoff, quarantine), so callers run it serially.
+func (p *Pipeline) PrepareFromLoaded(opt adapter.Options, loaded adapter.LoadResult) (PreparedExport, error) {
+	opt = withDefaults(opt)
+	ctx := opt.ContextOrBackground()
+	if err := ctx.Err(); err != nil {
 		return PreparedExport{}, err
 	}
 	if strings.TrimSpace(opt.Output) == "" {
@@ -46,21 +101,7 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if batchID == "" {
 		batchID = "local-" + time.Now().UTC().Format("20060102T150405Z")
 	}
-	// Complete any history-filter transaction an earlier crash left
-	// half-applied BEFORE the adapter loads records: adapters read the
-	// message baselines and (via FilterForExport) the quarantine store, and
-	// both must reflect the converged post-recovery state, not a
-	// half-applied transaction.
-	if err := recoverPendingFilterTxn(opt.StateDir); err != nil {
-		return PreparedExport{}, err
-	}
-	loaded, err := p.registry.LoadRecordsForSource(opt)
-	if err != nil {
-		return PreparedExport{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return PreparedExport{}, err
-	}
+	var err error
 	records := loaded.Records
 	plugin, _ := p.registry.Lookup(opt.Source)
 	if plugin.FilterForExport != nil {
@@ -78,6 +119,7 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 		return PreparedExport{}, err
 	}
 	valid := make([]adapter.Record, 0, len(records))
+	var oldestAt, newestAt *time.Time
 	for idx, record := range records {
 		if err := ctx.Err(); err != nil {
 			return PreparedExport{}, err
@@ -93,6 +135,16 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 			return PreparedExport{}, fmt.Errorf("record %d exceeds maximum allowed size (%d bytes > %d bytes); failing closed", idx, len(raw), MaxBatchPayloadBytes)
 		}
 		valid = append(valid, record)
+		if at, ok := adapter.OccurredAt(record); ok {
+			if oldestAt == nil || at.Before(*oldestAt) {
+				clone := at
+				oldestAt = &clone
+			}
+			if newestAt == nil || at.After(*newestAt) {
+				clone := at
+				newestAt = &clone
+			}
+		}
 	}
 	payload, err := json.MarshalIndent(adapter.Batch{BatchID: batchID, Records: valid}, "", "  ")
 	if err != nil {
@@ -101,7 +153,7 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if err := ctx.Err(); err != nil {
 		return PreparedExport{}, err
 	}
-	return PreparedExport{BatchID: batchID, Output: opt.Output, Records: len(valid), Payload: append(payload, '\n'), MessageUpdates: messageUpdates}, nil
+	return PreparedExport{BatchID: batchID, Output: opt.Output, Records: len(valid), Payload: append(payload, '\n'), MessageUpdates: messageUpdates, ScanStates: loaded.ScanStates, OldestAt: oldestAt, NewestAt: newestAt}, nil
 }
 
 // SplitPreparedExport partitions a PreparedExport into chunks that each satisfy
@@ -244,6 +296,22 @@ func (p *Pipeline) WritePreparedExport(prepared PreparedExport) error {
 }
 
 func PrepareExport(opt adapter.Options) (PreparedExport, error) { return production.PrepareExport(opt) }
+
+// RecoverPendingFilter completes any half-applied history-filter transaction
+// through the production registry.
+func RecoverPendingFilter(stateDir string) error { return production.RecoverPendingFilter(stateDir) }
+
+// LoadSource reads and parses one source through the production registry,
+// without filtering. Safe to call concurrently for different sources.
+func LoadSource(opt adapter.Options) (adapter.LoadResult, error) {
+	return production.LoadSource(opt)
+}
+
+// PrepareFromLoaded filters an already loaded result through the production
+// registry and produces the export payload.
+func PrepareFromLoaded(opt adapter.Options, loaded adapter.LoadResult) (PreparedExport, error) {
+	return production.PrepareFromLoaded(opt, loaded)
+}
 func SplitPreparedExport(prepared PreparedExport) ([]PreparedExport, error) {
 	return production.SplitPreparedExport(prepared)
 }

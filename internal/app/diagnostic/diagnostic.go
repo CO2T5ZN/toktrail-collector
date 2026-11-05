@@ -25,6 +25,7 @@ import (
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/quarantine"
+	"toktrail-collector/internal/local/scanledger"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/scheduler"
 	"toktrail-collector/internal/source/adapter"
@@ -213,6 +214,35 @@ func (r DoctorReport) Failed() bool {
 
 // Doctor runs local health checks. Nothing here prompts, sends messages,
 // or prints secrets. Network happens only when opt.CheckServer is set.
+// scanCacheCheck reports the incremental-scan state: how many sources have a
+// committed scan ledger, and whether the known-record cache exists. Both are
+// accelerators — a missing one only costs a full re-read — so this never
+// fails a doctor run.
+func scanCacheCheck(stateDir string) Check {
+	sources := []string{
+		adapter.CodexJSONLSource,
+		adapter.ClaudeCodeJSONLSource,
+		adapter.DeepSeekHarnessSource,
+	}
+	trackedSources, trackedFiles := 0, 0
+	for _, source := range sources {
+		states, existed, err := scanledger.New(stateDir).Load(source)
+		if err != nil || !existed {
+			continue
+		}
+		trackedSources++
+		trackedFiles += len(states)
+	}
+	if trackedSources == 0 {
+		return Check{Name: "scan-cache", Status: CheckOK, Detail: "no incremental scan state yet; the first collection run records it, and later runs skip unchanged history"}
+	}
+	return Check{
+		Name:   "scan-cache",
+		Status: CheckOK,
+		Detail: fmt.Sprintf("%d source(s) with committed scan state covering %d file(s); unchanged history is skipped", trackedSources, trackedFiles),
+	}
+}
+
 func Doctor(opt DoctorOptions) (DoctorReport, error) {
 	stateDir := strings.TrimSpace(opt.StateDir)
 	if stateDir == "" {
@@ -248,6 +278,12 @@ func Doctor(opt DoctorOptions) (DoctorReport, error) {
 	if cursorCheck.Status != CheckSkipped {
 		report.Checks = append(report.Checks, cursorCheck)
 	}
+
+	// Incremental-scan state: after the first run, unchanged history files
+	// are skipped. Reporting it makes an upgrade verifiable — a state
+	// directory that has never run has none, and one that has run shows the
+	// files it covers.
+	report.Checks = append(report.Checks, scanCacheCheck(stateDir))
 
 	// 2. Local-file grants (Cursor account sources do not use grants.json).
 	enabledGrants, err := grants.New(stateDir).Enabled()

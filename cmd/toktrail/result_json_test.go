@@ -16,6 +16,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"toktrail-collector/internal/app/collection"
 	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/connect"
+	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/cursor/auth"
 	"toktrail-collector/internal/local/grants"
@@ -451,23 +453,18 @@ func TestConnectJSONPromptStaysInteractiveAndOffStdout(t *testing.T) {
 	t.Setenv("USERPROFILE", homeDir)
 	connectURL := connectCLIServers(t, []string{"Cursor"})
 
-	// Answer the interactive confirmation with a decline. DefaultConfirm
-	// reads os.Stdin; the swap feeds it one line (stdin only — every
-	// output writer stays explicitly injected).
-	oldStdin := os.Stdin
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
+	// Answer the interactive confirmation with a decline. The production
+	// reader is the controlling terminal (internal/console), which a test
+	// host may or may not have and must never block on; the injected
+	// answer source feeds exactly one line instead.
+	oldSource := console.AnswerSource
+	console.AnswerSource = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("n\n")), nil
 	}
-	os.Stdin = r
-	if _, err := w.WriteString("n\n"); err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-	defer func() { os.Stdin = oldStdin; r.Close() }()
+	defer func() { console.AnswerSource = oldSource }()
 
 	var stdout, stderr bytes.Buffer
-	err = runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
+	err := runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
 	if err == nil {
 		t.Fatalf("a declined account-source enable keeps the historical incomplete result (the authorization named the tool)")
 	}

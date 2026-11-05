@@ -93,6 +93,7 @@ func runResyncWithIO(args []string, input io.Reader, output io.Writer) error {
 	// waits on stdin; the prompt line is closed - a newline only, the
 	// answer never echoed - once the confirmation returns).
 	hs := newHumanStream(output)
+	hs.quiet = !isTerminalWriter(output)
 	out := io.Writer(hs)
 	// The coupled heartbeat: event-driven lines from the progress
 	// stream plus a fast fallback ticker for the phases no internal

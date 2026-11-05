@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 
 	"errors"
@@ -10,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 	"toktrail-collector/internal/app/collection"
@@ -18,8 +16,11 @@ import (
 
 	"toktrail-collector/internal/bind"
 	"toktrail-collector/internal/connect"
+	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/scheduler"
+	"toktrail-collector/internal/syncbudget"
+	"toktrail-collector/internal/syncretry"
 )
 
 var connectSchedulerRunner scheduler.Runner // injectable for tests
@@ -44,6 +45,7 @@ flags:
   --device-name string      optional device name override
   --interval duration       scheduled collection interval (minimum 1m)
   --max-total-batches int   max total batches to POST during connect sync across the device, account-source and history queues (0=default 1000)
+  --sync-timeout duration   overall connect sync time limit, covering the source scan and the uploads (default 10m); the interactive confirmation wait is not counted
   --progress-json           emit collection progress events as JSON Lines on stderr (never stdout); filter lines by the JSON "type":"collection_progress" discriminator
   --json                    print the run's stable result (stop_reason and phase counts) as a single JSON object on stdout; human output and prompts move to stderr
   --verbose                 show detailed per-tool, per-batch and per-pass output (never secrets: no URLs, tickets or credentials)
@@ -95,6 +97,7 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 	deviceName := fs.String("device-name", "", "optional device name override")
 	interval := fs.Duration("interval", scheduler.DefaultInterval, "scheduled collection interval (minimum 1m)")
 	maxTotalBatches := fs.Int("max-total-batches", 0, "max total batches to POST during connect sync across the device, account-source and history queues (0=default 1000)")
+	syncTimeout := fs.Duration("sync-timeout", 10*time.Minute, "overall connect sync time limit, covering the source scan and the uploads; the interactive confirmation wait is not counted")
 	progressJSON := fs.Bool("progress-json", false, "emit collection progress events as JSON Lines on stderr (never stdout); stderr may also carry human text and prompts — filter lines by the JSON \"type\":\"collection_progress\" discriminator")
 	jsonOut := fs.Bool("json", false, "print the run's stable §6.5 result (stop_reason and phase counts) as a single JSON object on stdout; human output and prompts move to stderr")
 	verbose := fs.Bool("verbose", false, "show detailed per-tool, per-batch and per-pass output (never secrets: no URLs, tickets or credentials)")
@@ -150,6 +153,13 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 	var stopHeartbeat func()
 	if !*progressJSON {
 		hs = newHumanStream(human)
+		// Only a terminal gets heartbeat lines; everything else stays
+		// quiet so installation and CI logs remain readable.
+		sink := stdout
+		if *jsonOut {
+			sink = stderr
+		}
+		hs.quiet = !isTerminalWriter(sink)
 		human = hs
 		// The coupled heartbeat: event-driven lines from the progress
 		// stream plus a fast fallback ticker for the phases no internal
@@ -197,7 +207,10 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 			return notRunUnknown(err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	if *syncTimeout <= 0 {
+		return notRun(errors.New("--sync-timeout must be positive"))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *syncTimeout)
 	defer cancel()
 	// Account-level cursor wiring: the desktop credential reader and the
 	// pinned-host Cursor API client. Construction reads no credential;
@@ -275,11 +288,38 @@ func runFailureDisplayText(err error, fallback string) string {
 		// The reason only: main's unified line already carries the
 		// "connect failed:"/"resync failed:" prefix.
 		return "local source access denied; check the permissions of the affected directory"
+	case isRunDeadlineExpired(err):
+		// The run's own time limit, not a network fault: the device is
+		// reachable and whatever was confirmed stays confirmed. Saying
+		// "the server could not be reached" here sent users to debug a
+		// healthy server.
+		return "the run's time limit was reached with work remaining; the remaining work stays queued and continues on the next run (raise --sync-timeout to give one run more time)"
+	case isRequestTimeout(err):
+		return "a request timed out before the server answered; check connectivity and the server status"
 	case isNetworkUnreachable(err):
 		return "the server could not be reached; check connectivity and the server status"
 	default:
 		return fallback
 	}
+}
+
+// isRunDeadlineExpired reports whether err is the run's own deadline:
+// the connect sync budget deadline, a past-deadline retry stop, or the
+// run context expiring. These are NOT network faults — the device may be
+// perfectly reachable — and must not be displayed as one.
+func isRunDeadlineExpired(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, syncbudget.ErrDeadlineExceeded) ||
+		errors.Is(err, syncretry.ErrRetryPastDeadline)
+}
+
+// isRequestTimeout reports a single request that timed out (net.Error with
+// Timeout() true). It is checked before isNetworkUnreachable because
+// context.DeadlineExceeded also satisfies net.Error; only the ordering
+// keeps the two verdicts apart.
+func isRequestTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // isNetworkUnreachable reports whether err carries a net.Error (a DNS
@@ -308,40 +348,18 @@ func stateReplaceConfirmFor(forced bool, hs *humanStream) cursorsync.ConfirmFunc
 }
 
 // stateReplacePrompt asks the interactive state-replacement question.
-// It mirrors cursorsync.DefaultConfirm's safety shape: a bounded stdin
-// read (the answer is never echoed; an over-long line is refused), only
-// an explicit y/yes confirms, and an unavailable stdin is an error the
-// connect flow treats as a decline (the ownership guards then fail
-// closed with their actionable guidance).
+// It reads the answer from the controlling terminal through the shared
+// console helper: under the documented `curl … | sh` install, stdin
+// carries the install script, so a stdin read would answer for nobody
+// (EOF, or the next script line under incrementally parsing shells).
+// Only an explicit y/yes confirms; a missing terminal returns
+// console.ErrNoInteractiveTerminal, which the connect flow reports as
+// "not confirmed" (the ownership guards then fail closed with their
+// actionable guidance and --replace-state stays the explicit
+// non-interactive channel).
 func stateReplacePrompt(notice string, out io.Writer) (bool, error) {
 	fmt.Fprintln(out, notice)
-	fmt.Fprint(out, "Replace the existing local TokTrail state and start fresh under this connect link? [y/N] ")
-	line, err := readBoundedStdinLine(64)
-	if err != nil {
-		return false, fmt.Errorf("no interactive input available: %w", err)
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true, nil
-	default:
-		return false, nil
-	}
-}
-
-// readBoundedStdinLine reads one line from stdin, at most max bytes
-// (plus the newline). An over-long line is an error; the content read is
-// never included in the error (an answer line may quote anything pasted
-// into the terminal).
-func readBoundedStdinLine(max int) (string, error) {
-	br := bufio.NewReader(io.LimitReader(os.Stdin, int64(max)+1))
-	line, err := br.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
-	}
-	if len(line) > max {
-		return "", fmt.Errorf("input exceeds %d bytes and was refused", max)
-	}
-	return line, nil
+	return console.Confirm(out, "Replace the existing local TokTrail state and start fresh under this connect link? [y/N] ")
 }
 
 // cursorConfirmResume wraps the run's interactive confirmation hook so
@@ -388,6 +406,11 @@ type humanStream struct {
 	mu           sync.Mutex
 	w            io.Writer
 	lineComplete bool
+	// quiet suppresses heartbeat lines entirely. A redirected stream
+	// (install log, CI, scheduled task) gains nothing from a repeated
+	// "still working" line every few seconds; the final summary and any
+	// error still render. Phase lines and prompts are unaffected.
+	quiet bool
 }
 
 func newHumanStream(w io.Writer) *humanStream {
@@ -411,6 +434,12 @@ func (s *humanStream) Write(p []byte) (int, error) {
 func (s *humanStream) WriteHeartbeatLine(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.quiet {
+		// Dropped by design: the stream is not a terminal, so the
+		// heartbeat would only be log noise. Reported as written so the
+		// emitter does not treat it as a failure.
+		return len(p), nil
+	}
 	if !s.lineComplete {
 		// Prompt in flight: the heartbeat is dropped, never injected
 		// into the prompt's line.

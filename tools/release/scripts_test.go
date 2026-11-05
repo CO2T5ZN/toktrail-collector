@@ -699,3 +699,73 @@ func TestPOSIXScriptInstallModeStillDefaultsInstallDir(t *testing.T) {
 		t.Fatalf("install mode must forward -install-dir: %q", args)
 	}
 }
+
+// The documented install runs the script through a pipe
+// (`curl … | sh -s -- …`). In that shape the collector inherits the script
+// pipeline as stdin, so a confirmation prompt that read stdin would see EOF
+// or — under shells that parse incrementally — program text. This test
+// executes the emitted script exactly that way and pins both facts the
+// collector's terminal-based confirmation relies on:
+//
+//   - the collector's stdin is NOT a terminal;
+//   - reading it yields no answer and, specifically, never runs the
+//     install script's remaining text as if it were a typed answer.
+func TestConnectFromPipeShapeNeverFeedsScriptTextToCollector(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell pipeline test")
+	}
+	installScript, baseURL, recordFile, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "install_target")
+	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
+
+	// Rebuild the script with the fake collector replaced by one that
+	// reports its stdin: is it a tty, and does reading it produce the
+	// trailing script text?
+	raw, err := os.ReadFile(installScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptText := string(raw)
+	probe := filepath.Join(dir, "probe.sh")
+	// The probe reads one line from stdin and records what it saw.
+	probeBody := `#!/bin/sh
+if [ -t 0 ]; then echo "tty=yes" > ` + recordFile + `.stdin; else echo "tty=no" > ` + recordFile + `.stdin; fi
+if IFS= read -r line; then echo "read=$line" >> ` + recordFile + `.stdin; else echo "read=EOF" >> ` + recordFile + `.stdin; fi
+`
+	if err := os.WriteFile(probe, []byte(probeBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Point the emitted `connect` call at the probe instead of the fake
+	// binary: the call shape (`"$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL"`)
+	// is what matters, so rewriting the installed binary path is enough.
+	scriptText = strings.ReplaceAll(scriptText,
+		`"$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL"`,
+		`"`+probe+`"`)
+	if !strings.Contains(scriptText, probe) {
+		t.Fatal("could not redirect the connect call to the stdin probe")
+	}
+	// A trailing line AFTER the connect call is what an incrementally
+	// parsing shell would let the collector swallow; it must still run.
+	scriptText += "echo TRAILING_LINE_RAN\n"
+
+	cmd := exec.Command("/bin/sh", "-s", "--", baseURL, installTarget, "--connect", placeholderLink)
+	cmd.Stdin = strings.NewReader(scriptText)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("piped install failed: %v\nOutput: %s", err, out)
+	}
+	if !strings.Contains(string(out), "TRAILING_LINE_RAN") {
+		t.Fatalf("the trailing script line must still run; the collector consumed script text.\nOutput:\n%s", out)
+	}
+	report, err := os.ReadFile(recordFile + ".stdin")
+	if err != nil {
+		t.Fatalf("the probe did not run: %v", err)
+	}
+	reportText := string(report)
+	if !strings.Contains(reportText, "tty=no") {
+		t.Fatalf("under the pipe shape the collector's stdin must not be a terminal, got:\n%s", reportText)
+	}
+	if !strings.Contains(reportText, "read=EOF") {
+		t.Fatalf("reading the inherited stdin must yield no answer (never script text), got:\n%s", reportText)
+	}
+}

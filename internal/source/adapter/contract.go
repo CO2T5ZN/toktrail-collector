@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"toktrail-collector/internal/local/progress"
+	"toktrail-collector/internal/local/scanledger"
 )
 
 const (
@@ -59,6 +60,13 @@ type LoadResult struct {
 	Issues         []LineIssue
 	Quarantined    int
 	MessageUpdates []progress.MessagePendingUpdate
+	// ScanStates carries the per-file content states a resumed scan
+	// observed (see internal/local/scanledger). A loader that can skip
+	// unchanged files returns the states of EVERY file it considered, and
+	// the caller may persist them only after this batch's records have
+	// been safely committed: persisting at parse time would drop records
+	// whenever the export failed.
+	ScanStates map[string]scanledger.FileState
 }
 
 // SourceLoader dispatches Options to one compiled-in source adapter.

@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"toktrail-collector/internal/app/cursorsync"
+	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/cursor/auth"
 	"toktrail-collector/internal/cursor/identity"
@@ -605,5 +606,72 @@ func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "not enabled; run `toktrail cursor enable` in a terminal to confirm locally") {
 		t.Fatalf("output must point the user at the interactive enable, got:\n%s", out)
+	}
+}
+
+// TestConnectCursorNoTerminalIsDistinctFromDecline pins the wording the
+// one-line install needs: when the first-time confirmation has no
+// terminal (the documented `curl … | sh` runs the collector from a
+// pipeline), the run must say so instead of implying the user declined.
+func TestConnectCursorNoTerminalIsDistinctFromDecline(t *testing.T) {
+	confirm := func(notice string, w io.Writer) (bool, error) {
+		return false, console.ErrNoInteractiveTerminal
+	}
+
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	toktrail := startCursorToktrailMock(t)
+	cfgServer := startConnectConfigMock(t, Config{
+		SchemaVersion: 1,
+		ServerURL:     toktrail.URL,
+		ApplicationID: "app-cursor-1",
+		SubjectID:     cursorTestSubjectID,
+		Tools:         []string{"Cursor"},
+		Days:          intPtr(30),
+		ExpiresAt:     cursorTestNow.Add(24 * time.Hour).Format(time.RFC3339),
+	})
+	authFake := &fakeCursorAuth{}
+	pullFake := &fakeCursorPull{events: cursorFixtureEvents()}
+	out := &bytes.Buffer{}
+	_, err := Run(context.Background(), Options{
+		URL:             fmt.Sprintf("%s/api/collector/connect#%s", cfgServer.URL, strings.Repeat("7", 64)),
+		StateDir:        stateDir,
+		HomeDir:         homeDir,
+		BinaryPath:      fakeCollectorBinary(t),
+		HTTPClient:      cfgServer.Client(),
+		SchedulerRunner: &mockRunner{},
+		Now:             func() time.Time { return cursorTestNow },
+		Out:             out,
+		Cursor: &cursorsync.Options{
+			Auth:   authFake,
+			Verify: fakeCursorVerify,
+			Pull:   pullFake.Pull,
+			Now:    func() time.Time { return cursorTestNow },
+		},
+		CursorConfirm: confirm,
+	})
+	if err == nil || !errors.Is(err, ErrSyncIncomplete) {
+		t.Fatalf("an unconfirmed cursor source leaves the install incomplete, got %v", err)
+	}
+	outStr := out.String()
+
+	if strings.Contains(outStr, "not enabled; run `toktrail cursor enable` in a terminal to confirm locally") {
+		t.Fatalf("a missing terminal must not read as a plain decline, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "no interactive terminal was available to confirm") {
+		t.Fatalf("the run must name the missing terminal, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "`toktrail cursor enable`") {
+		t.Fatalf("the run must still point at the interactive enable, got:\n%s", outStr)
+	}
+	// Nothing was enabled or uploaded: the boundary held.
+	toktrail.mu.Lock()
+	enableCalls, srcPosts := toktrail.enableCalls, toktrail.srcBatchPosts
+	toktrail.mu.Unlock()
+	if enableCalls != 0 || srcPosts != 0 {
+		t.Fatalf("no enable or upload may happen without a confirmation (enable=%d posts=%d)", enableCalls, srcPosts)
+	}
+	if _, err := os.Stat(stateDir); err != nil {
+		t.Fatalf("the state directory must still exist: %v", err)
 	}
 }

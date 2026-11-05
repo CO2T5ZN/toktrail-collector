@@ -15,6 +15,7 @@ import (
 
 	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/bind"
+	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/local/cursorsource"
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/runlock"
@@ -623,7 +624,17 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 						if counted {
 							toolCounts.accountNotEnabled++
 						}
-						d.phase("tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+						// "Not confirmed" is not "declined": under the
+						// documented one-line install the collector runs
+						// from a `curl … | sh` pipeline, where the
+						// confirmation prompt has no terminal to read
+						// from. Say which case happened instead of
+						// implying the user answered no.
+						if errors.Is(enableErr, console.ErrNoInteractiveTerminal) {
+							d.phase("tool %q: not enabled; no interactive terminal was available to confirm this first-time local enable; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+						} else {
+							d.phase("tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+						}
 					}
 					continue
 				}

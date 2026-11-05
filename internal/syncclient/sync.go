@@ -122,6 +122,11 @@ type Options struct {
 	// outbox accounting (outbox.Store.RecordPreflightAttempt) they would
 	// get from a StateDir. Runs with a StateDir keep the built-in ledger
 	// accounting and leave this nil.
+	// PreferBatchID names the pending outbox batch to upload when no
+	// BatchFile is given. The batch must still be pending; an unknown or
+	// already-settled id falls back to the oldest pending batch, so a stale
+	// preference can never wedge the queue.
+	PreferBatchID       string
 	PreflightAccounting func(at time.Time) error
 	// Progress is optional. When non-nil, Run delivers one sanitized
 	// AttemptEvent per send attempt of the selected batch — exactly one
@@ -274,9 +279,18 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	fromOutbox := false
 	var outboxEntry outbox.BatchEntry
 	if batchFile == "" && strings.TrimSpace(opt.StateDir) != "" {
-		entry, ok, err := ledger.NextPending()
+		// A caller that already selected a pending batch (the periodic
+		// drain, which prefers recent data) passes its id here; without it
+		// the historical oldest-first selection applies.
+		entry, ok, err := ledger.PendingByID(opt.PreferBatchID)
 		if err != nil {
 			return Result{}, err
+		}
+		if !ok {
+			entry, ok, err = ledger.NextPending()
+			if err != nil {
+				return Result{}, err
+			}
 		}
 		if !ok {
 			// Empty outbox: if quarantined records exist, try to recover

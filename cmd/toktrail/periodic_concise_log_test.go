@@ -1008,7 +1008,7 @@ func TestPeriodicConcisePendingHonorsObservationGates(t *testing.T) {
 			drain:     collection.DrainSummary{PendingObserved: true},
 			account:   collection.AccountDrainSummary{Outcome: cursorsync.RoundAbsent},
 			drainOnly: true,
-			want:      "nothing pending (drain-only; the cursor queue was not read)",
+			want:      "device queue empty, nothing was scanned and the account queue was not read (drain-only)",
 		},
 		{
 			// RoundAbsent WITHOUT the drain-only flag: the mode is not

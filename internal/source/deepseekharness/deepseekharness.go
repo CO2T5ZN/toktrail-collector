@@ -108,6 +108,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
+	"toktrail-collector/internal/local/scanledger"
 	"toktrail-collector/internal/source/adapter"
 )
 
@@ -134,7 +135,7 @@ func Adapter() adapter.Adapter {
 		Source:      adapter.DeepSeekHarnessSource,
 		Description: "DeepSeek Harness session JSONL (per-attempt deltas)",
 		Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-			return loadRecordsContext(opt.ContextOrBackground(), opt.Input)
+			return loadRecordsResuming(opt)
 		},
 		FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
 			ctx := opt.ContextOrBackground()
@@ -169,6 +170,31 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 // partial result — records, issues, and quarantine counts accumulated so far
 // are discarded, so a scan cut short never exports half of a session.
 func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, error) {
+	return loadRecordsWithPrior(ctx, root, nil)
+}
+
+// loadRecordsResuming is the production loader: unchanged session files are
+// skipped instead of being re-decoded on every scheduled run.
+//
+// A skip is content-proven (whole-file SHA-256 over the chosen generation
+// file, see internal/local/scanledger); a rewritten or appended session is
+// parsed exactly as before, and the downstream known-set keeps the authority
+// for counting each record once. The returned ScanStates let the caller
+// advance the ledger only after this scan's records are committed.
+func loadRecordsResuming(opt adapter.Options) (adapter.LoadResult, error) {
+	var prior map[string]scanledger.FileState
+	if strings.TrimSpace(opt.StateDir) != "" {
+		if loaded, _, err := scanledger.New(opt.StateDir).Load(adapter.DeepSeekHarnessSource); err == nil {
+			prior = loaded
+		}
+	}
+	return loadRecordsWithPrior(opt.ContextOrBackground(), opt.Input, prior)
+}
+
+// loadRecordsWithPrior is the shared scan. A nil prior parses every file (the
+// historical behavior); a non-nil map skips files whose content digest
+// matches it.
+func loadRecordsWithPrior(ctx context.Context, root string, prior map[string]scanledger.FileState) (adapter.LoadResult, error) {
 	res := adapter.LoadResult{}
 	clean := strings.TrimSpace(root)
 	if clean == "" {
@@ -178,14 +204,24 @@ func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, e
 	if err != nil {
 		return res, err
 	}
+	states := make(map[string]scanledger.FileState, len(files))
 	seen := map[string]bool{}
 	for _, path := range files {
 		if err := ctx.Err(); err != nil {
 			return adapter.LoadResult{}, err
 		}
+		current, unchanged, derr := scanledger.Inspect(path, prior)
+		if derr == nil && unchanged {
+			// Already exported, and provably unchanged: no records.
+			states[path] = current
+			continue
+		}
 		records, issues, quarantined, err := loadSessionFile(ctx, path)
 		if err != nil {
 			return adapter.LoadResult{}, err
+		}
+		if derr == nil {
+			states[path] = current
 		}
 		res.Quarantined += quarantined
 		res.Issues = appendIssues(res.Issues, issues)
@@ -210,6 +246,7 @@ func loadRecordsContext(ctx context.Context, root string) (adapter.LoadResult, e
 		}
 		return a < b
 	})
+	res.ScanStates = states
 	return res, nil
 }
 
