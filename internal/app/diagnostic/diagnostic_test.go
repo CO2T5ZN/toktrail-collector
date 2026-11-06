@@ -566,22 +566,31 @@ func TestDoctorBinaryIdentityWarnsWhenTheTaskCannotBeInspected(t *testing.T) {
 	if len(plan.Files) == 0 {
 		t.Skip("no registration file on this platform")
 	}
-	written := ""
+	blocked := ""
 	for _, f := range plan.Files {
 		if err := os.MkdirAll(filepath.Dir(f.Path), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		if strings.HasSuffix(f.Path, ".service") || strings.HasSuffix(f.Path, ".plist") {
+			// RegisteredBinary reads the service/plist, not the systemd
+			// timer. A directory forces a read error even when running as
+			// root, which can bypass chmod-based permission restrictions.
+			if err := os.Mkdir(f.Path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			blocked = f.Path
+			continue
+		}
 		if err := os.WriteFile(f.Path, []byte(f.Content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		written = f.Path
 	}
-	// Unreadable registration: the identity check cannot verify what the
-	// schedule starts, and must say so instead of claiming there is no task.
-	if err := os.Chmod(written, 0o000); err != nil {
-		t.Fatal(err)
+	if blocked == "" {
+		t.Fatal("no service or plist registration was rendered")
 	}
-	t.Cleanup(func() { _ = os.Chmod(written, 0o600) })
+	if _, err := os.ReadFile(blocked); err == nil {
+		t.Fatal("the registration fixture must fail to read")
+	}
 
 	report, err := Doctor(DoctorOptions{
 		StateDir: stateDir, Binary: binary, HomeDir: home, Version: "v0.6.0",

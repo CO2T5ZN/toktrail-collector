@@ -352,12 +352,18 @@ func runInstallerUnderPTY(t *testing.T, installScript, baseURL, installTarget, h
 	if runtime.GOOS == "darwin" {
 		cmd = exec.Command("/usr/bin/script", append([]string{"-q", "/dev/null"}, self...)...)
 	} else {
-		cmd = exec.Command("script", "-q", "-c", strings.Join(self, " "), "/dev/null")
+		// util-linux script invokes $SHELL -c. Quote each argument so
+		// spaces and shell metacharacters in fixture paths remain literal.
+		quoted := make([]string, len(self))
+		for i, arg := range self {
+			quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+		}
+		cmd = exec.Command("script", "-q", "-e", "-c", strings.Join(quoted, " "), "/dev/null")
 	}
 	cmd.Env = append(os.Environ(),
 		"HOME="+home,
 		"TOKTRAIL_HOME="+filepath.Join(home, "state"),
-		"SHELL=/bin/zsh",
+		"SHELL=/bin/bash",
 		"PATH=/usr/bin:/bin",
 	)
 	reader, writer := io.Pipe()
@@ -1017,15 +1023,19 @@ func TestInstallPathSetupHandlesReplyAndUnsafeDir(t *testing.T) {
 		t.Skip("POSIX shell test")
 	}
 	installScript, baseURL, _, dir := connectTestFixture(t)
+	profileName := ".bashrc"
+	if runtime.GOOS == "darwin" {
+		profileName = ".bash_profile"
+	}
 
 	t.Run("padded_no_declines", func(t *testing.T) {
-		installTarget := filepath.Join(dir, "bin_padded")
+		installTarget := filepath.Join(dir, "bin padded")
 		home := t.TempDir()
 		out := runInstallerUnderPTY(t, installScript, baseURL, installTarget, home, "  no  \n")
 		if !strings.Contains(out, "left PATH unchanged") {
 			t.Fatalf("a padded no must decline:\n%s", out)
 		}
-		if _, err := os.Stat(filepath.Join(home, ".zshrc")); err == nil {
+		if _, err := os.Stat(filepath.Join(home, profileName)); err == nil {
 			t.Fatal("no profile may be written after an explicit decline")
 		}
 	})
@@ -1037,7 +1047,7 @@ func TestInstallPathSetupHandlesReplyAndUnsafeDir(t *testing.T) {
 		if !strings.Contains(out, "cannot be written literally") {
 			t.Fatalf("a metacharacter directory must be reported, not written:\n%s", out)
 		}
-		if _, err := os.Stat(filepath.Join(home, ".zshrc")); err == nil {
+		if _, err := os.Stat(filepath.Join(home, profileName)); err == nil {
 			t.Fatal("no profile may be written for an unsafe directory")
 		}
 	})
