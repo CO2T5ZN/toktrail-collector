@@ -797,6 +797,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				StateDir:     stateDir,
 				ServerURL:    cfg.ServerURL,
 				HTTPClient:   opt.HTTPClient,
+				Retry:        retry,
 				ToolStatuses: probeStatuses,
 			})
 			if err != nil {

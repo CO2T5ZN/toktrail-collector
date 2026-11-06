@@ -75,6 +75,16 @@ type budgetFakeServer struct {
 	// confirmed upload. Failed attempts are not counted in
 	// toolStatusPosts.
 	failToolStatus bool
+	// failToolStatusFirst, when positive, answers only the FIRST N
+	// tool-status POSTs with the same transient 503 before accepting:
+	// a scripted blip that clears, for retry-wiring tests. It combines
+	// additively with failToolStatus (either flag fails the POST).
+	failToolStatusFirst int
+	// toolStatusAttempts counts every tool-status POST the server has
+	// seen, including the ones answered with the synthetic 503 (which
+	// failToolStatus* arms), so retry tests can assert the real attempt
+	// count.
+	toolStatusAttempts int
 }
 
 // fairUpload is one recorded real ingest POST: which queue made it and
@@ -169,7 +179,8 @@ func startBudgetFakeServer(t *testing.T) *budgetFakeServer {
 				t.Errorf("tool-status POST must carry at least one statuses[] entry")
 			}
 			s.mu.Lock()
-			failed := s.failToolStatus
+			s.toolStatusAttempts++
+			failed := s.failToolStatus || s.toolStatusAttempts <= s.failToolStatusFirst
 			if !failed {
 				s.toolStatusPosts++
 			}
@@ -243,6 +254,22 @@ func (s *budgetFakeServer) setFailToolStatus(fail bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failToolStatus = fail
+}
+
+// setFailToolStatusFirst scripts a transient tool-status blip: the first
+// n POSTs answer the synthetic 503, every later POST is accepted.
+func (s *budgetFakeServer) setFailToolStatusFirst(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failToolStatusFirst = n
+}
+
+// toolStatusAttemptCount returns every tool-status POST seen, including
+// the ones answered with the synthetic 503.
+func (s *budgetFakeServer) toolStatusAttemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.toolStatusAttempts
 }
 
 func (s *budgetFakeServer) counters() (selfRequests, srcPosts, devicePosts, toolStatusPosts, grantAcks int) {

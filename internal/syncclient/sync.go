@@ -108,7 +108,9 @@ type Options struct {
 	// upload budget again before the actual POST. Production wiring that
 	// enables retries should construct the policy with an explicit
 	// non-zero random Jitter: syncretry.New on its own is deterministic
-	// (jitter nil).
+	// (jitter nil). ReportToolStatuses also uses this policy for transient
+	// failures of its preflight GET and metadata POST, with fresh authorization
+	// each time; those metadata requests do not consume the ingest Budget.
 	Retry *syncretry.Policy
 	// PreflightAccounting is the preflight-only safe-accounting hook for
 	// runs that deliberately pass NO StateDir — the history
@@ -835,6 +837,12 @@ func FetchDeviceSelf(ctx context.Context, store statedir.Store, opt Options) (Se
 // redirect answer fails closed as an error, having performed exactly one
 // request.
 func fetchSelf(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState) (SelfStatus, error) {
+	return fetchSelfAttempt(ctx, client, serverURL, st, false)
+}
+
+// fetchSelfAttempt optionally classifies transient failures for metadata retries.
+// Existing fetchSelf callers retain their single-attempt error contract.
+func fetchSelfAttempt(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState, retryTransient bool) (SelfStatus, error) {
 	endpoint, err := joinURL(serverURL, "/v1/devices/self")
 	if err != nil {
 		return SelfStatus{}, err
@@ -848,11 +856,14 @@ func fetchSelf(ctx context.Context, client *http.Client, serverURL string, st st
 	if err != nil {
 		// The raw transport text (endpoint, runtime detail) never reaches
 		// a human message; the cause stays matchable through Unwrap.
-		return SelfStatus{}, wrapTransportError("device self check failed", err)
+		return SelfStatus{}, retryToolStatusTransport(ctx, retryTransient, "device self check failed", err)
 	}
 	defer resp.Body.Close()
 	var body selfResponse
 	if err := json.NewDecoder(capResponseBody(resp.Body)).Decode(&body); err != nil {
+		if retryTransient && ctx.Err() == nil && retryableIngestStatus(resp.StatusCode) && !errors.Is(err, errResponseBodyTooLarge) {
+			return SelfStatus{}, syncretry.RetryAfterHeader(fmt.Errorf("device self check response HTTP %d: %w", resp.StatusCode, safeDecodeErrorOf(err)), resp.Header.Get("Retry-After"))
+		}
 		if errors.Is(err, errResponseBodyTooLarge) {
 			return SelfStatus{}, fmt.Errorf("%w: device self check response exceeded the %d MiB body limit (status %d)", ErrSelfProtocol, maxResponseBodyBytes>>20, resp.StatusCode)
 		}
@@ -900,6 +911,9 @@ func fetchSelf(ctx context.Context, client *http.Client, serverURL string, st st
 	// network condition.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return SelfStatus{}, fmt.Errorf("%w: device self check rejected the device credentials (HTTP %d)", ErrDeviceUnauthorized, resp.StatusCode)
+	}
+	if retryTransient && ctx.Err() == nil && retryableIngestStatus(resp.StatusCode) && retryableIngestCode(code) {
+		return SelfStatus{}, syncretry.RetryAfterHeader(fmt.Errorf("device self check failed: status %d", resp.StatusCode), resp.Header.Get("Retry-After"))
 	}
 	if code != "" {
 		// Unknown server codes are never echoed — not even the code
@@ -1054,7 +1068,11 @@ func checkNotPaused(self SelfStatus) error {
 const pausedToolSentinel = "__toktrail_paused__"
 
 func preflightSelf(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState) (SelfStatus, error) {
-	dev, err := fetchSelf(ctx, client, serverURL, st)
+	return preflightSelfAttempt(ctx, client, serverURL, st, false)
+}
+
+func preflightSelfAttempt(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState, retryTransient bool) (SelfStatus, error) {
+	dev, err := fetchSelfAttempt(ctx, client, serverURL, st, retryTransient)
 	if err != nil {
 		return SelfStatus{}, err
 	}

@@ -13,6 +13,7 @@ import (
 
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/statedir"
+	"toktrail-collector/internal/syncretry"
 )
 
 // ToolStatus is a source observation, independent of usage batches and cursors.
@@ -23,7 +24,11 @@ type ToolStatus struct {
 }
 
 // ReportToolStatuses never changes usage ACKs, baselines, or progress.
+// With Retry, transient preflight and report failures use the run's bounded
+// policy. Each attempt rechecks live authorization and resends the same status
+// payload. Metadata POSTs do not consume the ingest budget.
 func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) (Result, error) {
+	opt.ToolStatuses = append([]ToolStatus(nil), opt.ToolStatuses...)
 	if len(opt.ToolStatuses) == 0 || len(opt.ToolStatuses) > 32 {
 		return Result{}, errors.New("tool status count must be between 1 and 32")
 	}
@@ -44,6 +49,25 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 			return Result{}, errors.New("invalid tool status detail")
 		}
 	}
+	payload, err := json.Marshal(struct {
+		Statuses []ToolStatus `json:"statuses"`
+	}{opt.ToolStatuses})
+	if err != nil {
+		return Result{}, err
+	}
+	if opt.Retry == nil {
+		return reportToolStatusAttempt(ctx, store, opt, payload)
+	}
+	var outcome Result
+	err = opt.Retry.Do(ctx, func(ctx context.Context, _ int) error {
+		var err error
+		outcome, err = reportToolStatusAttempt(ctx, store, opt, payload)
+		return err
+	})
+	return outcome, err
+}
+
+func reportToolStatusAttempt(ctx context.Context, store statedir.Store, opt Options, payload []byte) (Result, error) {
 	st, err := store.Load()
 	if err != nil {
 		return Result{}, err
@@ -64,7 +88,7 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 			return Result{}, err
 		}
 	}
-	self, err := preflightSelf(ctx, client, serverURL, st)
+	self, err := preflightSelfAttempt(ctx, client, serverURL, st, opt.Retry != nil)
 	if err != nil {
 		return Result{}, err
 	}
@@ -90,12 +114,6 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 	if err != nil {
 		return Result{}, err
 	}
-	payload, err := json.Marshal(struct {
-		Statuses []ToolStatus `json:"statuses"`
-	}{opt.ToolStatuses})
-	if err != nil {
-		return Result{}, err
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return Result{}, err
@@ -107,7 +125,7 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 	if err != nil {
 		// Raw transport text never reaches a human message; the cause
 		// stays matchable through Unwrap.
-		return Result{}, wrapTransportError("tool status report", err)
+		return Result{}, retryToolStatusTransport(ctx, opt.Retry != nil, "tool status report", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
@@ -116,13 +134,29 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 		}
 		var body ingestResponse
 		if err := json.NewDecoder(capResponseBody(resp.Body)).Decode(&body); err != nil {
-			return Result{}, fmt.Errorf("tool status response HTTP %d", resp.StatusCode)
+			failure := fmt.Errorf("tool status response HTTP %d", resp.StatusCode)
+			if opt.Retry != nil && ctx.Err() == nil && retryableIngestStatus(resp.StatusCode) && !errors.Is(err, errResponseBodyTooLarge) {
+				return Result{}, syncretry.RetryAfterHeader(failure, resp.Header.Get("Retry-After"))
+			}
+			return Result{}, failure
 		}
 		code := ""
 		if body.Error != nil {
 			code = body.Error.Code
 		}
-		return Result{}, classifyIngestError(resp.StatusCode, code)
+		failure := classifyIngestError(resp.StatusCode, code)
+		if opt.Retry != nil && ctx.Err() == nil && retryableIngestStatus(resp.StatusCode) && retryableIngestCode(code) {
+			return Result{}, syncretry.RetryAfterHeader(failure, resp.Header.Get("Retry-After"))
+		}
+		return Result{}, failure
 	}
 	return Result{State: st, Self: self, Status: resp.StatusCode}, nil
+}
+
+func retryToolStatusTransport(ctx context.Context, enabled bool, scope string, err error) error {
+	failure := wrapTransportError(scope, err)
+	if enabled && ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errDeviceRedirect) {
+		return syncretry.Retryable(failure)
+	}
+	return failure
 }

@@ -70,6 +70,19 @@ existing busy error and touches nothing.
    to the caller; HTTP 404/405 is tolerated for older servers.
 6. Release the lock.
 
+Periodic and connect runs retry transient tool-status failures in both the
+preflight GET and status POST using the run's existing retry policy: at most
+four attempts by default, exponential backoff with full jitter, and a
+`Retry-After` floor. Only transport failures while the run remains live and
+HTTP 429/500/502/503/504 with no business error or an explicitly transient
+business code are retried. Empty or non-JSON gateway error bodies on those
+statuses are also retryable. Each attempt records a new preflight check and
+uses fresh authorization; revocation, pause, scope changes, redirects and
+other permanent errors stop immediately. Waiting cannot exceed the run's
+deadline. Status metadata does not consume the ingest POST budget or resend
+an already-confirmed usage batch. Exhausted retries still report failure,
+with confirmed usage and measured pending counts preserved.
+
 No secrets ever appear in command lines, rendered scheduler files, plan
 output, or logs.
 

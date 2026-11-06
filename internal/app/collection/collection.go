@@ -569,8 +569,14 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 	// whose grant the user disabled must not silently ride an old ack.
 	// Best-effort: a failure here never blocks collection.
 	if len(grantSync.Pending) > 0 && !grantSync.Paused {
+		// Retry also covers this run's tool-status metadata reports
+		// (grant restrictions, cursor receipts, per-batch "synced"
+		// statuses): the same policy retries their transient preflight
+		// and POST failures inside syncclient. Metadata attempts never
+		// consume the ingest Budget — that counts ingest POSTs only —
+		// but they stay governed by the run's context deadline.
 		if statuses := pendingToolStatuses(grantSync.Pending); len(statuses) > 0 {
-			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: statuses}); err != nil {
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, Retry: opt.Retry, ToolStatuses: statuses}); err != nil {
 				if !errors.Is(err, synccmd.ErrDevicePaused) && grantSync.Note == "" {
 					grantSync.Note = fmt.Sprintf("restricted-tool status report failed: %v", err)
 					res.GrantSync = grantSync
@@ -706,6 +712,7 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 				StateDir:     stateDir,
 				ServerURL:    opt.ServerURL,
 				HTTPClient:   opt.HTTPClient,
+				Retry:        opt.Retry,
 				ToolStatuses: []synccmd.ToolStatus{{Tool: cursorsource.ToolName, Status: status, Detail: detail}},
 			}); err != nil && !errors.Is(err, synccmd.ErrDevicePaused) {
 				// Note is empty on this path by construction.
@@ -1014,6 +1021,7 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 			StateDir:     stateDir,
 			ServerURL:    opt.ServerURL,
 			HTTPClient:   opt.HTTPClient,
+			Retry:        opt.Retry,
 			ToolStatuses: []synccmd.ToolStatus{{Tool: cursorsource.ToolName, Status: status, Detail: detail}},
 		}); err != nil && !errors.Is(err, synccmd.ErrDevicePaused) {
 			// Note is empty on this path by construction.
@@ -1054,7 +1062,7 @@ func runLocked(ctx context.Context, opt Options, lock *runlock.Lock) (Result, er
 			statuses = append(statuses, synccmd.ToolStatus{Tool: tool, Status: "no_new_records", Detail: "no new records since last confirmed baseline"})
 		}
 		if len(statuses) > 0 {
-			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: statuses}); err != nil {
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, Retry: opt.Retry, ToolStatuses: statuses}); err != nil {
 				// A paused device sends no status metadata either; that is
 				// a state, not a failure of the run.
 				if errors.Is(err, synccmd.ErrDevicePaused) {
@@ -1673,7 +1681,7 @@ func (d *deviceQueueDrain) step(ctx context.Context) (progressed bool, err error
 				d.res.syncedTools = map[string]bool{}
 			}
 			d.res.syncedTools[tool] = true
-			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(d.stateDir), synccmd.Options{StateDir: d.stateDir, ServerURL: d.opt.ServerURL, HTTPClient: d.opt.HTTPClient, ToolStatuses: []synccmd.ToolStatus{{Tool: tool, Status: "synced"}}}); err != nil {
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(d.stateDir), synccmd.Options{StateDir: d.stateDir, ServerURL: d.opt.ServerURL, HTTPClient: d.opt.HTTPClient, Retry: d.opt.Retry, ToolStatuses: []synccmd.ToolStatus{{Tool: tool, Status: "synced"}}}); err != nil {
 				remaining, countErr := countPending(d.ledger)
 				if countErr != nil {
 					return false, countErr
