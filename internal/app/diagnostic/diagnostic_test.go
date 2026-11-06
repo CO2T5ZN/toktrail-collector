@@ -413,3 +413,132 @@ func (m *mockTaskRunner) Run(name string, args ...string) error {
 func (m *mockTaskRunner) RunOutput(name string, args ...string) ([]byte, error) {
 	return []byte(m.xmlOutput), nil
 }
+
+// installScheduleForTest writes the real scheduler registration for one binary
+// into a temp home, so the identity check has something true to compare against.
+func installScheduleForTest(t *testing.T, stateDir, home, binary string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(binary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := scheduler.Install(scheduler.InstallOptions{
+		Config: scheduler.TaskConfig{
+			Platform: runtime.GOOS,
+			StateDir: stateDir,
+			Binary:   binary,
+			Interval: scheduler.DefaultInterval,
+			HomeDir:  home,
+		},
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("the windows task is registered by schtasks; covered by the scheduler package tests")
+	}
+	for _, f := range plan.Files {
+		if err := os.MkdirAll(filepath.Dir(f.Path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.Path, []byte(f.Content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// An upgrade replaces one path. If the schedule starts a different copy, doctor
+// must say so instead of reporting a healthy install — that is the difference
+// between "I upgraded" and "the scheduled runs use the new binary".
+func TestDoctorBinaryIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	scheduled := filepath.Join(t.TempDir(), "scheduled", "toktrail")
+	installScheduleForTest(t, stateDir, home, scheduled)
+
+	t.Run("mismatch_fails_with_both_paths", func(t *testing.T) {
+		other := filepath.Join(t.TempDir(), "other", "toktrail")
+		if err := os.MkdirAll(filepath.Dir(other), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(other, []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, err := Doctor(DoctorOptions{
+			StateDir: stateDir, Binary: other, HomeDir: home, Version: "v0.6.0",
+			LookPath: func(string) (string, error) { return "", os.ErrNotExist },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := findCheck(t, report, "binary")
+		if check.Status != CheckFail {
+			t.Fatalf("status = %s, want fail: %s", check.Status, check.Detail)
+		}
+		if !strings.Contains(check.Detail, scheduled) || !strings.Contains(check.Detail, other) {
+			t.Fatalf("the failure must name both paths, got %q", check.Detail)
+		}
+		if !strings.Contains(check.Detail, "would not affect scheduled runs") {
+			t.Fatalf("the failure must state the consequence, got %q", check.Detail)
+		}
+	})
+
+	t.Run("same_binary_is_ok", func(t *testing.T) {
+		report, err := Doctor(DoctorOptions{
+			StateDir: stateDir, Binary: scheduled, HomeDir: home, Version: "v0.6.0",
+			LookPath: func(string) (string, error) { return scheduled, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := findCheck(t, report, "binary")
+		if check.Status != CheckOK {
+			t.Fatalf("status = %s, want ok: %s", check.Status, check.Detail)
+		}
+		if !strings.Contains(check.Detail, "v0.6.0") {
+			t.Fatalf("the ok line must name the version, got %q", check.Detail)
+		}
+	})
+
+	t.Run("path_copy_differs_warns", func(t *testing.T) {
+		pathCopy := filepath.Join(t.TempDir(), "path", "toktrail")
+		if err := os.MkdirAll(filepath.Dir(pathCopy), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pathCopy, []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, err := Doctor(DoctorOptions{
+			StateDir: t.TempDir(), Binary: pathCopy, HomeDir: t.TempDir(), Version: "v0.6.0",
+			LookPath: func(string) (string, error) { return scheduled, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := findCheck(t, report, "binary")
+		if check.Status != CheckWarn {
+			t.Fatalf("status = %s, want warn: %s", check.Status, check.Detail)
+		}
+	})
+
+	t.Run("symlinked_copy_is_the_same_install", func(t *testing.T) {
+		linkDir := t.TempDir()
+		link := filepath.Join(linkDir, "toktrail")
+		if err := os.Symlink(scheduled, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		report, err := Doctor(DoctorOptions{
+			StateDir: stateDir, Binary: link, HomeDir: home, Version: "v0.6.0",
+			LookPath: func(string) (string, error) { return link, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if check := findCheck(t, report, "binary"); check.Status != CheckOK {
+			t.Fatalf("a symlink to the scheduled binary must not fail: %s", check.Detail)
+		}
+	})
+}

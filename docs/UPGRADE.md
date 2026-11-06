@@ -37,6 +37,21 @@ difference is measured in seconds instead of a full re-parse; on a machine that
 was repeatedly hitting the old two-minute window this is what makes a run reach
 its first export commit at all.
 
+## How to upgrade
+
+```sh
+toktrail upgrade --check        # what is installed, what the latest release is
+toktrail upgrade --to v0.6.0    # verify and replace this installation in place
+```
+
+`upgrade` replaces exactly one file (the binary that is running, with the
+previous copy kept as `<binary>.previous`) and refuses to run without a pinned
+public key, so it never installs an unverified release. It also refuses when the
+running binary is not the released artifact for this platform (a source build or
+a locally modified binary), unless `--skip-self-check` says so explicitly. `toktrail doctor`'s
+`binary` line confirms afterwards that the schedule starts the same binary that
+was upgraded; its `scan-cache` line confirms the new scan state exists.
+
 ## Verifying the upgrade took effect
 
 ```

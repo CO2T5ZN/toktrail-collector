@@ -28,7 +28,7 @@
 #     registration. There is no automatic rollback; see docs/RELEASE.md.
 #     --upgrade and --connect are mutually exclusive.
 #
-# Usage: install-{{.Version}}.sh [BASE_URL [INSTALL_DIR]] [--connect LINK] [--upgrade]
+# Usage: install-{{.Version}}.sh [BASE_URL [INSTALL_DIR]] [--connect LINK] [--upgrade] [--no-path]
 #   BASE_URL      release download root that serves manifest.json et al.
 #                 (also via TOKTRAIL_DOWNLOAD_BASE); defaults to the
 #                 official GitHub release download root for {{.Version}}
@@ -42,6 +42,8 @@
 #                 install, runs 'toktrail connect LINK' using the
 #                 absolute path of the binary just installed
 #   --upgrade     in-place upgrade of an existing installation only
+#   --no-path     never offer to add the install directory to PATH
+#                 (also: TOKTRAIL_SKIP_PATH_SETUP=1)
 set -eu
 
 VERSION='{{.Version}}'
@@ -54,6 +56,7 @@ INSTALL_DIR_ARG=""
 CONNECT_URL=""
 UPGRADE=0
 POSITIONAL=0
+NO_PATH_SETUP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --connect)
@@ -69,6 +72,10 @@ while [ $# -gt 0 ]; do
       ;;
     --upgrade)
       UPGRADE=1
+      shift
+      ;;
+    --no-path)
+      NO_PATH_SETUP=1
       shift
       ;;
     --*)
@@ -169,6 +176,128 @@ else
     -version "$VERSION" \
     -pubkey "$TMP/pub.pem" \
     -install-dir "$INSTALL_DIR"
+fi
+
+# PATH setup. Installing into a directory that no shell searches leaves
+# `toktrail: command not found` right after a successful install, which reads
+# as a broken install. So after an install (never an upgrade) this offers to add
+# the directory to the user's shell profile:
+#   - it asks on the controlling terminal and DEFAULTS TO YES (empty answer
+#     means yes; only an explicit n/no declines);
+#   - with no terminal to ask (an unattended `curl | sh`, CI) it proceeds with
+#     that same default, and prints exactly what it wrote and how to undo it;
+#   - it only ever appends one marked line to the profile for $SHELL, is
+#     idempotent (re-running adds nothing), and never rewrites existing lines;
+#   - --no-path / TOKTRAIL_SKIP_PATH_SETUP=1 opts out entirely.
+# Scheduled collection never needs PATH: the task invokes the binary by
+# absolute path.
+path_setup_done=0
+if [ "$UPGRADE" = 0 ]; then
+  ABS_PATH_DIR="$INSTALL_DIR"
+  case "$ABS_PATH_DIR" in
+    /*) ;;
+    *) ABS_PATH_DIR="$(cd "$ABS_PATH_DIR" && pwd)" || ABS_PATH_DIR="$INSTALL_DIR" ;;
+  esac
+  on_path=0
+  old_ifs=$IFS
+  IFS=:
+  for dir in $PATH; do
+    case "$dir" in
+      /*) ;;
+      *) continue ;;
+    esac
+    if [ "$(cd "$dir" 2>/dev/null && pwd -P)" = "$(cd "$ABS_PATH_DIR" 2>/dev/null && pwd -P)" ]; then
+      on_path=1
+    fi
+  done
+  IFS=$old_ifs
+
+  if [ "$on_path" = 1 ]; then
+    path_setup_done=1
+  elif [ "${TOKTRAIL_SKIP_PATH_SETUP:-}" = 1 ] || [ "$NO_PATH_SETUP" = 1 ]; then
+    echo ""
+    echo "note: skipped adding $ABS_PATH_DIR to PATH (--no-path); add it yourself if you want \`toktrail\` in a shell:"
+    echo "      export PATH=\"$ABS_PATH_DIR:\$PATH\""
+    echo ""
+  else
+    profile=""
+    path_line=""
+    case "${SHELL:-}" in
+      */zsh)
+        profile="$HOME/.zshrc"
+        path_line="export PATH=\"$ABS_PATH_DIR:\$PATH\""
+        ;;
+      */bash)
+        if [ "$(uname -s)" = "Darwin" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+        path_line="export PATH=\"$ABS_PATH_DIR:\$PATH\""
+        ;;
+      */fish)
+        profile="$HOME/.config/fish/config.fish"
+        path_line="fish_add_path \"$ABS_PATH_DIR\""
+        ;;
+      *)
+        profile=""
+        ;;
+    esac
+    if [ -z "$profile" ]; then
+      echo ""
+      echo "note: $ABS_PATH_DIR is not on PATH and \$SHELL (${SHELL:-unset}) is not a shell this script edits."
+      echo "      add it to your shell's startup file:  export PATH=\"$ABS_PATH_DIR:\$PATH\""
+      echo "      Scheduled collection does not need PATH: the task invokes $ABS_PATH_DIR/toktrail directly."
+      echo ""
+    else
+      already=0
+      if [ -f "$profile" ] && grep -F -x -q -- "$path_line" "$profile" 2>/dev/null; then
+        already=1
+      fi
+      if [ "$already" = 1 ]; then
+        path_setup_done=1
+      else
+        answer=""
+        if ( : </dev/tty ) 2>/dev/null; then
+          # Ask on the terminal, never on stdin: under `curl | sh` stdin is the
+          # script itself, so a prompt reading it would consume script text.
+          printf 'Add %s to PATH in %s? [Y/n] ' "$ABS_PATH_DIR" "$profile" >/dev/tty 2>/dev/null || true
+          if IFS= read -r answer </dev/tty 2>/dev/null; then :; else answer=""; fi
+        fi
+        case "$answer" in
+          n|N|no|No|NO)
+            echo ""
+            echo "note: left PATH unchanged; add it yourself with:  $path_line"
+            echo ""
+            ;;
+          *)
+            mkdir -p -- "$(dirname -- "$profile")" 2>/dev/null || true
+            if [ -w "$profile" ] || [ ! -e "$profile" ]; then
+              {
+                echo ""
+                echo "# TokTrail collector: added by $0"
+                echo "$path_line"
+              } >> "$profile"
+              path_setup_done=1
+              echo ""
+              echo "==> added to PATH in $profile:"
+              echo "    $path_line"
+              echo "    open a new terminal (or run: . \"$profile\") to use \`toktrail\`"
+              echo "    to undo: delete the line above from $profile"
+              echo ""
+            else
+              echo ""
+              echo "note: could not write $profile; add it yourself with:  $path_line"
+              echo ""
+            fi
+            ;;
+        esac
+      fi
+    fi
+  fi
+  if [ "$path_setup_done" = 1 ] && [ "$on_path" = 1 ]; then
+    :
+  fi
+  if [ "$path_setup_done" = 1 ] && [ "$on_path" = 0 ]; then
+    echo "note: scheduled collection does not need PATH: the task invokes $ABS_PATH_DIR/toktrail directly."
+    echo ""
+  fi
 fi
 
 if [ -n "$CONNECT_URL" ]; then

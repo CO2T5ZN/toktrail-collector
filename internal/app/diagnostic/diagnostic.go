@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -172,6 +173,12 @@ type DoctorOptions struct {
 	HTTPClient  *http.Client
 	// Binary is the executable path used for scheduler task inspection.
 	Binary string
+	// Version is the running collector's build version ("" when unknown).
+	Version string
+	// LookPath resolves a bare command name to a path (defaults to
+	// exec.LookPath; injectable for tests). It answers "which copy would a
+	// shell start?" independently of the running binary.
+	LookPath func(string) (string, error)
 	// HomeDir is the user home directory for scheduler path resolution.
 	HomeDir string
 	// Runner is an optional command runner for scheduler inspection (used in tests).
@@ -218,6 +225,92 @@ func (r DoctorReport) Failed() bool {
 // committed scan ledger, and whether the known-record cache exists. Both are
 // accelerators — a missing one only costs a full re-read — so this never
 // fails a doctor run.
+// binaryIdentityCheck compares the running binary with the schedule's
+// registered binary and with the copy a shell would start.
+//
+//   - fail when the schedule starts a different binary than the one running:
+//     an upgrade of the running copy does not affect scheduled runs;
+//   - warn when PATH resolves to yet another copy (two installations), which
+//     makes `toktrail ...` from a shell hit a different build than the
+//     scheduler;
+//   - ok otherwise, naming the version so support can see it at a glance.
+func binaryIdentityCheck(opt DoctorOptions) Check {
+	current := strings.TrimSpace(opt.Binary)
+	if current == "" {
+		return Check{Name: "binary", Status: CheckSkipped, Detail: "running binary path unknown; identity check skipped"}
+	}
+	currentResolved := resolvePath(current)
+	version := strings.TrimSpace(opt.Version)
+	versionLabel := "version unknown"
+	if version != "" {
+		versionLabel = "version " + version
+	}
+
+	lookPath := opt.LookPath
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	pathCopy := ""
+	if found, err := lookPath("toktrail"); err == nil {
+		pathCopy = found
+	}
+
+	cfg := scheduler.TaskConfig{
+		Platform: platformOf(),
+		StateDir: strings.TrimSpace(opt.StateDir),
+		Binary:   current,
+		Interval: scheduler.DefaultInterval,
+		HomeDir:  opt.HomeDir,
+	}
+	registered := ""
+	source := ""
+	if path, src, found, err := scheduler.RegisteredBinary(cfg); err == nil && found {
+		registered, source = path, src
+	}
+
+	switch {
+	case registered != "" && resolvePath(registered) != currentResolved:
+		return Check{
+			Name:   "binary",
+			Status: CheckFail,
+			Detail: fmt.Sprintf("the schedule starts %s (from %s), but this command is %s (%s); upgrading this copy would not affect scheduled runs - upgrade or reinstall the scheduled path, or re-register the schedule with `toktrail service install`", registered, source, current, versionLabel),
+		}
+	case pathCopy != "" && resolvePath(pathCopy) != currentResolved:
+		return Check{
+			Name:   "binary",
+			Status: CheckWarn,
+			Detail: fmt.Sprintf("PATH resolves `toktrail` to %s while this command is %s (%s); two installations exist, so a shell command and the scheduled run may use different builds", pathCopy, current, versionLabel),
+		}
+	case registered != "":
+		return Check{
+			Name:   "binary",
+			Status: CheckOK,
+			Detail: fmt.Sprintf("%s (%s); the schedule starts this same binary", current, versionLabel),
+		}
+	default:
+		return Check{
+			Name:   "binary",
+			Status: CheckOK,
+			Detail: fmt.Sprintf("%s (%s); no scheduled task to compare against", current, versionLabel),
+		}
+	}
+}
+
+// resolvePath makes two spellings of one file comparable (absolute, symlinks
+// resolved). An unresolvable path falls back to its cleaned form so the
+// comparison still happens; a resolution difference alone must never turn a
+// healthy install into a failure.
+func resolvePath(path string) string {
+	clean := filepath.Clean(path)
+	if abs, err := filepath.Abs(clean); err == nil {
+		clean = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return resolved
+	}
+	return clean
+}
+
 func scanCacheCheck(stateDir string) Check {
 	sources := []string{
 		adapter.CodexJSONLSource,
@@ -356,6 +449,13 @@ func Doctor(opt DoctorOptions) (DoctorReport, error) {
 			add("scheduler", CheckWarn, "no scheduled task for this state directory (`toktrail service install`)")
 		}
 	}
+
+	// 5b. Version and installation identity. An upgrade replaces the binary at
+	// ONE path; if the schedule starts a different copy (a second install, an
+	// older PATH copy, a symlink target that moved), the upgrade silently does
+	// nothing for the scheduled runs. Compare the three paths that matter and
+	// say which is which instead of leaving "I upgraded but nothing changed".
+	report.Checks = append(report.Checks, binaryIdentityCheck(opt))
 
 	// 6. Optional server check (the only network path, explicit opt-in).
 	if opt.CheckServer {

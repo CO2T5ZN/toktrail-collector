@@ -128,6 +128,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "privacy failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "upgrade":
+		if err := runUpgrade(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "upgrade failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "doctor":
 		if err := runDoctor(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "doctor failed: %v\n", err)
@@ -2453,6 +2458,7 @@ func runDoctor(args []string) error {
 		ServerURL:   *serverURL,
 		Binary:      binary,
 		HomeDir:     home,
+		Version:     version,
 	})
 	if err != nil {
 		return err
@@ -2571,6 +2577,8 @@ Scheduling and diagnostics (implemented):
   privacy [--source <s> --input <path>]
                                local-only report of what would be uploaded;
                                never touches the network
+  upgrade [--check] [--to V]   verify and replace this installation in place
+                               (state, grants, outbox and the schedule are untouched)
   doctor [--check-server]      local health checks; the server check is the
                                only networked one and is opt-in
 

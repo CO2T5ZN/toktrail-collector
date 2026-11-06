@@ -66,8 +66,18 @@ build_target() {
   extension=
   if [ "$build_os" = windows ]; then extension=.exe; fi
   echo "Building $build_os/$build_arch"
+  # Pin the release public key into the collector binary so `toktrail upgrade`
+  # can verify a release on a machine that has no copy of the key. The value is
+  # base64 of the PEM text: a linker flag is one token, and the key is public
+  # material. Set TOKTRAIL_RELEASE_PUBKEY to the same pin the bootstrap scripts
+  # use; when it is unset the binary carries no anchor and `upgrade` requires an
+  # explicit --pubkey (never an unverified install).
+  upgrade_ldflags=
+  if [ -n "${TOKTRAIL_RELEASE_PUBKEY:-}" ] && [ -f "${TOKTRAIL_RELEASE_PUBKEY}" ]; then
+    upgrade_ldflags=" -X main.releasePubKeyB64=$(base64 < "${TOKTRAIL_RELEASE_PUBKEY}" | tr -d '\n')"
+  fi
   GOOS=$build_os GOARCH=$build_arch CGO_ENABLED=0 "$go_bin" build -trimpath \
-    -ldflags "-s -w -X main.version=$version" \
+    -ldflags "-s -w -X main.version=$version$upgrade_ldflags" \
     -o "$dist_dir/toktrail-$version-$build_os-$build_arch$extension" ./cmd/toktrail
   # Retain the schema-1 filename for existing bootstrap consumers.
   GOOS=$build_os GOARCH=$build_arch CGO_ENABLED=0 "$go_bin" build -trimpath \

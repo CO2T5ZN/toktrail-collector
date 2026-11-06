@@ -193,6 +193,36 @@ sh install-v0.1.0.sh https://downloads.example.invalid/toktrail/v0.1.0 "$HOME/.l
 
 The `.invalid` host above is a placeholder for a custom mirror; it is not the default. A public production download host beyond the default GitHub release root is still operator configuration when one is needed.
 
+### Upgrading from the machine itself: `toktrail upgrade`
+
+Besides the bootstrap script's `--upgrade` and the release tool's `upgrade`
+subcommand, an installed collector can upgrade itself:
+
+```sh
+toktrail upgrade --check                 # installed vs available; changes nothing
+toktrail upgrade --to v0.6.0             # verify and replace this installation in place
+```
+
+Two properties matter here:
+
+- **It targets the binary that is running.** `--install-dir` defaults to the directory of the current executable (symlinks resolved), not the first `toktrail` on `PATH`. A machine with two installations therefore upgrades the one the scheduled task actually starts; `toktrail doctor`'s `binary` check reports a mismatch between the running binary, `PATH` and the schedule's registered path.
+- **The trust root is never invented.** The pinned public key comes from `--pubkey`, from `TOKTRAIL_RELEASE_PUBKEY` (a path or inline PEM), or from the key pinned into the release build (`scripts/release.sh` passes `-X main.releasePubKeyB64` when `TOKTRAIL_RELEASE_PUBKEY` names a key file). With no trust root an upgrade refuses; `--check` still answers but labels the version `UNVERIFIED`.
+
+Before replacing anything, the running collector hashes itself and compares that with the release manifest's collector entry for its platform: a binary built from source or modified locally refuses to replace itself unless `--skip-self-check` is given explicitly. The replaced binary keeps the previous copy at `<binary>.previous`, and nothing else changes: no state, grants or outbox, no upload consent, no connect, no scheduler registration.
+
+### Where the binary lands, and PATH
+
+Both bootstrap scripts install to a fixed default directory — `$HOME/.toktrail/bin` on unix, `%USERPROFILE%\.toktrail\bin` on Windows — or to the directory given as the second positional argument / `-InstallDir`.
+
+After an install (never an upgrade) the script offers to put that directory on `PATH`:
+
+- it asks on the **controlling terminal**, not stdin (under `curl | sh` stdin is the script itself), and an empty answer means **yes** — only an explicit `n`/`no` declines;
+- with no terminal to ask — an unattended `curl | sh`, CI — the same default applies, and the script prints exactly what it wrote and how to undo it;
+- it appends one marked line to the startup file for `$SHELL` (`~/.zshrc`, `~/.bash_profile` on macOS / `~/.bashrc` on Linux, `~/.config/fish/config.fish`), is idempotent, and never rewrites existing lines. An unrecognised shell is reported instead of guessed;
+- `--no-path` / `-NoPathSetup` / `TOKTRAIL_SKIP_PATH_SETUP=1` opts out.
+
+Scheduled collection never depends on PATH: the launchd plist, systemd unit or scheduled task invokes the binary by absolute path. The PATH change only makes manual `toktrail ...` commands work.
+
 ### `--connect` / `-ConnectUrl`: bootstrap-then-connect in one step
 
 Both bootstrap scripts accept an optional one-time connect link. When given, the script runs the just-installed `toktrail connect <link>` immediately after a successful binary install, using the absolute path of the binary it just placed:

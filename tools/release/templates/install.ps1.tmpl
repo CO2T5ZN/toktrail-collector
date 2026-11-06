@@ -46,7 +46,8 @@ param(
   [string]$BaseUrl = "https://github.com/lich0821/toktrail-collector/releases/download/{{.Version}}",
   [string]$InstallDir = "$env:USERPROFILE\.toktrail\bin",
   [string]$ConnectUrl = "",
-  [switch]$Upgrade
+  [switch]$Upgrade,
+  [switch]$NoPathSetup
 )
 $ErrorActionPreference = 'Stop'
 $version = '{{.Version}}'
@@ -118,6 +119,60 @@ try {
   & $tool $mode @toolArgs
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
+  }
+
+  # PATH setup. Installing into a directory no shell searches leaves
+  # "toktrail is not recognized" right after a successful install. After an
+  # install (never an upgrade) this offers to add the directory to the user
+  # PATH: it prompts with a YES default, honours an explicit "n", and is
+  # idempotent. -NoPathSetup / TOKTRAIL_SKIP_PATH_SETUP=1 opts out. Scheduled
+  # collection never needs PATH: the task invokes the exe by absolute path.
+  if (-not $Upgrade) {
+    $installPath = (Resolve-Path -LiteralPath $InstallDir).Path
+    $onPath = $false
+    foreach ($dir in @($env:Path -split ';')) {
+      if (-not $dir) { continue }
+      try {
+        $resolved = (Resolve-Path -LiteralPath $dir -ErrorAction Stop).Path
+        if ($resolved.TrimEnd([char]'\') -ieq $installPath.TrimEnd([char]'\')) { $onPath = $true }
+      } catch { }
+    }
+    if ($onPath) {
+      # nothing to do
+    } elseif ($NoPathSetup -or $env:TOKTRAIL_SKIP_PATH_SETUP -eq '1') {
+      Write-Host ""
+      Write-Host "note: skipped adding $installPath to PATH (-NoPathSetup); add it yourself if you want 'toktrail' in a shell:"
+      Write-Host "      `$env:Path = `"$installPath;`$env:Path`""
+      Write-Host ""
+    } else {
+      $answer = Read-Host "Add $installPath to PATH for your user account? [Y/n]"
+      if ($answer -match '^(n|no)$') {
+        Write-Host ""
+        Write-Host "note: left PATH unchanged; add it yourself with:  `$env:Path = `"$installPath;`$env:Path`""
+        Write-Host ""
+      } else {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not $userPath) { $userPath = '' }
+        $alreadyThere = $false
+        foreach ($dir in @($userPath -split ';')) {
+          if ($dir -and $dir.TrimEnd([char]'\') -ieq $installPath.TrimEnd([char]'\')) { $alreadyThere = $true }
+        }
+        if ($alreadyThere) {
+          Write-Host "==> $installPath is already in your user PATH"
+        } else {
+          $newPath = if ($userPath) { "$installPath;$userPath" } else { $installPath }
+          [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+          $env:Path = "$installPath;$env:Path"
+          Write-Host ""
+          Write-Host "==> added to your user PATH: $installPath"
+          Write-Host "    open a new terminal to use 'toktrail'; this session has it already"
+          Write-Host "    to undo: remove that entry in System Properties > Environment Variables"
+          Write-Host ""
+        }
+        Write-Host "note: scheduled collection does not need PATH: the task invokes $installPath\toktrail.exe directly."
+        Write-Host ""
+      }
+    }
   }
 
   if ($ConnectUrl) {

@@ -277,6 +277,7 @@ exit 0
 	// 1. Success case: verify installer runs, returns 0, and TMP directory is cleaned up.
 	baseURL := "file://" + filepath.ToSlash(serverDir)
 	cmd := exec.Command("/bin/sh", installScript, baseURL, filepath.Join(dir, "install_target"))
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.sh failed: %v\nOutput: %s", err, out)
@@ -297,7 +298,7 @@ exit 0
 	// 2. Failure case: verify installer failure propagates exit code, and TMP directory is STILL cleaned up.
 	os.Remove(recordTmpFile)
 	cmdFail := exec.Command("/bin/sh", installScript, baseURL, filepath.Join(dir, "install_target"))
-	cmdFail.Env = append(os.Environ(), "FAIL_INSTALLER=1")
+	cmdFail.Env = append(os.Environ(), "FAIL_INSTALLER=1", "HOME="+t.TempDir())
 	outFail, errFail := cmdFail.CombinedOutput()
 	if errFail == nil {
 		t.Fatalf("expected install.sh to fail with exit 42, but succeeded. Output: %s", outFail)
@@ -324,6 +325,31 @@ exit 0
 // a fake "toktrail" binary (a shell script) at the chosen install dir. The
 // fake toktrail records any "connect <url>" invocation and can be told to
 // fail via the CONNECT_FAIL env var, without ever using a real ticket/link.
+
+// hermeticHomeEnv returns an environment whose HOME points at a temp directory.
+// Every test that EXECUTES the generated installer must use it: the installer
+// (by design) offers to add its directory to the user's shell profile, so an
+// inherited HOME would edit the developer's real startup files.
+func hermeticHomeEnv(t *testing.T) (env []string, home string) {
+	t.Helper()
+	home = t.TempDir()
+	env = append(os.Environ(), "HOME="+home, "TOKTRAIL_HOME="+filepath.Join(home, "state"))
+	return env, home
+}
+
+// runInstaller executes the generated shell script in a hermetic HOME.
+func runInstaller(t *testing.T, args ...string) (string, string) {
+	t.Helper()
+	env, home := hermeticHomeEnv(t)
+	cmd := exec.Command("/bin/sh", args...)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install script failed: %v\n%s", err, out)
+	}
+	return string(out), home
+}
+
 func connectTestFixture(t *testing.T) (installScript, baseURL, connectRecordFile string, workDir string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -431,6 +457,7 @@ func TestConnectFlagInvokesInstalledBinary(t *testing.T) {
 	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
 
 	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect", placeholderLink)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.sh --connect failed: %v\nOutput: %s", err, out)
@@ -452,6 +479,7 @@ func TestConnectFlagEqualsForm(t *testing.T) {
 	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
 
 	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect="+placeholderLink)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.sh --connect=LINK failed: %v\nOutput: %s", err, out)
@@ -475,7 +503,7 @@ func TestConnectFlagFailurePropagates(t *testing.T) {
 	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
 
 	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect", placeholderLink)
-	cmd.Env = append(os.Environ(), "CONNECT_FAIL=13")
+	cmd.Env = append(os.Environ(), "CONNECT_FAIL=13", "HOME="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected install.sh to fail with exit 13, but succeeded. Output: %s", out)
@@ -511,6 +539,7 @@ func TestConnectFlagValidation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command("/bin/sh", append([]string{installScript}, tc.args...)...)
+			cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 			out, err := cmd.CombinedOutput()
 			if err == nil {
 				t.Fatalf("expected install.sh to reject arguments, but succeeded. Output: %s", out)
@@ -622,6 +651,7 @@ func TestPOSIXScriptUpgradeModeInvokesInstallerWithoutDefaultInstallDir(t *testi
 	installScript, baseURL, recordFile := upgradeTestFixture(t)
 
 	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh --upgrade failed: %v\nOutput: %s", err, out)
 	}
@@ -646,6 +676,7 @@ func TestPOSIXScriptUpgradeModeForwardsExplicitInstallDir(t *testing.T) {
 	dir := t.TempDir()
 
 	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL, dir)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh --upgrade with install dir failed: %v\nOutput: %s", err, out)
 	}
@@ -669,6 +700,7 @@ func TestPOSIXScriptUpgradeRejectsConnect(t *testing.T) {
 	installScript, baseURL, recordFile := upgradeTestFixture(t)
 
 	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL, "--connect", "TEST_TICKET_PLACEHOLDER")
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected install.sh --upgrade --connect to fail, succeeded. Output: %s", out)
@@ -688,6 +720,7 @@ func TestPOSIXScriptInstallModeStillDefaultsInstallDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "target")
 
 	cmd := exec.Command("/bin/sh", installScript, baseURL, dir)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh failed: %v\nOutput: %s", err, out)
 	}
@@ -749,6 +782,9 @@ if IFS= read -r line; then echo "read=$line" >> ` + recordFile + `.stdin; else e
 	scriptText += "echo TRAILING_LINE_RAN\n"
 
 	cmd := exec.Command("/bin/sh", "-s", "--", baseURL, installTarget, "--connect", placeholderLink)
+	// A real HOME would let this test edit the developer's shell profile: the
+	// installer offers the PATH change before connect runs.
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 	cmd.Stdin = strings.NewReader(scriptText)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -768,4 +804,74 @@ if IFS= read -r line; then echo "read=$line" >> ` + recordFile + `.stdin; else e
 	if !strings.Contains(reportText, "read=EOF") {
 		t.Fatalf("reading the inherited stdin must yield no answer (never script text), got:\n%s", reportText)
 	}
+}
+
+// The PowerShell installer must offer the same PATH setup as the shell one
+// (execution is covered by the Windows gate; this pins the generated text so
+// the two scripts cannot drift).
+func TestPowerShellInstallerCarriesPathSetup(t *testing.T) {
+	dir := t.TempDir()
+	_, pubPEM := generateTestPubKey(t)
+	paths, err := EmitInstallScripts(dir, testManifest("v1.2.3"), pubPEM)
+	if err != nil {
+		t.Fatalf("EmitInstallScripts: %v", err)
+	}
+	var ps1 string
+	for _, path := range paths {
+		if strings.HasSuffix(path, ".ps1") {
+			raw, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			ps1 = string(raw)
+		}
+	}
+	if ps1 == "" {
+		t.Fatal("no generated .ps1 script")
+	}
+	for _, want := range []string{
+		"Read-Host",
+		"[Y/n]",
+		"[Environment]::SetEnvironmentVariable('Path', $newPath, 'User')",
+		"$NoPathSetup",
+		"TOKTRAIL_SKIP_PATH_SETUP",
+		"Scheduled collection does not need PATH",
+		"if (-not $Upgrade)",
+	} {
+		if !strings.Contains(strings.ToLower(ps1), strings.ToLower(want)) {
+			t.Fatalf("the PowerShell installer must contain %q", want)
+		}
+	}
+}
+
+// Guard: no test in this file may execute the generated installer with the
+// process's own HOME. That is how a test suite edits a developer's real
+// ~/.zshrc, which is exactly what happened once while the PATH offer was added.
+func TestAllInstallerExecutionsUseAHermeticHome(t *testing.T) {
+	raw, err := os.ReadFile("scripts_test.go")
+	if err != nil {
+		t.Fatalf("read own source: %v", err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	const needle = "exec." + "Command(\"/bin/sh\""
+	for i, line := range lines {
+		if !strings.Contains(line, needle) {
+			continue
+		}
+		// The next few lines must set HOME to a temp directory before the
+		// command runs.
+		window := strings.Join(lines[i:min(i+4, len(lines))], "\n")
+		// A helper that returns the environment (env := …, cmd.Env = env) is
+		// also fine: runInstaller builds a hermetic HOME itself.
+		if !strings.Contains(window, `"HOME="+`) && !strings.Contains(window, "cmd.Env = env") {
+			t.Fatalf("line %d runs a command without a hermetic HOME:\n%s", i+1, window)
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
