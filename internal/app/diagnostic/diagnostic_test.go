@@ -542,3 +542,55 @@ func TestDoctorBinaryIdentity(t *testing.T) {
 		}
 	})
 }
+
+// A scheduler query that fails must not read as "no task installed": that would
+// report a healthy-looking install whose identity was never verified. It is a
+// warning, exactly like the neighbouring scheduler check.
+func TestDoctorBinaryIdentityWarnsWhenTheTaskCannotBeInspected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the POSIX registration is a plist file; Windows uses schtasks")
+	}
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "toktrail")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := scheduler.RenderInstall(scheduler.TaskConfig{
+		Platform: runtime.GOOS, StateDir: stateDir, Binary: binary,
+		Interval: scheduler.DefaultInterval, HomeDir: home,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Files) == 0 {
+		t.Skip("no registration file on this platform")
+	}
+	written := ""
+	for _, f := range plan.Files {
+		if err := os.MkdirAll(filepath.Dir(f.Path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.Path, []byte(f.Content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		written = f.Path
+	}
+	// Unreadable registration: the identity check cannot verify what the
+	// schedule starts, and must say so instead of claiming there is no task.
+	if err := os.Chmod(written, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(written, 0o600) })
+
+	report, err := Doctor(DoctorOptions{
+		StateDir: stateDir, Binary: binary, HomeDir: home, Version: "v0.6.0",
+		LookPath: func(string) (string, error) { return binary, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check := findCheck(t, report, "binary"); check.Status != CheckWarn {
+		t.Fatalf("an unreadable registration must warn, got %s: %s", check.Status, check.Detail)
+	}
+}

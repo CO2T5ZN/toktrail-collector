@@ -556,17 +556,20 @@ func accountVerdictFixtures() map[string]struct {
 }
 
 // TestSummarizeRunAccountVerdictCodes pins the closed codes for the
-// two account-source verdict classes evaluateIncomplete flags (the
-// declined first-time enable, the withheld permit): the run keeps its
-// fatal_error verdict — the verdict codes explain it, they never
-// downgrade it — and the machine JSON carries only the closed code,
-// never the skip reason's paths, URLs or credentials.
+// two account-source verdict classes evaluateIncomplete flags (an
+// enable that did not complete, and a withheld permit) and the verdict
+// they drive: an AUTHORIZED source this device could not cover is
+// partial — incomplete, never a claimed completion and never a fatal
+// error. Calling it fatal made a named, expected condition print
+// "an unexpected error occurred", indistinguishable from a crash. The
+// machine JSON still carries only the closed code, never the skip
+// reason's paths, URLs or credentials.
 func TestSummarizeRunAccountVerdictCodes(t *testing.T) {
 	for name, tc := range accountVerdictFixtures() {
 		t.Run(name, func(t *testing.T) {
 			got := SummarizeRun(tc.res, fmt.Errorf("%w: the account source did not run", ErrSyncIncomplete), nil, 12)
-			if got.StopReason != collection.StopFatalError {
-				t.Fatalf("stopReason = %q, want fatal_error (the verdict code must not change the exit semantics)", got.StopReason)
+			if got.StopReason != collection.StopPartial {
+				t.Fatalf("stopReason = %q, want partial (an authorized source the device could not cover)", got.StopReason)
 			}
 			if strings.Join(got.IncompleteCodes, ",") != tc.want {
 				t.Fatalf("incompleteCodes = %v, want exactly [%s]", got.IncompleteCodes, tc.want)
@@ -927,5 +930,36 @@ func TestSummarizeRunAccountVerdictsNeverFabricate(t *testing.T) {
 				t.Fatalf("incompleteCodes = %v, want [%s] (no fabricated account verdict code)", got.IncompleteCodes, tc.want)
 			}
 		})
+	}
+}
+
+// A cursor round that RAN and failed (a pull error, a corrupt permit) is a hard
+// failure, not "incomplete": `toktrail periodic` classifies the same state as
+// fatal_error, and a monitoring rule keyed on stop_reason must not see a real
+// fault as a soft gap. Only a round that never ran is partial.
+func TestSummarizeFailedAccountRoundStaysFatal(t *testing.T) {
+	res := Result{
+		BindStatus: BindBound,
+		Sync: SyncResult{
+			accountIncomplete: true,
+			Collection: collection.Result{
+				Cursor: cursorsync.Result{
+					Ran:     true,
+					Outcome: cursorsync.RoundError,
+					Skipped: "the Cursor usage query failed",
+				},
+			},
+		},
+	}
+	got := SummarizeRun(res, fmt.Errorf("%w: account source Cursor failed", ErrSyncIncomplete), nil, 5)
+	if got.StopReason != collection.StopFatalError {
+		t.Fatalf("a failed account round must stay fatal, got %q", got.StopReason)
+	}
+
+	// The same marker with a round that never ran is the partial case.
+	res.Sync.Collection.Cursor = cursorsync.Result{Outcome: cursorsync.RoundNoPermit, Skipped: "no local cursor permit"}
+	got = SummarizeRun(res, fmt.Errorf("%w: account source Cursor did not run", ErrSyncIncomplete), nil, 5)
+	if got.StopReason != collection.StopPartial {
+		t.Fatalf("a round that never ran must be partial, got %q", got.StopReason)
 	}
 }

@@ -260,6 +260,14 @@ if [ "$UPGRADE" = 0 ]; then
           printf 'Add %s to PATH in %s? [Y/n] ' "$ABS_PATH_DIR" "$profile" >/dev/tty 2>/dev/null || true
           if IFS= read -r answer </dev/tty 2>/dev/null; then :; else answer=""; fi
         fi
+        # Surrounding whitespace must not turn an explicit "no " into a yes.
+        answer=$(printf '%s' "$answer" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        # A directory containing shell metacharacters cannot be written as a
+        # literal PATH line: say so instead of writing something malformed.
+        unsafe=0
+        case "$ABS_PATH_DIR" in
+          *'"'*|*'$'*|*'`'*|*'\\'*) unsafe=1 ;;
+        esac
         case "$answer" in
           n|N|no|No|NO)
             echo ""
@@ -267,32 +275,41 @@ if [ "$UPGRADE" = 0 ]; then
             echo ""
             ;;
           *)
-            mkdir -p -- "$(dirname -- "$profile")" 2>/dev/null || true
-            if [ -w "$profile" ] || [ ! -e "$profile" ]; then
-              {
-                echo ""
-                echo "# TokTrail collector: added by $0"
-                echo "$path_line"
-              } >> "$profile"
-              path_setup_done=1
+            if [ "$unsafe" = 1 ]; then
               echo ""
-              echo "==> added to PATH in $profile:"
-              echo "    $path_line"
-              echo "    open a new terminal (or run: . \"$profile\") to use \`toktrail\`"
-              echo "    to undo: delete the line above from $profile"
+              echo "note: $ABS_PATH_DIR contains characters that cannot be written literally into $profile."
+              echo "      add it yourself with the quoting your shell needs; the scheduled task uses the absolute path."
               echo ""
             else
-              echo ""
-              echo "note: could not write $profile; add it yourself with:  $path_line"
-              echo ""
+              mkdir -p -- "$(dirname -- "$profile")" 2>/dev/null || true
+              if [ -w "$profile" ] || [ ! -e "$profile" ]; then
+                # One write, not three: a concurrent installer cannot interleave
+                # its lines into the middle of this block.
+                if printf '\n# TokTrail collector: added by %s\n%s\n' "$0" "$path_line" >> "$profile" 2>/dev/null; then
+                  path_setup_done=1
+                  echo ""
+                  echo "==> added to PATH in $profile:"
+                  echo "    $path_line"
+                  echo "    open a new terminal (or run: . \"$profile\") to use \`toktrail\`"
+                  echo "    to undo: delete the line above from $profile"
+                  echo ""
+                else
+                  # set -e must not abort the install (and the --connect step)
+                  # because a profile could not be appended to.
+                  echo ""
+                  echo "note: could not write $profile; add it yourself with:  $path_line"
+                  echo ""
+                fi
+              else
+                echo ""
+                echo "note: could not write $profile; add it yourself with:  $path_line"
+                echo ""
+              fi
             fi
             ;;
         esac
       fi
     fi
-  fi
-  if [ "$path_setup_done" = 1 ] && [ "$on_path" = 1 ]; then
-    :
   fi
   if [ "$path_setup_done" = 1 ] && [ "$on_path" = 0 ]; then
     echo "note: scheduled collection does not need PATH: the task invokes $ABS_PATH_DIR/toktrail directly."

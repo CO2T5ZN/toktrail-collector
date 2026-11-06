@@ -7,6 +7,7 @@ package cursorsync_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -748,8 +749,8 @@ func TestEnableOldServerNeverReadsCredential(t *testing.T) {
 	h.srv.setCapsEnabled(false)
 	confirm := &fakeConfirm{answer: true}
 	_, err := cursorsync.Enable(context.Background(), h.options(), confirm.confirm)
-	if err == nil || !strings.Contains(err.Error(), "account-source support") {
-		t.Fatalf("old server must fail the enable, got %v", err)
+	if err == nil || !errors.Is(err, cursorsync.ErrEnableNeedsAccountSources) {
+		t.Fatalf("old server must fail the enable with the capability class, got %v", err)
 	}
 	if confirm.callCount() != 0 {
 		t.Fatalf("the first enable must not ask a second time, got %d call(s)", confirm.callCount())
@@ -1040,5 +1041,37 @@ func TestSyncLoginExpiredClassification(t *testing.T) {
 	}
 	if h.auth.fetchCount() != fetches {
 		t.Fatal("a login_expired permit must not re-read the credential")
+	}
+}
+
+// The account switch is the one place a local answer is still required: a
+// different Cursor account must not silently continue another account's history
+// and caches. Declining there is a distinct, named outcome (never a read of the
+// new credential into the ledger).
+func TestEnableAccountSwitchDeclineIsNamed(t *testing.T) {
+	h := newHarness(t)
+	h.pull.setEvents(ev("evt-a1", baseTime.Add(-30*time.Minute), 100, 0, 0, 50))
+	if _, err := cursorsync.Enable(context.Background(), h.options(), nil); err != nil {
+		t.Fatalf("first enable: %v", err)
+	}
+	h.auth.setToken("tok-B")
+	if _, err := cursorsync.Sync(context.Background(), h.options(), syncGate()); err != nil {
+		t.Fatalf("switch pause: %v", err)
+	}
+
+	decline := &fakeConfirm{answer: false}
+	_, err := cursorsync.Enable(context.Background(), h.options(), decline.confirm)
+	if !errors.Is(err, cursorsync.ErrConfirmationDeclined) {
+		t.Fatalf("a declined switch must be ErrConfirmationDeclined, got %v", err)
+	}
+	if decline.callCount() != 1 {
+		t.Fatalf("the switch must ask exactly once, got %d", decline.callCount())
+	}
+	license := loadLicense(t, h.dir)
+	if license.Status != cursorsource.StatusPausedAccountSwitch {
+		t.Fatalf("a declined switch must leave the permit paused, got %q", license.Status)
+	}
+	if license.AccountMatchID != identity.MatchAccount(accountA) {
+		t.Fatalf("the permit must still belong to account A after a decline")
 	}
 }

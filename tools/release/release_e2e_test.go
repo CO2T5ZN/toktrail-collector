@@ -122,6 +122,15 @@ func TestEndToEndRelease(t *testing.T) {
 	installDir := filepath.Join(work, "install-target")
 	scriptPath := filepath.Join(distDir, "install-"+version+".sh")
 	cmd := exec.Command("sh", scriptPath, "file://"+distDir, installDir)
+	// The generated installer offers to add its directory to the shell profile
+	// (defaulting to yes when there is no terminal to ask). A hermetic HOME keeps
+	// that write inside the test's work directory instead of the developer's real
+	// ~/.zshrc - this is the release manager's own verification run.
+	e2eHome := filepath.Join(work, "home")
+	if err := os.MkdirAll(e2eHome, 0o700); err != nil {
+		t.Fatalf("create sandboxed HOME: %v", err)
+	}
+	cmd.Env = append(os.Environ(), "HOME="+e2eHome, "TOKTRAIL_HOME="+filepath.Join(e2eHome, "state"))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bootstrap script failed: %v\n%s", err, out)
 	}

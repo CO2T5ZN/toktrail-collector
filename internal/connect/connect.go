@@ -16,6 +16,7 @@ import (
 	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/bind"
 	"toktrail-collector/internal/console"
+	cursorauth "toktrail-collector/internal/cursor/auth"
 	"toktrail-collector/internal/local/cursorsource"
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/runlock"
@@ -509,18 +510,14 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			}
 			if spec.IsAccountNetwork() {
 				// Account-network tools never map to a local directory
-				// grant. The first-time local confirmation (integrated
-				// enable) runs here, inside the state lock, because the
-				// server-side enable and the license write are state
-				// mutations; an existing permit defers to the initial
-				// collection. A confirmation failure is a clear skip — it
-				// never fails the whole connect run (the other tools keep
-				// their setup) and never reports a fabricated tool status;
-				// the sync phase reports the account source as incomplete
-				// instead.
-				accountTools = append(accountTools, spec.Tool)
+				// grant. First-time enable runs here inside the state lock;
+				// an existing permit defers to the initial collection. A
+				// missing desktop login without a prior permit is a normal
+				// not-detected source. Other enable failures leave that
+				// account source incomplete while local tools continue.
 				counted := toolCounts.counted(spec.Tool)
 				if opt.Cursor == nil {
+					accountTools = append(accountTools, spec.Tool)
 					d.phase("tool %q: account source; this build has no cursor wiring, skipped", spec.Tool)
 					if counted {
 						toolCounts.accountNotEnabled++
@@ -532,6 +529,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					return lErr
 				}
 				if hasLicense && license.Collectable() {
+					accountTools = append(accountTools, spec.Tool)
 					d.phase("tool %q: local permit already active; the initial collection continues it", spec.Tool)
 					authorizedTools = append(authorizedTools, spec.Tool)
 					if counted {
@@ -583,6 +581,25 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 					defer enableEmitter.Stop()
 					return cursorsync.Enable(ctx, enableOpts, opt.CursorConfirm)
 				}()
+				// Website authorization selects eligible tools, not tools that
+				// must be installed on every device. With no prior permit and
+				// no desktop login, Cursor is absent just like a missing local
+				// source directory. Existing permits and other credential
+				// failures still require attention.
+				if !hasLicense && !enableRes.Sync.Ran && errors.Is(enableErr, cursorauth.ErrNoLogin) {
+					if counted {
+						toolCounts.notDetected++
+					}
+					d.detail("tool %q: no local Cursor login detected; skipped", spec.Tool)
+					if !reportedProbe[spec.Tool] {
+						reportedProbe[spec.Tool] = true
+						probeStatuses = append(probeStatuses, syncclient.ToolStatus{
+							Tool: spec.Tool, Status: "not_detected",
+						})
+					}
+					continue
+				}
+				accountTools = append(accountTools, spec.Tool)
 				if enableErr != nil {
 					// The raw error text is never echoed into the human
 					// display (unvetted text may carry reflected
@@ -630,21 +647,33 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 						// confirmation prompt has no terminal to read
 						// from. Say which case happened instead of
 						// implying the user answered no.
-						// Three different things can stop a first-time
-						// enable, and they need different follow-ups: no
-						// terminal to ask, a terminal whose answer could not
-						// be read, or an answer that was not yes. Reporting
-						// all three as "not enabled" is what made a Windows
-						// console's "y" look like a refusal.
+						// Three different things can stop the remaining local
+						// question (the account-switch confirmation), and they
+						// need different follow-ups: no terminal to ask, a
+						// terminal whose answer could not be read, or an answer
+						// that was not yes. Reporting all three as "not enabled"
+						// is what once made a Windows console's "y" look like a
+						// refusal.
 						switch {
 						case errors.Is(enableErr, console.ErrNoInteractiveTerminal):
-							d.phase("tool %q: not enabled; no interactive terminal was available to confirm this first-time local enable; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+							d.phase("tool %q: not enabled; no interactive terminal was available to confirm the Cursor account switch; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
 						case errors.Is(enableErr, console.ErrAnswerUnreadable):
 							d.phase("tool %q: not enabled; the local confirmation could not be read from the terminal; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
 						case errors.Is(enableErr, cursorsync.ErrConfirmationDeclined):
 							d.phase("tool %q: not enabled; the local confirmation was answered no, so nothing was enabled; run `toktrail cursor enable` in a terminal and answer y to enable it", spec.Tool)
+						case errors.Is(enableErr, cursorsync.ErrEnableScopeWithheld):
+							d.phase("tool %q: not enabled; the current authorization on the website does not include Cursor for this device; include it in the collection scope and reconnect", spec.Tool)
+						case errors.Is(enableErr, cursorsync.ErrEnableNeedsAccountSources):
+							d.phase("tool %q: not enabled; the server does not support account sources yet", spec.Tool)
+						case errors.Is(enableErr, cursorsync.ErrEnableCredential):
+							d.phase("tool %q: not enabled; this machine's Cursor login could not be used (%s); sign in to the Cursor app on this machine, then run `toktrail cursor enable`", spec.Tool, cursorsync.CredentialFailureReason(enableErr))
+						case errors.Is(enableErr, cursorsync.ErrEnableServer):
+							d.phase("tool %q: not enabled; the server refused the enable or its first sync; run `toktrail cursor enable` in a terminal to see why", spec.Tool)
 						default:
-							d.phase("tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+							// The website grant authorizes the enable; if it still
+							// did not complete, this is a failure to report, not a
+							// consent to obtain.
+							d.phase("tool %q: not enabled; the local enable did not complete; run `toktrail cursor enable` in a terminal to see why", spec.Tool)
 						}
 					}
 					continue

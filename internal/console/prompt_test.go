@@ -174,3 +174,73 @@ func TestConfirmWindowsConsoleLineShapes(t *testing.T) {
 		t.Fatalf("an empty console line must decline without error, got (%v, %v)", got, err)
 	}
 }
+
+// A console that delivers the answer without a trailing newline (or closes the
+// handle right after it) returns the bytes together with io.EOF. That is an
+// answer, not a missing terminal — treating it as "no terminal" would refuse a
+// confirmation the user did give.
+func TestConfirmAcceptsAnAnswerWithoutTrailingNewline(t *testing.T) {
+	old := AnswerSource
+	AnswerSource = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte("y"))), nil
+	}
+	t.Cleanup(func() { AnswerSource = old })
+
+	confirmed, err := Confirm(io.Discard, "Proceed? ")
+	if err != nil {
+		t.Fatalf("a newline-less answer must not be an error: %v", err)
+	}
+	if !confirmed {
+		t.Fatal("a newline-less \"y\" must confirm")
+	}
+}
+
+// The same shape with an explicit negative answer declines (still no error).
+func TestConfirmDeclinesANewlineLessNo(t *testing.T) {
+	old := AnswerSource
+	AnswerSource = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte("n"))), nil
+	}
+	t.Cleanup(func() { AnswerSource = old })
+
+	confirmed, err := Confirm(io.Discard, "Proceed? ")
+	if err != nil || confirmed {
+		t.Fatalf("a newline-less \"n\" must decline without error, got (%v, %v)", confirmed, err)
+	}
+}
+
+// An empty stream is still "no answer" - never a decline.
+func TestConfirmEmptyStreamIsStillNoTerminal(t *testing.T) {
+	old := AnswerSource
+	AnswerSource = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	t.Cleanup(func() { AnswerSource = old })
+
+	if _, err := Confirm(io.Discard, "Proceed? "); !errors.Is(err, ErrNoInteractiveTerminal) {
+		t.Fatalf("an empty stream must be ErrNoInteractiveTerminal, got %v", err)
+	}
+}
+
+// A NUL-padded ANSI answer is not UTF-16: the looser heuristic decoded
+// "y\0\r\n" as UTF-16 and turned a confirmation into a decline.
+func TestNormalizeAnswerDoesNotMistakeNulPaddingForUTF16(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{"nul padded y", []byte{'y', 0, '\r', '\n'}, "y"},
+		{"nul padded yes", []byte{'y', 0, 'e', 0, 's', 0}, "yes"},
+		{"nul padded n", []byte{'n', 0, '\r', '\n'}, "n"},
+	}
+	for _, tc := range cases {
+		if got := normalizeAnswer(tc.raw); got != tc.want {
+			t.Fatalf("%s: normalizeAnswer(%q) = %q, want %q", tc.name, tc.raw, got, tc.want)
+		}
+	}
+	// The real UTF-16LE shape (every odd byte NUL) still decodes.
+	if got := normalizeAnswer([]byte{'y', 0, '\r', 0, '\n', 0}); got != "y" {
+		t.Fatalf("utf16le answer = %q, want y", got)
+	}
+}

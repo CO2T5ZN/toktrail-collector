@@ -369,3 +369,33 @@ func (h *harness) writeLicense(t *testing.T, license cursorsource.License) {
 		t.Fatalf("write license: %v", err)
 	}
 }
+
+// The install link carries the tool list from when it was generated. Revoking
+// Cursor on the website and then running an older link must not read this
+// machine's desktop login: the live scope gates the read, exactly as it does
+// for a steady-state sync.
+func TestEnableRefusesWhenTheLiveScopeWithholdsCursor(t *testing.T) {
+	h := newHarness(t)
+	h.srv.setAllowedTools([]string{"Codex"}) // Cursor revoked on the website
+	before := h.auth.fetchCount()
+
+	_, err := cursorsync.Enable(context.Background(), h.options(), nil)
+	if err == nil {
+		t.Fatal("a live scope without Cursor must refuse the enable")
+	}
+	if !strings.Contains(err.Error(), "does not allow Cursor") {
+		t.Fatalf("the refusal must name the scope, got %v", err)
+	}
+	if h.auth.fetchCount() != before {
+		t.Fatalf("the desktop credential was read %d time(s) under a scope that withholds Cursor", h.auth.fetchCount()-before)
+	}
+	if h.verify.callCount() != 0 {
+		t.Fatalf("the credential was verified %d time(s) under a scope that withholds Cursor", h.verify.callCount())
+	}
+	if _, ok, loadErr := cursorsource.New(h.dir).Load(); loadErr != nil || ok {
+		t.Fatalf("no permit may exist (ok=%t err=%v)", ok, loadErr)
+	}
+	if _, enable, ingest, _, _ := h.srv.stats(); enable != 0 || ingest != 0 {
+		t.Fatalf("server enable=%d ingest=%d, want 0/0", enable, ingest)
+	}
+}

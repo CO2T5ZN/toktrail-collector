@@ -90,7 +90,7 @@ func TestSummarizeFirstSyncFailureChainDrivesPendingCode(t *testing.T) {
 		t.Fatalf("a written permit must never report account_no_permit, got %v", summary.IncompleteCodes)
 	}
 	if summary.StopReason != collection.StopFatalError {
-		t.Fatalf("stopReason = %q, want fatal_error (the code explains the verdict, never changes it)", summary.StopReason)
+		t.Fatalf("stopReason = %q, want fatal_error (a written permit whose first sync failed is a hard phase failure)", summary.StopReason)
 	}
 }
 
@@ -151,8 +151,8 @@ func TestSummarizeFailedEnableChainDrivesNoPermitCode(t *testing.T) {
 	if hasCode(summary.IncompleteCodes, "account_pending_first_sync") {
 		t.Fatalf("no permit exists, so no first-sync code may appear, got %v", summary.IncompleteCodes)
 	}
-	if summary.StopReason != collection.StopFatalError {
-		t.Fatalf("stopReason = %q, want fatal_error", summary.StopReason)
+	if summary.StopReason != collection.StopPartial {
+		t.Fatalf("stopReason = %q, want partial: an authorized source this device could not cover is incomplete, not fatal", summary.StopReason)
 	}
 }
 

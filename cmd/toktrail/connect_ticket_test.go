@@ -27,7 +27,12 @@ func TestConnectSupersededTicketGuidance(t *testing.T) {
 		t.Fatal("expected rejected ticket")
 	}
 	got := runFailureDisplayText(fmt.Errorf("binding failed: %w", err), "generic failure")
-	if !strings.Contains(got, "generate a new command") || strings.Contains(got, "ticket-secret") || strings.Contains(got, "untrusted") {
+	// The guidance must name the action and never echo the ticket or the
+	// server's own text.
+	if !strings.Contains(got, "generate a new connect link") {
+		t.Fatalf("the guidance must tell the user to get a new link, got %q", got)
+	}
+	if strings.Contains(got, "ticket-secret") || strings.Contains(got, "untrusted") || strings.Contains(got, "an unexpected error occurred") {
 		t.Fatalf("unexpected safe guidance: %q", got)
 	}
 }

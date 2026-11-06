@@ -145,14 +145,29 @@ try {
       Write-Host "      `$env:Path = `"$installPath;`$env:Path`""
       Write-Host ""
     } else {
-      $answer = Read-Host "Add $installPath to PATH for your user account? [Y/n]"
+      # Ask only when a human can answer; a non-interactive host (CI, a scheduled
+      # task) must fall back to the same default as the POSIX script instead of
+      # throwing out of Read-Host and aborting before -ConnectUrl runs.
+      $answer = 'y'
+      if ([Environment]::UserInteractive) {
+        try {
+          $answer = Read-Host "Add $installPath to PATH for your user account? [Y/n]"
+        } catch {
+          $answer = 'y'
+        }
+      }
       if ($answer -match '^(n|no)$') {
         Write-Host ""
         Write-Host "note: left PATH unchanged; add it yourself with:  `$env:Path = `"$installPath;`$env:Path`""
         Write-Host ""
       } else {
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if (-not $userPath) { $userPath = '' }
+        # Read and write HKCU\Environment directly: GetEnvironmentVariable
+        # expands REG_EXPAND_SZ values (%USERPROFILE% is frozen into its current
+        # value) and SetEnvironmentVariable writes REG_SZ, which permanently
+        # breaks every %VAR% entry in the user PATH. Preserve the raw text and
+        # the value kind.
+        $envKey = Get-Item -LiteralPath 'HKCU:\Environment'
+        $userPath = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $alreadyThere = $false
         foreach ($dir in @($userPath -split ';')) {
           if ($dir -and $dir.TrimEnd([char]'\') -ieq $installPath.TrimEnd([char]'\')) { $alreadyThere = $true }
@@ -161,7 +176,9 @@ try {
           Write-Host "==> $installPath is already in your user PATH"
         } else {
           $newPath = if ($userPath) { "$installPath;$userPath" } else { $installPath }
-          [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+          $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+          try { if ($envKey.GetValueKind('Path') -eq [Microsoft.Win32.RegistryValueKind]::String) { $kind = [Microsoft.Win32.RegistryValueKind]::String } } catch { }
+          $envKey.SetValue('Path', $newPath, $kind)
           $env:Path = "$installPath;$env:Path"
           Write-Host ""
           Write-Host "==> added to your user PATH: $installPath"

@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"toktrail-collector/internal/distribution"
 )
@@ -325,6 +327,52 @@ exit 0
 // a fake "toktrail" binary (a shell script) at the chosen install dir. The
 // fake toktrail records any "connect <url>" invocation and can be told to
 // fail via the CONNECT_FAIL env var, without ever using a real ticket/link.
+
+// pathSetupEnv builds a hermetic environment for the PATH-offer tests: the fake
+// HOME keeps every profile write inside the temp directory, so a test can never
+// touch the developer's own shell configuration.
+func pathSetupEnv(t *testing.T, shell string, extra ...string) []string {
+	t.Helper()
+	home := t.TempDir()
+	env := append(os.Environ(),
+		"HOME="+home,
+		"TOKTRAIL_HOME="+filepath.Join(home, "state"),
+		"SHELL="+shell,
+	)
+	return append(env, extra...)
+}
+
+// runInstallerUnderPTY runs the installer with a real pseudo terminal and feeds
+// it one answer. `script` allocates the pty; the answer pipe stays open briefly
+// so the terminal does not see EOF before the prompt reads.
+func runInstallerUnderPTY(t *testing.T, installScript, baseURL, installTarget, home, answer string) string {
+	t.Helper()
+	self := []string{"/bin/sh", installScript, baseURL, installTarget}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		cmd = exec.Command("/usr/bin/script", append([]string{"-q", "/dev/null"}, self...)...)
+	} else {
+		cmd = exec.Command("script", "-q", "-c", strings.Join(self, " "), "/dev/null")
+	}
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"TOKTRAIL_HOME="+filepath.Join(home, "state"),
+		"SHELL=/bin/zsh",
+		"PATH=/usr/bin:/bin",
+	)
+	reader, writer := io.Pipe()
+	cmd.Stdin = reader
+	go func() {
+		_, _ = writer.Write([]byte(answer))
+		time.Sleep(1500 * time.Millisecond)
+		_ = writer.Close()
+	}()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pty install failed: %v\n%s", err, out)
+	}
+	return string(out)
+}
 
 // hermeticHomeEnv returns an environment whose HOME points at a temp directory.
 // Every test that EXECUTES the generated installer must use it: the installer
@@ -832,7 +880,13 @@ func TestPowerShellInstallerCarriesPathSetup(t *testing.T) {
 	for _, want := range []string{
 		"Read-Host",
 		"[Y/n]",
-		"[Environment]::SetEnvironmentVariable('Path', $newPath, 'User')",
+		// The user PATH must be written through the registry with its original
+		// value kind: SetEnvironmentVariable turns REG_EXPAND_SZ into REG_SZ and
+		// freezes %VAR% entries, permanently breaking them.
+		"DoNotExpandEnvironmentNames",
+		"[Microsoft.Win32.RegistryValueKind]::ExpandString",
+		"$envKey.SetValue('Path', $newPath, $kind)",
+		"[Environment]::UserInteractive",
 		"$NoPathSetup",
 		"TOKTRAIL_SKIP_PATH_SETUP",
 		"Scheduled collection does not need PATH",
@@ -848,23 +902,67 @@ func TestPowerShellInstallerCarriesPathSetup(t *testing.T) {
 // process's own HOME. That is how a test suite edits a developer's real
 // ~/.zshrc, which is exactly what happened once while the PATH offer was added.
 func TestAllInstallerExecutionsUseAHermeticHome(t *testing.T) {
-	raw, err := os.ReadFile("scripts_test.go")
+	// Every test file in this package that runs the generated bootstrap script.
+	// release_e2e_test.go was missing from the first version of this guard, and
+	// that is exactly where a real ~/.zshrc write was waiting to happen.
+	files, err := filepath.Glob("*_test.go")
 	if err != nil {
-		t.Fatalf("read own source: %v", err)
+		t.Fatalf("list test files: %v", err)
+	}
+	for _, name := range files {
+		checkHermeticHomeInFile(t, name)
+	}
+}
+
+func checkHermeticHomeInFile(t *testing.T, name string) {
+	t.Helper()
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
 	}
 	lines := strings.Split(string(raw), "\n")
-	const needle = "exec." + "Command(\"/bin/sh\""
+	needles := []string{"exec." + "Command(\"/bin/sh\"", "exec." + "Command(\"sh\""}
 	for i, line := range lines {
-		if !strings.Contains(line, needle) {
+		matches := false
+		for _, needle := range needles {
+			if strings.Contains(line, needle) {
+				matches = true
+			}
+		}
+		if !matches {
 			continue
 		}
 		// The next few lines must set HOME to a temp directory before the
 		// command runs.
-		window := strings.Join(lines[i:min(i+4, len(lines))], "\n")
+		// The window runs to the end of the statement block: explanatory
+		// comments and a sandbox-directory setup may sit between the command and
+		// its environment assignment.
+		end := i + 1
+		for end < len(lines) && end-i < 16 && strings.TrimSpace(lines[end]) != "" {
+			end++
+		}
+		window := strings.Join(lines[i:end], "\n")
+		// Only the GENERATED installer touches a shell profile; building a
+		// release (`release.sh build`) does not, so it needs no sandbox.
+		// Upgrade mode never touches a shell profile (the script guards the PATH
+		// offer with `if [ "$UPGRADE" = 0 ]`), so it needs no sandbox.
+		if strings.Contains(window, "--upgrade") {
+			continue
+		}
+		runsInstaller := strings.Contains(window, "install-") ||
+			strings.Contains(window, "scriptPath") ||
+			strings.Contains(window, "installScript") ||
+			strings.Contains(window, "args...")
+		if !runsInstaller {
+			continue
+		}
 		// A helper that returns the environment (env := …, cmd.Env = env) is
 		// also fine: runInstaller builds a hermetic HOME itself.
-		if !strings.Contains(window, `"HOME="+`) && !strings.Contains(window, "cmd.Env = env") {
-			t.Fatalf("line %d runs a command without a hermetic HOME:\n%s", i+1, window)
+		hermetic := strings.Contains(window, `"HOME="+`) ||
+			strings.Contains(window, "cmd.Env = env") ||
+			strings.Contains(window, "append(env,") // env comes from pathSetupEnv/hermeticHomeEnv
+		if !hermetic {
+			t.Fatalf("%s:%d runs a command without a hermetic HOME:\n%s", name, i+1, window)
 		}
 	}
 }
@@ -874,4 +972,73 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// The PATH append must not abort the install: with `set -eu` a failed redirect
+// used to kill the script after the binary was installed but before --connect
+// ran. A read-only profile must degrade to a printed instruction.
+func TestInstallSurvivesAnUnwritableProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test")
+	}
+	installScript, baseURL, _, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "bin_readonly")
+	env := pathSetupEnv(t, "/bin/zsh")
+	home := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+		}
+	}
+	// A profile that exists and cannot be appended to.
+	profile := filepath.Join(home, ".zshrc")
+	if err := os.WriteFile(profile, []byte("# existing\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget)
+	cmd.Env = append(env, "PATH=/usr/bin:/bin")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a read-only profile must not fail the install: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "could not write") {
+		t.Fatalf("the failure must be reported and survive:\n%s", out)
+	}
+	raw, readErr := os.ReadFile(profile)
+	if readErr != nil || strings.Contains(string(raw), installTarget) {
+		t.Fatalf("the profile must be unchanged (err=%v content=%q)", readErr, raw)
+	}
+}
+
+// An explicit "no" with surrounding whitespace still declines, and a directory
+// carrying shell metacharacters is reported rather than written into a profile.
+func TestInstallPathSetupHandlesReplyAndUnsafeDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test")
+	}
+	installScript, baseURL, _, dir := connectTestFixture(t)
+
+	t.Run("padded_no_declines", func(t *testing.T) {
+		installTarget := filepath.Join(dir, "bin_padded")
+		home := t.TempDir()
+		out := runInstallerUnderPTY(t, installScript, baseURL, installTarget, home, "  no  \n")
+		if !strings.Contains(out, "left PATH unchanged") {
+			t.Fatalf("a padded no must decline:\n%s", out)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".zshrc")); err == nil {
+			t.Fatal("no profile may be written after an explicit decline")
+		}
+	})
+
+	t.Run("metacharacter_dir_is_reported", func(t *testing.T) {
+		installTarget := filepath.Join(dir, `bin_we"ird`)
+		home := t.TempDir()
+		out := runInstallerUnderPTY(t, installScript, baseURL, installTarget, home, "\n")
+		if !strings.Contains(out, "cannot be written literally") {
+			t.Fatalf("a metacharacter directory must be reported, not written:\n%s", out)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".zshrc")); err == nil {
+			t.Fatal("no profile may be written for an unsafe directory")
+		}
+	})
 }

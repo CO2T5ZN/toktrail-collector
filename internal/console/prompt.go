@@ -80,7 +80,10 @@ func Confirm(out io.Writer, question string) (bool, error) {
 	}
 	defer source.Close()
 	raw, err := readBoundedLine(source, maxAnswerBytes)
-	if err != nil {
+	// A line without a trailing newline is still an answer: a console that
+	// delivers "y" and then EOF (or closes after the answer) returns the bytes
+	// together with io.EOF. Only a stream that produced NOTHING is "no answer".
+	if err != nil && len(raw) == 0 {
 		if errors.Is(err, io.EOF) {
 			// The stream ran dry without an answer: no terminal, or a
 			// source that closed. Either way nothing about the user's
@@ -142,14 +145,19 @@ func decodeIfUTF16(raw []byte) string {
 			return decodeUTF16(raw[2:], true)
 		}
 	}
+	// Only a byte sequence where EVERY odd byte is NUL and every even byte is
+	// printable ASCII is treated as UTF-16LE. A looser rule (a few NULs) would
+	// mis-read a NUL-padded ANSI answer such as "y\0\r\n" as UTF-16 and turn a
+	// confirmation into a decline.
 	if len(raw) >= 4 && len(raw)%2 == 0 {
-		zeros := 0
-		for i := 1; i < len(raw); i += 2 {
-			if raw[i] == 0 {
-				zeros++
+		pairs := len(raw) / 2
+		asciiPairs := 0
+		for i := 0; i+1 < len(raw); i += 2 {
+			if raw[i+1] == 0 && raw[i] >= 0x20 && raw[i] < 0x7f {
+				asciiPairs++
 			}
 		}
-		if zeros*2 >= len(raw)/2 {
+		if asciiPairs == pairs {
 			return decodeUTF16(raw, false)
 		}
 	}
@@ -171,8 +179,8 @@ func decodeUTF16(raw []byte, bigEndian bool) string {
 	return string(utf16.Decode(units))
 }
 
-// readBoundedLine reads one line, at most max bytes (plus the newline). An
-// over-long line is an error; the content read is never included in the
+// readBoundedLine reads one line, at most max bytes INCLUDING its terminator.
+// An over-long line is an error; the content read is never included in the
 // error (it may quote anything the wrong stream carries).
 func readBoundedLine(r io.Reader, max int) ([]byte, error) {
 	br := bufio.NewReader(io.LimitReader(r, int64(max)+1))

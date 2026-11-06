@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -65,24 +64,12 @@ func CheckRelease(opts CheckOptions) (*CheckResult, error) {
 	if arch == "" {
 		arch = runtime.GOARCH
 	}
-	manifestPath := ""
-	var manifestBytes []byte
-	var err error
-	if strings.TrimSpace(opts.DistDir) != "" {
-		manifestPath = filepath.Join(opts.DistDir, distribution.ManifestFileName)
-		manifestBytes, err = distribution.ReadBoundedFile(manifestPath, distribution.MaxManifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest: %w", err)
-		}
-	} else {
-		base := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
-		if base == "" {
-			return nil, errors.New("a release base URL (or a local dist directory) is required")
-		}
-		manifestBytes, err = Fetch(base+"/"+distribution.ManifestFileName, distribution.MaxManifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("fetch release manifest: %w", err)
-		}
+	// Reuse the install path's file resolution (safe name check + scheme
+	// validation) instead of hand-joining strings: a mirror URL carrying a query
+	// string would otherwise silently fetch the wrong path here and only here.
+	manifestBytes, err := readReleaseFile(opts.DistDir, opts.BaseURL, distribution.ManifestFileName, distribution.MaxManifestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read release manifest: %w", err)
 	}
 
 	var manifest *distribution.Manifest
@@ -92,14 +79,9 @@ func CheckRelease(opts CheckOptions) (*CheckResult, error) {
 		if keyErr != nil {
 			return nil, fmt.Errorf("trust root: %w", keyErr)
 		}
-		var sigBytes []byte
-		if manifestPath != "" {
-			sigBytes, err = distribution.ReadBoundedFile(filepath.Join(filepath.Dir(manifestPath), distribution.ManifestSignatureFileName), distribution.SignatureSize)
-		} else {
-			sigBytes, err = Fetch(strings.TrimRight(opts.BaseURL, "/")+"/"+distribution.ManifestSignatureFileName, distribution.SignatureSize)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read manifest signature: %w", err)
+		sigBytes, sigErr := readReleaseFile(opts.DistDir, opts.BaseURL, distribution.ManifestSignatureFileName, distribution.SignatureSize)
+		if sigErr != nil {
+			return nil, fmt.Errorf("read manifest signature: %w", sigErr)
 		}
 		if len(sigBytes) != distribution.SignatureSize {
 			return nil, fmt.Errorf("manifest signature: %d bytes, want %d", len(sigBytes), distribution.SignatureSize)

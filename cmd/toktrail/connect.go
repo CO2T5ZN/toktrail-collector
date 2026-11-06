@@ -268,9 +268,15 @@ func runConnectIO(args []string, stdout, stderr io.Writer) error {
 // network (net.Error, DNS included). Everything else keeps the
 // closed-set fallback phrase; no raw text, no paths, no URLs.
 func runFailureDisplayText(err error, fallback string) string {
+	// Every bind refusal has a closed-set category (the server's own code is
+	// whitelisted into it), so the display can always say what happened. Only
+	// the 409 ticket case used to be mapped; a reused or expired link therefore
+	// printed "an unexpected error occurred".
 	var bindErr *bind.Error
-	if errors.As(err, &bindErr) && bindErr.Status() == 409 && bindErr.Category() == bind.CategoryTicketSuperseded {
-		return "the installation command is outdated; generate a new command and try again"
+	if errors.As(err, &bindErr) {
+		if phrase := bindErr.DisplayPhrase(); phrase != "" {
+			return phrase
+		}
 	}
 	switch {
 	case errors.Is(err, connect.ErrStateAuthorizationMismatch),

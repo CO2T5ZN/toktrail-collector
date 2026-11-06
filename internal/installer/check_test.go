@@ -113,3 +113,17 @@ func TestCheckReleaseRejectsForeignSignature(t *testing.T) {
 		t.Fatal("a manifest signed by a different key must be rejected")
 	}
 }
+
+// A mirror URL carrying a query string must not be hand-joined: the check has to
+// resolve files exactly like the install does, or it silently reads a different
+// path than the one the installer would use.
+func TestCheckReleaseRejectsAQueryStringBaseURL(t *testing.T) {
+	distDir, _ := releaseFixture(t, "v0.6.0", [2]string{"darwin", "arm64"})
+	if _, err := CheckRelease(CheckOptions{BaseURL: "https://example.invalid/releases?token=1", OS: "darwin", Arch: "arm64"}); err == nil {
+		t.Fatal("a base URL with a query string must be refused rather than mis-joined")
+	}
+	// The dist-directory path still works.
+	if _, err := CheckRelease(CheckOptions{DistDir: distDir, OS: "darwin", Arch: "arm64"}); err != nil {
+		t.Fatalf("dist-dir check failed: %v", err)
+	}
+}

@@ -264,8 +264,20 @@ func binaryIdentityCheck(opt DoctorOptions) Check {
 	}
 	registered := ""
 	source := ""
-	if path, src, found, err := scheduler.RegisteredBinary(cfg); err == nil && found {
+	registerErr := error(nil)
+	if path, src, found, err := scheduler.RegisteredBinary(cfg); err != nil {
+		// "Could not read the registration" is not "no registration": saying
+		// nothing would report a healthy install that cannot be verified.
+		registerErr = err
+	} else if found {
 		registered, source = path, src
+	}
+	if registerErr != nil {
+		return Check{
+			Name:   "binary",
+			Status: CheckWarn,
+			Detail: fmt.Sprintf("%s (%s); the scheduled task could not be inspected, so the schedule's binary is unverified", current, versionLabel),
+		}
 	}
 
 	switch {

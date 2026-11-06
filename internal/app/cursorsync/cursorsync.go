@@ -1638,13 +1638,26 @@ func Enable(ctx context.Context, opt Options, confirm ConfirmFunc) (EnableResult
 		// against it. A self view already listing account sources is
 		// compatibility evidence and skips the extra round trip.
 		if err := requireAccountSources(ctx, opt, self, st); err != nil {
-			return res, fmt.Errorf("cursor enable needs a server with account-source support: %w", err)
+			return res, fmt.Errorf("%w: %w", ErrEnableNeedsAccountSources, err)
+		}
+		// The live grant scope must allow Cursor BEFORE the desktop login is
+		// read. The install link's tool list is a snapshot taken when it was
+		// generated: a user who revokes Cursor on the website and then runs
+		// that link would otherwise still have this machine's credential read
+		// once. Sync already gates on the live scope before its read; the
+		// first enable must apply the same rule.
+		if !(Gate{AllowedTools: self.AllowedTools}).cursorAllowed() {
+			return res, ErrEnableScopeWithheld
 		}
 		_, accountID, _, err := verifiedCredential(ctx, opt)
 		if err != nil {
-			return res, fmt.Errorf("cursor credential verification failed: %w", err)
+			return res, fmt.Errorf("%w: %w", ErrEnableCredential, err)
 		}
-		return enableServerAndSync(ctx, opt, self, st, store, cursorsource.License{}, false, identity.MatchAccount(accountID), res)
+		enabled, enableErr := enableServerAndSync(ctx, opt, self, st, store, cursorsource.License{}, false, identity.MatchAccount(accountID), res)
+		if enableErr != nil {
+			return enabled, fmt.Errorf("%w: %w", ErrEnableServer, enableErr)
+		}
+		return enabled, nil
 	}
 
 	// Existing permit: reading is already covered. Verify the credential
@@ -1869,11 +1882,48 @@ func Logout(opt Options, purge bool) (removedLicense, purgedCache bool, err erro
 	return removedLicense, purgedCache, nil
 }
 
-// ErrConfirmationDeclined reports that the operator answered no to a
-// first-time enable. It is a sentinel so a caller can distinguish "the user
-// said no" from "the answer could not be read" instead of printing the same
-// line for both.
+// ErrConfirmationDeclined reports that the operator answered no to the one
+// remaining local question: the desktop login switched to a different Cursor
+// account. (A first enable no longer asks - the website grant authorizes it.)
+// It is a sentinel so a caller can distinguish "the user said no" from "the
+// answer could not be read" instead of printing the same line for both.
 var ErrConfirmationDeclined = errors.New("cursor enable declined by the user")
+
+// Enable-failure classes. The terminal display maps these to fixed, value-free
+// sentences, so a failed enable says WHICH step stopped it instead of only "did
+// not complete" - the difference between "the website does not authorize
+// Cursor", "this machine is not signed in to Cursor", and "the server refused".
+var (
+	// ErrEnableScopeWithheld: the live grant scope does not include Cursor.
+	ErrEnableScopeWithheld = errors.New("cursor enable: the current authorization does not allow Cursor on this device")
+	// ErrEnableNeedsAccountSources: the server cannot store account sources.
+	ErrEnableNeedsAccountSources = errors.New("cursor enable: the server does not support account sources")
+	// ErrEnableCredential: this machine's Cursor login could not be used.
+	ErrEnableCredential = errors.New("cursor enable: the cursor credential could not be verified")
+	// ErrEnableServer: the server refused the enable or its first sync.
+	ErrEnableServer = errors.New("cursor enable: the server enable or first sync failed")
+)
+
+// CredentialFailureReason classifies a credential failure into a closed word set
+// (never text from the underlying error, which may quote a path). The auth
+// package's own errors are already redacted, but this keeps the terminal
+// vocabulary fixed.
+func CredentialFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return "unknown"
+	case errors.Is(err, auth.ErrNoLogin):
+		return "no Cursor login on this machine"
+	case errors.Is(err, auth.ErrPermission):
+		return "the Cursor state is not readable with the current permissions"
+	case errors.Is(err, auth.ErrUnsupportedSchema):
+		return "the Cursor state schema is not recognized"
+	case errors.Is(err, auth.ErrUnsupportedOS):
+		return "this operating system has no known Cursor layout"
+	default:
+		return "the Cursor state is unavailable"
+	}
+}
 
 // DefaultConfirm prints the notice and reads a y/N answer from the
 // controlling terminal (internal/console). Reading the terminal — not

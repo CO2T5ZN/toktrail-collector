@@ -190,9 +190,13 @@ func SyncStopReason(sync SyncResult, err, ctxErr error) collection.StopReason {
 		sync.Backlog.Result.Cursor.Outcome == cursorsync.RoundPaused:
 		return collection.StopPaused
 	case collection.PendingCoverageConcerns(sync.Collection.GrantSync.Pending) > 0,
-		collection.PendingCoverageConcerns(sync.Backlog.Result.GrantSync.Pending) > 0:
-		// An authorized source this device could not cover: not a
-		// failure, but never a claimed completion.
+		collection.PendingCoverageConcerns(sync.Backlog.Result.GrantSync.Pending) > 0,
+		accountRoundDidNotRun(sync):
+		// An authorized source this device could not cover — including an
+		// account source whose local enable did not complete — is not a
+		// failure, but never a claimed completion. Reporting it as fatal
+		// used to turn a known, named reason into "an unexpected error
+		// occurred", which is indistinguishable from a real crash.
 		return collection.StopPartial
 	default:
 		return collection.StopFatalError
@@ -202,6 +206,23 @@ func SyncStopReason(sync SyncResult, err, ctxErr error) collection.StopReason {
 // connectStopReason is SyncStopReason over the connect run's sync
 // state; connect.Run's own Result carries nothing the verdict reads
 // beyond it.
+// accountRoundDidNotRun reports an authorized account source that never ran on
+// this device (no permit, or the grant withheld it). Only that is the "source
+// not covered" case, which is partial. A round that RAN and errored stays a
+// hard failure, matching how `toktrail periodic` classifies the same state: a
+// real pull failure must not be downgraded to "incomplete" because the command
+// happened to be `connect`.
+func accountRoundDidNotRun(sync SyncResult) bool {
+	if !sync.accountIncomplete {
+		return false
+	}
+	switch sync.Collection.Cursor.Outcome {
+	case cursorsync.RoundNoPermit, cursorsync.RoundAuthWithheld:
+		return true
+	}
+	return false
+}
+
 func connectStopReason(res Result, err, ctxErr error) collection.StopReason {
 	return SyncStopReason(res.Sync, err, ctxErr)
 }

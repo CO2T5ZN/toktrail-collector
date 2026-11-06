@@ -73,8 +73,16 @@ build_target() {
   # use; when it is unset the binary carries no anchor and `upgrade` requires an
   # explicit --pubkey (never an unverified install).
   upgrade_ldflags=
-  if [ -n "${TOKTRAIL_RELEASE_PUBKEY:-}" ] && [ -f "${TOKTRAIL_RELEASE_PUBKEY}" ]; then
-    upgrade_ldflags=" -X main.releasePubKeyB64=$(base64 < "${TOKTRAIL_RELEASE_PUBKEY}" | tr -d '\n')"
+  if [ -n "${TOKTRAIL_RELEASE_PUBKEY:-}" ]; then
+    if [ -f "${TOKTRAIL_RELEASE_PUBKEY}" ]; then
+      upgrade_ldflags=" -X main.releasePubKeyB64=$(base64 < "${TOKTRAIL_RELEASE_PUBKEY}" | tr -d '\n')"
+    else
+      # Fail loudly: a silently anchor-less release ships a binary whose
+      # `toktrail upgrade` can only ever refuse, and nobody notices until a user
+      # reports it.
+      echo "release: TOKTRAIL_RELEASE_PUBKEY is set but $TOKTRAIL_RELEASE_PUBKEY is not a readable file" >&2
+      exit 1
+    fi
   fi
   GOOS=$build_os GOARCH=$build_arch CGO_ENABLED=0 "$go_bin" build -trimpath \
     -ldflags "-s -w -X main.version=$version$upgrade_ldflags" \

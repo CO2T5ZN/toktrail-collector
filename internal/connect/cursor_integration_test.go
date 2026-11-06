@@ -41,6 +41,7 @@ import (
 	"toktrail-collector/internal/console"
 	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/cursor/auth"
+	autherr "toktrail-collector/internal/cursor/auth"
 	"toktrail-collector/internal/cursor/identity"
 	"toktrail-collector/internal/cursor/protocol"
 	"toktrail-collector/internal/local/cursorsource"
@@ -675,5 +676,44 @@ func TestConnectCursorFirstEnableIsHeadless(t *testing.T) {
 	}
 	if pullFake.calls.Load() == 0 {
 		t.Fatal("the first sync must run during a headless first enable")
+	}
+}
+
+// A failed enable must say WHICH step stopped it. "The local enable did not
+// complete" was all a Windows user saw while the actual cause (an unreadable
+// Cursor login, a scope that excludes Cursor, a server refusal) was known to the
+// code but not to them.
+func TestConnectNamesTheCursorEnableFailureClass(t *testing.T) {
+	stateDir := t.TempDir()
+	homeDir := t.TempDir()
+	mock := startCursorBacklogMock(t)
+	cfg := startSyncConfigMock(t, mock.URL, []string{"Cursor"}, nil)
+	ticket := strings.Repeat("7", 64)
+	seedFirstEnableConnect(t, stateDir, mock, cfg, ticket)
+
+	wiring := budgetCursorWiring(&cursorBacklogPull{events: cursorBulkEvents(1)}, 5)
+	wiring.Verify = func(ctx context.Context, accessToken string) (api.VerifyResult, error) {
+		// An unreadable login must not be mistaken for an absent tool.
+		return api.VerifyResult{}, fmt.Errorf("verify: %w", autherr.ErrPermission)
+	}
+	out := &bytes.Buffer{}
+	res, err := runCursorConnectWithOptionsOut(t, cfg, stateDir, homeDir, ticket, Options{
+		Cursor: wiring,
+	}, out)
+	if err == nil || !isErrSyncIncomplete(err) {
+		t.Fatalf("a credential failure must leave the run incomplete, got %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Cursor login could not be used") {
+		t.Fatalf("the failure class must be named, got:\n%s", text)
+	}
+	if !strings.Contains(text, "the Cursor state is not readable with the current permissions") {
+		t.Fatalf("the closed-set credential reason must appear, got:\n%s", text)
+	}
+	if strings.Contains(text, "an unexpected error occurred") {
+		t.Fatalf("a known cause must never read as an unexpected error, got:\n%s", text)
+	}
+	if res.Sync.Collection.Cursor.Outcome != cursorsync.RoundNoPermit {
+		t.Fatalf("outcome = %q, want no_permit", res.Sync.Collection.Cursor.Outcome)
 	}
 }

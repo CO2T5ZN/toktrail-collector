@@ -414,19 +414,20 @@ func TestConnectJSONFlagErrorEmitsObject(t *testing.T) {
 	}
 }
 
-// TestConnectJSONPromptStaysInteractiveAndOffStdout pins the
+// TestConnectJSONKeepsHumanTextOffStdout pins the
 // interactive-prompt preservation under --json: the first-time Cursor
 // confirmation still runs (it reads stdin and writes the human
 // stream), a declined answer keeps the historical clean-skip handling,
 // and the prompt text never lands on the JSON machine stream.
-func TestConnectJSONPromptStaysInteractiveAndOffStdout(t *testing.T) {
+func TestConnectJSONKeepsHumanTextOffStdout(t *testing.T) {
 	oldRunner := connectSchedulerRunner
 	connectSchedulerRunner = mockSchedulerRunner{}
 	defer func() { connectSchedulerRunner = oldRunner }()
 
-	// Inject the cursor wiring through the CLI seam; the declined
-	// confirmation returns before any credential read, so the provider
-	// is never reached.
+	// Inject the cursor wiring through the CLI seam. The provider here
+	// refuses to hand over a credential, so the enable cannot complete:
+	// the run must report that as an authorized source it could not
+	// cover, and keep stdout pure JSON.
 	oldCursor := connectCursorOptions
 	authReached := false
 	connectCursorOptions = func(stateDir, serverURL string, httpClient *http.Client) (*cursorsync.Options, error) {
@@ -466,21 +467,22 @@ func TestConnectJSONPromptStaysInteractiveAndOffStdout(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := runConnectIO([]string{"--state-dir", stateDir, "--json", connectURL}, &stdout, &stderr)
 	if err == nil {
-		t.Fatalf("a declined account-source enable keeps the historical incomplete result (the authorization named the tool)")
+		t.Fatalf("an account-source enable that could not complete keeps the incomplete result (the authorization named the tool)")
 	}
 	if authReached {
-		t.Fatal("a declined confirmation must precede any credential read")
+		t.Fatal("a refusing provider must not be read")
 	}
 	decoded := decodeSingleJSONLine(t, stdout.String())
-	if decoded["stop_reason"] != string(collection.StopFatalError) {
-		t.Fatalf("stopReason = %v, want fatal_error: %s", decoded["stop_reason"], stdout.String())
+	if decoded["stop_reason"] != string(collection.StopPartial) {
+		t.Fatalf("stopReason = %v, want partial (an authorized source this device could not cover): %s", decoded["stop_reason"], stdout.String())
 	}
-	// The prompt (and its decline) live on the human stream.
+	// The consent notice and the not-enabled guidance live on the human
+	// stream.
 	if !strings.Contains(stderr.String(), "Cursor desktop login credentials") {
-		t.Fatalf("the interactive confirmation notice must move to stderr, got:\n%s", stderr.String())
+		t.Fatalf("the consent notice must go to stderr, got:\n%s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "not enabled") {
-		t.Fatalf("the decline guidance must move to stderr, got:\n%s", stderr.String())
+		t.Fatalf("the not-enabled guidance must go to stderr, got:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "Cursor desktop login credentials") || strings.Contains(stdout.String(), "not enabled") {
 		t.Fatalf("stdout must carry only the JSON object: %s", stdout.String())
