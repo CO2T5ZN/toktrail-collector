@@ -161,37 +161,63 @@ func TestUpgradeUsesBuiltInTrustRoot(t *testing.T) {
 	}
 }
 
-// --check without --to resolves the latest tag and validates it strictly.
-func TestUpgradeCheckResolvesLatestTag(t *testing.T) {
-	distDir, pubKeyPath := signedRelease(t, "v0.6.0")
+// The latest-release lookup validates the tag strictly and, when it cannot
+// answer (a rate-limited API is the real case: CI got a 403 here), the command
+// must fail with a message that offers the explicit alternative.
+func TestUpgradeLatestLookupAndItsFailureModes(t *testing.T) {
+	previousBase := releaseLatestAPIBase
+	t.Cleanup(func() { releaseLatestAPIBase = previousBase })
+
+	var status int
+	var body string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/lich0821/toktrail-collector/releases/latest" {
-			http.NotFound(w, r)
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
 			return
 		}
-		_, _ = w.Write([]byte(`{"tag_name":"v0.6.0"}`))
+		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
-	previousBase := releaseLatestAPIBase
 	releaseLatestAPIBase = server.URL
+
+	status, body = http.StatusOK, `{"tag_name":"v0.6.0"}`
+	tag, err := resolveLatestReleaseTag()
+	if err != nil || tag != "v0.6.0" {
+		t.Fatalf("latest tag = (%q, %v), want v0.6.0", tag, err)
+	}
+
+	status, body = http.StatusOK, `{"tag_name":"nightly"}`
+	if _, err := resolveLatestReleaseTag(); err == nil || !strings.Contains(err.Error(), "not a release version") {
+		t.Fatalf("an invalid latest tag must be refused, got %v", err)
+	}
+
+	// A rate-limited API must produce a failure that names the way out, and the
+	// check must not have contacted anything else.
+	status = http.StatusForbidden
+	var out bytes.Buffer
+	err = runUpgrade([]string{"--check"}, &out, &out)
+	if err == nil {
+		t.Fatalf("a 403 from the release lookup must fail the check:\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "--to VERSION") {
+		t.Fatalf("the failure must offer an explicit version, got %v", err)
+	}
+}
+
+// A local dist directory or an explicit mirror already names the release, so the
+// check must not ask the API at all: that lookup is what CI rate limited.
+func TestUpgradeCheckDoesNotLookUpLatestWhenAReleaseIsGiven(t *testing.T) {
+	distDir, pubKeyPath := signedRelease(t, "v0.6.0")
+	previousBase := releaseLatestAPIBase
+	releaseLatestAPIBase = "http://127.0.0.1:1" // unreachable: any lookup fails
 	t.Cleanup(func() { releaseLatestAPIBase = previousBase })
 
 	var out bytes.Buffer
 	if err := runUpgrade([]string{"--check", "--dist-dir", distDir, "--pubkey", pubKeyPath}, &out, &out); err != nil {
-		t.Fatalf("check failed: %v\n%s", err, out.String())
+		t.Fatalf("a dist-dir check must not need the API: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "available: v0.6.0") {
-		t.Fatalf("the latest tag must be checked against the release:\n%s", out.String())
-	}
-
-	// A non-release tag must be refused rather than turned into an install.
-	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"tag_name":"nightly"}`))
-	})
-	out.Reset()
-	err := runUpgrade([]string{"--check", "--dist-dir", distDir, "--pubkey", pubKeyPath}, &out, &out)
-	if err == nil || !strings.Contains(err.Error(), "not a release version") {
-		t.Fatalf("an invalid latest tag must be refused, got %v", err)
+		t.Fatalf("the manifest's own version must be reported:\n%s", out.String())
 	}
 }
 

@@ -225,22 +225,32 @@ type upgradeCheckInput struct {
 
 func runUpgradeCheck(in upgradeCheckInput, stdout io.Writer) error {
 	versionToCheck := in.target
-	if versionToCheck == "" {
-		// Without an explicit target, ask the official endpoint where "latest"
-		// points. That redirect is metadata only: the version it names is still
-		// reported as unverified until a signed manifest proves it.
-		latest, err := resolveLatestReleaseTag()
-		if err != nil {
-			return safeDisplayError(err, "could not determine the latest release version; pass --to VERSION to check a specific one")
-		}
-		versionToCheck = latest
-	}
-	if _, err := distribution.ParseVersion(versionToCheck); err != nil {
-		return safeDisplayError(err, "version must be a release version such as v0.6.0")
-	}
 	base := in.baseURL
 	distDir := in.distDir
-	if distDir == "" && base == "" {
+	switch {
+	case versionToCheck != "":
+		// An explicit target needs no lookup.
+		if _, err := distribution.ParseVersion(versionToCheck); err != nil {
+			return safeDisplayError(err, "version must be a release version such as v0.6.0")
+		}
+		if distDir == "" && base == "" {
+			base = installer.DefaultBaseURL(versionToCheck)
+		}
+	case distDir != "" || base != "":
+		// A local dist directory or an explicit mirror already names the
+		// release: its manifest carries the version, so no external lookup is
+		// needed (and none should be attempted).
+	default:
+		// Nothing names a release yet, so ask where "latest" points. That is
+		// metadata only: the version is still reported as unverified until a
+		// signed manifest proves it.
+		latest, err := resolveLatestReleaseTag()
+		if err != nil {
+			// The lookup's own text is value-free (no URL, no path), so the
+			// composed message stays display-safe while naming the way out.
+			return fmt.Errorf("could not determine the latest release version: %v; pass --to VERSION, or --dist-dir/--base-url for an explicit release", err)
+		}
+		versionToCheck = latest
 		base = installer.DefaultBaseURL(versionToCheck)
 	}
 	result, err := installer.CheckRelease(installer.CheckOptions{
@@ -252,6 +262,9 @@ func runUpgradeCheck(in upgradeCheckInput, stdout io.Writer) error {
 		return safeDisplayError(err, "the release could not be checked (network, mirror or signature problem)")
 	}
 
+	if versionToCheck != "" && result.Version != versionToCheck {
+		return fmt.Errorf("the release manifest reports %s but %s was requested", result.Version, versionToCheck)
+	}
 	upToDate := in.current != "" && result.Version == in.current
 	if in.jsonOut {
 		return writeUpgradeJSON(stdout, map[string]any{
