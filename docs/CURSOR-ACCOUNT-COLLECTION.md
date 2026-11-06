@@ -4,7 +4,9 @@ Cursor is an account-network source (`cursor-dashboard-api`), not a local conver
 
 ## First connection
 
-Select Cursor in the website's installation flow. When the connected collector supports account sources, its first `connect` asks for local permission to read the Cursor login and query account usage. After confirmation, it verifies the existing session, enables the server account source and performs its first synchronization. No additional Cursor login is required when the desktop session is usable.
+Select Cursor in the website's collection scope. That grant IS the authorization: the collector prints what it is about to do (read the desktop login on this machine, query the account directly, upload sanitized usage only, whole-account scope) and then verifies the existing session, enables the server account source and performs its first synchronization. There is no second local prompt — asking again in the terminal re-asked a question the user had already answered in the browser, and a headless install could not answer it at all. No additional Cursor login is required when the desktop session is usable.
+
+The website states that consenting to Cursor means reading this machine's Cursor desktop login; the terminal notice restates it at the moment of the read.
 
 For an already bound device:
 
@@ -15,9 +17,9 @@ toktrail cursor sync
 toktrail cursor logout
 ```
 
-`enable` grants local collection permission; it does not log the user into Cursor or install a Cursor extension. Unattended periodic tasks cannot perform first-time confirmation. Cursor is not represented by a `--grant source=directory` entry and does not expand local-file grants.
+`enable` performs the first (or account-switch) enable without prompting when the website grant already covers the tool; a switch to a different Cursor account still asks. It does not log the user into Cursor or install a Cursor extension. Cursor is not represented by a `--grant source=directory` entry and does not expand local-file grants.
 
-The existing device upload consent and Cursor's local permission are independent. Removing either prevents the corresponding collection/upload activity. One Cursor account source designates one executor device; another device cannot seize that role through `enable`. Use the website's explicit reassignment action to transfer collection.
+The website grant and the local permit are separate records with separate lifetimes, and both must exist for collection to run. Removing either prevents the corresponding collection/upload activity. One Cursor account source designates one executor device; another device cannot seize that role through `enable`. Use the website's explicit reassignment action to transfer collection.
 
 ## Data and credentials
 
@@ -25,7 +27,7 @@ The SQLite provider queries only Cursor authentication entries in `ItemTable`, n
 
 The collector uploads only pseudonymous event identities, revisions, time, model and token counts plus protocol metadata. It does not upload Cursor tokens, cookies, email, raw account or conversation IDs, original responses, charges or subscription details. These are account-wide statistics; the executor's computer is not necessarily where the usage happened.
 
-Token rotation with an unchanged canonical account identity continues automatically. A different account pauses collection until the user confirms it locally; account history and incremental caches must not silently move between accounts.
+Token rotation with an unchanged canonical account identity continues automatically. A different Cursor account pauses collection until the operator confirms the switch locally (`toktrail cursor enable` in a terminal, or the `connect` run that detects it): one account's history and incremental caches must not silently continue under another. This is the only remaining local question, and it exists to prevent mixing accounts, not to re-ask a consent the website already gave.
 
 For an already active permit, the manual fallback is `toktrail cursor sync --token-stdin`. If desktop authentication cannot be read and the permit is new or expired, use `toktrail cursor enable --token-stdin --confirm-local`: both flags are required so permission is explicit and separate from credential input. A server grant is still required. Supply the token through a protected pipe or file for that process only; interactive terminal input is refused to avoid echoing it. The token is not saved as a plaintext configuration field or command-line argument. The enable process reuses its one in-memory credential for verification and the first sync, then exits. Normal periodic tasks continue using the desktop login provider.
 

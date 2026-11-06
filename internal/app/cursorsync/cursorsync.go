@@ -1621,19 +1621,16 @@ func Enable(ctx context.Context, opt Options, confirm ConfirmFunc) (EnableResult
 		return res, err
 	}
 
-	// First time: the local confirmation strictly precedes reading the
-	// credential — an unattended run can never complete it by itself.
+	// First time: the website's grant for this tool IS the authorization. The
+	// collector only reaches this point after the device is authorized and the
+	// server accepted the tool, so a second local question would re-ask what the
+	// user already answered in the browser (and, on Windows, could not even read
+	// the answer reliably). The four consent facts are still printed — as a
+	// notice, not a prompt — so the terminal states what will happen: the local
+	// read of the desktop login, the direct account query, sanitized-only
+	// uploads, and the account-wide scope.
 	if !hasLicense {
-		if confirm == nil {
-			confirm = DefaultConfirm
-		}
-		confirmed, cerr := confirm(EnableNotice, out)
-		if cerr != nil {
-			return res, fmt.Errorf("cursor enable needs an interactive local confirmation (run `toktrail cursor enable` in a terminal): %w", cerr)
-		}
-		if !confirmed {
-			return res, errors.New("cursor enable declined by the user")
-		}
+		fmt.Fprintln(out, EnableNotice)
 		res.Confirmed = true
 		// Server capability gate BEFORE the credential read: an old
 		// server without account-source support can never store cursor
@@ -1680,8 +1677,10 @@ func Enable(ctx context.Context, opt Options, confirm ConfirmFunc) (EnableResult
 		}
 	}
 
-	// Re-confirmation is required only when the account actually changed
-	// (switch pause). The same account reactivates without a new prompt.
+	// The one remaining local question: the desktop login actually switched to
+	// another Cursor account. This is not a repeated consent — it prevents one
+	// account's history and caches from being silently continued under another —
+	// so it is asked once, at the switch, and only there.
 	if !sameAccount {
 		fmt.Fprintln(out, "The Cursor desktop login has switched to a different account.")
 		if confirm == nil {
@@ -1692,7 +1691,7 @@ func Enable(ctx context.Context, opt Options, confirm ConfirmFunc) (EnableResult
 			return res, fmt.Errorf("cursor enable needs an interactive local confirmation (run `toktrail cursor enable` in a terminal): %w", cerr)
 		}
 		if !confirmed {
-			return res, errors.New("cursor enable declined by the user")
+			return res, ErrConfirmationDeclined
 		}
 		res.Confirmed = true
 	}
@@ -1869,6 +1868,12 @@ func Logout(opt Options, purge bool) (removedLicense, purgedCache bool, err erro
 	}
 	return removedLicense, purgedCache, nil
 }
+
+// ErrConfirmationDeclined reports that the operator answered no to a
+// first-time enable. It is a sentinel so a caller can distinguish "the user
+// said no" from "the answer could not be read" instead of printing the same
+// line for both.
+var ErrConfirmationDeclined = errors.New("cursor enable declined by the user")
 
 // DefaultConfirm prints the notice and reads a y/N answer from the
 // controlling terminal (internal/console). Reading the terminal — not

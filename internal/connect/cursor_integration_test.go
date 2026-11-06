@@ -385,8 +385,12 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	if res.DeviceID != cursorTestDeviceID || res.SkippedBind {
 		t.Fatalf("unexpected bind outcome: %+v", res)
 	}
-	if confirmCalls != 1 {
-		t.Fatalf("first-time confirmation calls = %d, want exactly 1", confirmCalls)
+	// The website grant authorizes the first enable: no second local question.
+	if confirmCalls != 0 {
+		t.Fatalf("first-time confirmation calls = %d, want 0 (the website grant is the authorization)", confirmCalls)
+	}
+	if !strings.Contains(out, cursorsync.EnableNotice) {
+		t.Fatalf("the consent notice must still be printed, output:\n%s", out)
 	}
 
 	// Direct enable: exactly one server enable call for the cursor
@@ -493,16 +497,15 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	}
 }
 
-// TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools verifies that
-// a declined first-time confirmation is a clean, non-fatal skip for the
-// OTHER tools while making the overall install explicitly incomplete:
-// the Cursor credential is never read (the desktop state is untouched),
-// no permit and no server enable exist afterwards, and every other
-// authorized tool keeps its full connect setup — grant, scheduler and
-// initial collection. The run itself returns ErrSyncIncomplete naming
-// the account source, because the authorization selected Cursor and it
-// was not activated.
-func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
+// TestConnectCursorEnableFailureSkipsCursorAndKeepsOtherTools verifies that a
+// FAILED first-time enable (here: the credential cannot be verified) is a
+// clean, non-fatal skip for the OTHER tools while making the overall install
+// explicitly incomplete: no permit and no server enable exist afterwards, and
+// every other authorized tool keeps its full connect setup — grant, scheduler
+// and initial collection. The run itself returns ErrSyncIncomplete naming the
+// account source. No local confirmation is involved any more: the website grant
+// authorizes the attempt, so a failure is reported as a failure.
+func TestConnectCursorEnableFailureSkipsCursorAndKeepsOtherTools(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
 	// Codex exists locally (empty sessions directory); Cursor does not
@@ -539,36 +542,35 @@ func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
 		Now:             func() time.Time { return cursorTestNow },
 		Out:             out,
 		Cursor: &cursorsync.Options{
-			Auth:   authFake,
-			Verify: fakeCursorVerify,
-			Pull:   pullFake.Pull,
-			Now:    func() time.Time { return cursorTestNow },
+			Auth: authFake,
+			// Verification rejects the session, so the enable cannot finish.
+			Verify: func(ctx context.Context, accessToken string) (api.VerifyResult, error) {
+				return api.VerifyResult{}, errors.New("upstream rejected the session")
+			},
+			Pull: pullFake.Pull,
+			Now:  func() time.Time { return cursorTestNow },
 		},
 		CursorConfirm: func(notice string, w io.Writer) (bool, error) {
 			confirmCalls++
-			return false, nil // first-time non-interactive rejection
+			return true, nil
 		},
 	})
 	if err == nil {
-		t.Fatalf("a declined cursor confirmation leaves the install explicitly incomplete; expected an error")
+		t.Fatalf("a failed cursor enable leaves the install explicitly incomplete; expected an error")
 	}
 	if !errors.Is(err, ErrSyncIncomplete) {
-		t.Fatalf("the decline must surface as ErrSyncIncomplete, got: %v", err)
+		t.Fatalf("the failure must surface as ErrSyncIncomplete, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "Cursor") {
 		t.Fatalf("the incomplete error must name the account source: %v", err)
 	}
-	if confirmCalls != 1 {
-		t.Fatalf("confirmation calls = %d, want 1", confirmCalls)
+	if confirmCalls != 0 {
+		t.Fatalf("no local confirmation belongs on the first enable, got %d call(s)", confirmCalls)
 	}
 
-	// The Cursor credential was never read and nothing cursor-related
-	// reached the server or disk.
-	if got := authFake.fetches.Load(); got != 0 {
-		t.Fatalf("a declined confirmation must never read the cursor credential, got %d reads", got)
-	}
+	// Nothing cursor-related reached the server or the usage API.
 	if got := pullFake.calls.Load(); got != 0 {
-		t.Fatalf("a declined confirmation must never pull usage, got %d pulls", got)
+		t.Fatalf("a failed enable must never pull usage, got %d pulls", got)
 	}
 	toktrail.mu.Lock()
 	enableCalls, srcPosts := toktrail.enableCalls, toktrail.srcBatchPosts
@@ -604,17 +606,21 @@ func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
 	if !strings.Contains(res.PeriodicResult.Cursor.Skipped, "no local cursor permit") {
 		t.Fatalf("the cursor round must carry the no-permit skip reason, got %q", res.PeriodicResult.Cursor.Skipped)
 	}
-	if !strings.Contains(out.String(), "not enabled; run `toktrail cursor enable` in a terminal to confirm locally") {
-		t.Fatalf("output must point the user at the interactive enable, got:\n%s", out)
+	if !strings.Contains(out.String(), "not enabled") {
+		t.Fatalf("output must report the source as not enabled, got:\n%s", out)
 	}
 }
 
-// TestConnectCursorNoTerminalIsDistinctFromDecline pins the wording the
-// one-line install needs: when the first-time confirmation has no
-// terminal (the documented `curl … | sh` runs the collector from a
-// pipeline), the run must say so instead of implying the user declined.
-func TestConnectCursorNoTerminalIsDistinctFromDecline(t *testing.T) {
+// TestConnectCursorFirstEnableIsHeadless pins the product rule the install flow
+// depends on: the website's grant authorizes the first Cursor enable, so a run
+// with NO terminal (the documented `curl | sh`, or any headless install) must
+// complete instead of stopping to ask. A confirmer that would report a missing
+// terminal is never consulted; the notice is still printed so the terminal
+// states what is being read and uploaded.
+func TestConnectCursorFirstEnableIsHeadless(t *testing.T) {
+	confirmCalls := 0
 	confirm := func(notice string, w io.Writer) (bool, error) {
+		confirmCalls++
 		return false, console.ErrNoInteractiveTerminal
 	}
 
@@ -650,28 +656,24 @@ func TestConnectCursorNoTerminalIsDistinctFromDecline(t *testing.T) {
 		},
 		CursorConfirm: confirm,
 	})
-	if err == nil || !errors.Is(err, ErrSyncIncomplete) {
-		t.Fatalf("an unconfirmed cursor source leaves the install incomplete, got %v", err)
+	if err != nil {
+		t.Fatalf("a first enable must not need a terminal, got %v\n%s", err, out.String())
+	}
+	if confirmCalls != 0 {
+		t.Fatalf("no local confirmation belongs on the first enable, got %d call(s)", confirmCalls)
 	}
 	outStr := out.String()
-
-	if strings.Contains(outStr, "not enabled; run `toktrail cursor enable` in a terminal to confirm locally") {
-		t.Fatalf("a missing terminal must not read as a plain decline, got:\n%s", outStr)
+	if !strings.Contains(outStr, cursorsync.EnableNotice) {
+		t.Fatalf("the consent notice must still be printed, got:\n%s", outStr)
 	}
-	if !strings.Contains(outStr, "no interactive terminal was available to confirm") {
-		t.Fatalf("the run must name the missing terminal, got:\n%s", outStr)
+	if strings.Contains(outStr, "no interactive terminal was available") {
+		t.Fatalf("a first enable must not report a missing terminal, got:\n%s", outStr)
 	}
-	if !strings.Contains(outStr, "`toktrail cursor enable`") {
-		t.Fatalf("the run must still point at the interactive enable, got:\n%s", outStr)
+	// The enable really happened: a permit exists and usage was pulled.
+	if _, ok, loadErr := cursorsource.New(stateDir).Load(); loadErr != nil || !ok {
+		t.Fatalf("the permit must exist after a headless first enable (ok=%t err=%v)", ok, loadErr)
 	}
-	// Nothing was enabled or uploaded: the boundary held.
-	toktrail.mu.Lock()
-	enableCalls, srcPosts := toktrail.enableCalls, toktrail.srcBatchPosts
-	toktrail.mu.Unlock()
-	if enableCalls != 0 || srcPosts != 0 {
-		t.Fatalf("no enable or upload may happen without a confirmation (enable=%d posts=%d)", enableCalls, srcPosts)
-	}
-	if _, err := os.Stat(stateDir); err != nil {
-		t.Fatalf("the state directory must still exist: %v", err)
+	if pullFake.calls.Load() == 0 {
+		t.Fatal("the first sync must run during a headless first enable")
 	}
 }

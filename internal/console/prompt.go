@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf16"
 )
 
 // ErrNoInteractiveTerminal reports that no readable controlling terminal
@@ -78,7 +79,7 @@ func Confirm(out io.Writer, question string) (bool, error) {
 		return false, ErrNoInteractiveTerminal
 	}
 	defer source.Close()
-	line, err := readBoundedLine(source, maxAnswerBytes)
+	raw, err := readBoundedLine(source, maxAnswerBytes)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			// The stream ran dry without an answer: no terminal, or a
@@ -86,9 +87,13 @@ func Confirm(out io.Writer, question string) (bool, error) {
 			// intent is known.
 			return false, ErrNoInteractiveTerminal
 		}
-		return false, err
+		// Any other read failure is reported as its own class. It used to
+		// surface as "not confirmed", which reads exactly like a decline -
+		// a Windows console answered "y" and the run reported the user had
+		// declined, sending them to a manual command for no reason.
+		return false, fmt.Errorf("%w: %v", ErrAnswerUnreadable, err)
 	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
+	switch normalizeAnswer(raw) {
 	case "y", "yes":
 		return true, nil
 	default:
@@ -96,17 +101,87 @@ func Confirm(out io.Writer, question string) (bool, error) {
 	}
 }
 
+// ErrAnswerUnreadable reports that an answer stream existed but could not be
+// read to a decision (an I/O failure, or an over-long line). It is distinct
+// from a decline so callers never tell a user they said no when the program
+// could not hear them.
+var ErrAnswerUnreadable = errors.New("the confirmation answer could not be read")
+
+// normalizeAnswer turns the bytes a terminal produced into the word the user
+// typed.
+//
+// Terminals disagree about how a line arrives: unix ends it with LF, Windows
+// with CRLF, a console handle may deliver UTF-16LE (every other byte zero), and
+// a read may be NUL padded. Comparing the raw text made a typed "y" decline on
+// Windows. NULs, a BOM and control characters are therefore dropped before the
+// compare; anything left that is not "y"/"yes" still declines.
+func normalizeAnswer(raw []byte) string {
+	decoded := decodeIfUTF16(raw)
+	var b strings.Builder
+	for _, r := range decoded {
+		switch {
+		case r == 0, r == '\ufeff':
+			continue
+		case r < 0x20, r == 0x7f: // CR, LF, TAB, DEL and friends
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(b.String()))
+}
+
+// decodeIfUTF16 decodes a byte slice that is obviously UTF-16 (a BOM, or a
+// NUL-heavy ASCII pattern) and returns it unchanged otherwise.
+func decodeIfUTF16(raw []byte) string {
+	if len(raw) >= 2 {
+		if raw[0] == 0xff && raw[1] == 0xfe {
+			return decodeUTF16(raw[2:], false)
+		}
+		if raw[0] == 0xfe && raw[1] == 0xff {
+			return decodeUTF16(raw[2:], true)
+		}
+	}
+	if len(raw) >= 4 && len(raw)%2 == 0 {
+		zeros := 0
+		for i := 1; i < len(raw); i += 2 {
+			if raw[i] == 0 {
+				zeros++
+			}
+		}
+		if zeros*2 >= len(raw)/2 {
+			return decodeUTF16(raw, false)
+		}
+	}
+	return string(raw)
+}
+
+func decodeUTF16(raw []byte, bigEndian bool) string {
+	if len(raw)%2 != 0 {
+		raw = raw[:len(raw)-1]
+	}
+	units := make([]uint16, 0, len(raw)/2)
+	for i := 0; i+1 < len(raw); i += 2 {
+		if bigEndian {
+			units = append(units, uint16(raw[i])<<8|uint16(raw[i+1]))
+		} else {
+			units = append(units, uint16(raw[i+1])<<8|uint16(raw[i]))
+		}
+	}
+	return string(utf16.Decode(units))
+}
+
 // readBoundedLine reads one line, at most max bytes (plus the newline). An
 // over-long line is an error; the content read is never included in the
 // error (it may quote anything the wrong stream carries).
-func readBoundedLine(r io.Reader, max int) (string, error) {
+func readBoundedLine(r io.Reader, max int) ([]byte, error) {
 	br := bufio.NewReader(io.LimitReader(r, int64(max)+1))
-	line, err := br.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+	line, err := br.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return nil, err
 	}
 	if len(line) > max {
-		return "", fmt.Errorf("input exceeds %d bytes and was refused", max)
+		return nil, fmt.Errorf("input exceeds %d bytes and was refused", max)
 	}
 	return line, nil
 }

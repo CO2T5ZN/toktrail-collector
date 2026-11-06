@@ -14,6 +14,7 @@ package connect
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"toktrail-collector/internal/app/collection"
 	"toktrail-collector/internal/app/cursorsync"
+	"toktrail-collector/internal/cursor/api"
 	"toktrail-collector/internal/local/cursorsource"
 )
 
@@ -92,14 +94,14 @@ func TestSummarizeFirstSyncFailureChainDrivesPendingCode(t *testing.T) {
 	}
 }
 
-// TestSummarizeDeclinedEnableChainDrivesNoPermitCode drives the real
-// declined-first-enable chain: the authorization names Cursor, the
-// local confirmation is declined, no permit is ever written, the
+// TestSummarizeFailedEnableChainDrivesNoPermitCode drives the real
+// failed-first-enable chain: the authorization names Cursor, the enable fails
+// (here: the credential cannot be verified), no permit is ever written, the
 // initial collection's full cursor round ends RoundNoPermit, and
 // evaluateIncomplete's accountTools loop appends the did-not-run
 // reason and sets accountIncomplete — SummarizeRun then reports the
 // closed account_no_permit code over the real result.
-func TestSummarizeDeclinedEnableChainDrivesNoPermitCode(t *testing.T) {
+func TestSummarizeFailedEnableChainDrivesNoPermitCode(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
 	mock := startCursorBacklogMock(t)
@@ -107,21 +109,26 @@ func TestSummarizeDeclinedEnableChainDrivesNoPermitCode(t *testing.T) {
 	ticket := strings.Repeat("7", 64)
 	seedFirstEnableConnect(t, stateDir, mock, cfg, ticket)
 
-	// The pull fake is never invoked: a declined confirmation reads no
-	// credential and pulls nothing.
+	// The pull fake is never invoked: a failed enable pulls nothing.
 	pull := &cursorBacklogPull{events: cursorBulkEvents(2)}
+	wiring := budgetCursorWiring(pull, 5)
+	wiring.Verify = func(ctx context.Context, accessToken string) (api.VerifyResult, error) {
+		return api.VerifyResult{}, errors.New("upstream rejected the session")
+	}
 	out := &bytes.Buffer{}
 	res, err := runCursorConnectWithOptionsOut(t, cfg, stateDir, homeDir, ticket, Options{
-		Cursor: budgetCursorWiring(pull, 5),
+		Cursor: wiring,
 		CursorConfirm: func(notice string, w io.Writer) (bool, error) {
-			return false, nil
+			// Never consulted on a first enable; returning true keeps this
+			// test about the failure chain, not about consent.
+			return true, nil
 		},
 	}, out)
 	if err == nil || !isErrSyncIncomplete(err) {
-		t.Fatalf("a declined first-time confirmation must leave the connect incomplete, got %v", err)
+		t.Fatalf("a failed first-time enable must leave the connect incomplete, got %v", err)
 	}
 	if len(pull.calls) != 0 {
-		t.Fatalf("a declined confirmation must never pull usage, got %+v", pull.calls)
+		t.Fatalf("a failed enable must never pull usage, got %+v", pull.calls)
 	}
 	// The chain's structural facts: the round really observed the
 	// absent permit, and the accountTools reason was actually appended.
@@ -135,7 +142,7 @@ func TestSummarizeDeclinedEnableChainDrivesNoPermitCode(t *testing.T) {
 		t.Fatalf("no permit was written, so no first-sync failure reason may exist, reasons: %v", res.Sync.Incomplete)
 	}
 	if _, ok, lErr := cursorsource.New(stateDir).Load(); lErr != nil || ok {
-		t.Fatalf("a declined confirmation must leave no permit, ok=%v err=%v", ok, lErr)
+		t.Fatalf("a failed enable must leave no permit, ok=%v err=%v", ok, lErr)
 	}
 	summary := SummarizeRun(res, err, nil, 7)
 	if !hasCode(summary.IncompleteCodes, "account_no_permit") {

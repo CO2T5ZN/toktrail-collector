@@ -45,12 +45,14 @@ type Options struct {
 	MaxTotalBatches int
 	// Cursor carries the cursorsync options for the account-level Cursor
 	// source. When the connect authorization names Cursor and no local
-	// permit exists yet, connect performs the first-time local
-	// confirmation (the integrated enable). Nil skips the cursor branch
-	// entirely (builds without the cursor wiring).
+	// permitted yet, connect performs the integrated enable (no local
+	// prompt: the website grant authorizes it). Nil skips the cursor
+	// branch entirely (builds without the cursor wiring).
 	Cursor *cursorsync.Options
-	// CursorConfirm overrides the first-enable confirmation prompt
-	// (tests). Nil uses cursorsync.DefaultConfirm.
+	// CursorConfirm supplies the answer to the one remaining local question:
+	// the desktop login switched to a different Cursor account. A first enable
+	// does not ask (the website grant is the authorization).
+	// Nil uses cursorsync.DefaultConfirm at the switch.
 	CursorConfirm cursorsync.ConfirmFunc
 	// StateReplaceConfirm overrides the state-replacement confirmation
 	// prompt shown when the ownership guards refuse to move this state

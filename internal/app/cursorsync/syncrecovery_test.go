@@ -738,11 +738,12 @@ func TestSyncDrainBudgetSharedAcrossPhases(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestEnableOldServerNeverReadsCredential verifies a server without the
-// account-sources capability aborts the enable — after the first-time
-// confirmation, and before the existing-permit credential read — without
-// ever touching the desktop login.
+// account-sources capability aborts the enable before the credential read,
+// without ever touching the desktop login. The consent notice is printed first
+// (it states what would happen); no confirmation is asked, because the website
+// grant is the authorization.
 func TestEnableOldServerNeverReadsCredential(t *testing.T) {
-	// First-time flow: confirmation first, then the capability gate.
+	// First-time flow: capability gate before any credential read.
 	h := newHarness(t)
 	h.srv.setCapsEnabled(false)
 	confirm := &fakeConfirm{answer: true}
@@ -750,8 +751,8 @@ func TestEnableOldServerNeverReadsCredential(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "account-source support") {
 		t.Fatalf("old server must fail the enable, got %v", err)
 	}
-	if confirm.callCount() != 1 {
-		t.Fatal("the first-time confirmation precedes the capability gate")
+	if confirm.callCount() != 0 {
+		t.Fatalf("the first enable must not ask a second time, got %d call(s)", confirm.callCount())
 	}
 	if h.auth.fetchCount() != 0 || h.verify.callCount() != 0 {
 		t.Fatal("an old server must never see the desktop credential read or verified")

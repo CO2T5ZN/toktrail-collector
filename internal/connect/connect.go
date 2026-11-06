@@ -630,9 +630,20 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 						// confirmation prompt has no terminal to read
 						// from. Say which case happened instead of
 						// implying the user answered no.
-						if errors.Is(enableErr, console.ErrNoInteractiveTerminal) {
+						// Three different things can stop a first-time
+						// enable, and they need different follow-ups: no
+						// terminal to ask, a terminal whose answer could not
+						// be read, or an answer that was not yes. Reporting
+						// all three as "not enabled" is what made a Windows
+						// console's "y" look like a refusal.
+						switch {
+						case errors.Is(enableErr, console.ErrNoInteractiveTerminal):
 							d.phase("tool %q: not enabled; no interactive terminal was available to confirm this first-time local enable; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
-						} else {
+						case errors.Is(enableErr, console.ErrAnswerUnreadable):
+							d.phase("tool %q: not enabled; the local confirmation could not be read from the terminal; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
+						case errors.Is(enableErr, cursorsync.ErrConfirmationDeclined):
+							d.phase("tool %q: not enabled; the local confirmation was answered no, so nothing was enabled; run `toktrail cursor enable` in a terminal and answer y to enable it", spec.Tool)
+						default:
 							d.phase("tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally", spec.Tool)
 						}
 					}

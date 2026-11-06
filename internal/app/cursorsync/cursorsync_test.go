@@ -53,12 +53,13 @@ func loadCache(t *testing.T, dir string) *usage.EventCache {
 // Enable: confirmation ordering and idempotence
 // ---------------------------------------------------------------------------
 
-// TestEnableConfirmPrecedesCredentialRead pins the order-of-trust
-// invariant: on a first-time enable the local confirmation strictly
-// precedes any read of the Cursor desktop credential, the server
-// capability gate runs after the confirmation but still before the
-// credential read, and a full enable completes the first sync.
-func TestEnableConfirmPrecedesCredentialRead(t *testing.T) {
+// TestEnableNoticePrecedesCredentialRead pins the order-of-trust invariant that
+// survives the removal of the second local prompt: on a first-time enable the
+// consent notice (the four facts) is printed before any read of the Cursor
+// desktop credential, the server capability gate runs between them, and a full
+// enable completes the first sync. The website's grant is the authorization, so
+// no confirmation function is consulted at all.
+func TestEnableNoticePrecedesCredentialRead(t *testing.T) {
 	h := newHarness(t)
 	h.pull.setEvents(
 		ev("evt-0001", baseTime.Add(-30*time.Minute), 100, 0, 0, 50),
@@ -68,23 +69,26 @@ func TestEnableConfirmPrecedesCredentialRead(t *testing.T) {
 	confirm := &fakeConfirm{answer: true, order: &order}
 	h.auth.order = &order
 
-	res, err := cursorsync.Enable(context.Background(), h.options(), confirm.confirm)
+	var out strings.Builder
+	opt := h.options()
+	opt.Out = &out
+	res, err := cursorsync.Enable(context.Background(), opt, confirm.confirm)
 	if err != nil {
 		t.Fatalf("enable: %v", err)
 	}
-	if len(order) == 0 || order[0] != "confirm" {
-		t.Fatalf("the confirmation must precede every credential read, got order %v", order)
+	if confirm.calls != 0 {
+		t.Fatalf("the first enable must not ask a second time, got %d confirmation call(s)", confirm.calls)
 	}
-	for _, step := range order[:1] {
-		if step == "auth" {
-			t.Fatalf("credential read before confirmation: %v", order)
+	if !strings.Contains(out.String(), cursorsync.EnableNotice) {
+		t.Fatalf("the consent notice must still be printed before the credential is read, got:\n%s", out.String())
+	}
+	for _, step := range order {
+		if step == "confirm" {
+			t.Fatalf("no confirmation may precede the credential read: %v", order)
 		}
 	}
-	if confirm.notice() != cursorsync.EnableNotice {
-		t.Fatalf("confirm received notice %q, want EnableNotice", confirm.notice())
-	}
 	if !res.Confirmed || !res.ServerEnabled {
-		t.Fatalf("confirmed=%t serverEnabled=%t, want both true", res.Confirmed, res.ServerEnabled)
+		t.Fatalf("confirmed=%t serverEnabled=%t, want both true (the server grant is the authorization)", res.Confirmed, res.ServerEnabled)
 	}
 	if !res.Sync.Ran || !res.Sync.FirstSyncCompleted {
 		t.Fatalf("first sync did not complete: %+v", res.Sync)
@@ -101,28 +105,27 @@ func TestEnableConfirmPrecedesCredentialRead(t *testing.T) {
 	}
 }
 
-// TestEnableDeclinedNeverReadsCredential verifies a declined
-// confirmation aborts before any credential read, any server enable call
-// and any license write.
-func TestEnableDeclinedNeverReadsCredential(t *testing.T) {
+// TestEnableWithoutALocalPromptStillRequiresTheServerGrant pins what the
+// website grant does NOT replace: a device that is not authorized (paused,
+// revoked, or without an upload consent) is refused before any credential read,
+// with no prompt to be answered and no license written.
+func TestEnableWithoutALocalPromptStillRequiresTheServerGrant(t *testing.T) {
 	h := newHarness(t)
-	confirm := &fakeConfirm{answer: false}
+	h.srv.setPaused(true)
 
-	_, err := cursorsync.Enable(context.Background(), h.options(), confirm.confirm)
-	if err == nil || !strings.Contains(err.Error(), "declined") {
-		t.Fatalf("declined enable must fail, got %v", err)
+	var fetchedBefore = h.auth.fetchCount()
+	_, err := cursorsync.Enable(context.Background(), h.options(), nil)
+	if err == nil {
+		t.Fatal("an unauthorized device must be refused")
 	}
-	if h.auth.fetchCount() != 0 {
-		t.Fatalf("credential read %d time(s) after a declined confirmation", h.auth.fetchCount())
-	}
-	if h.verify.callCount() != 0 {
-		t.Fatalf("credential verified %d time(s) after a declined confirmation", h.verify.callCount())
+	if h.auth.fetchCount() != fetchedBefore {
+		t.Fatalf("credential read after an authorization refusal")
 	}
 	if _, enable, ingest, _, _ := h.srv.stats(); enable != 0 || ingest != 0 {
-		t.Fatalf("server enable=%d ingest=%d after a declined confirmation, want 0/0", enable, ingest)
+		t.Fatalf("server enable=%d ingest=%d, want 0/0", enable, ingest)
 	}
 	if _, ok, err := cursorsource.New(h.dir).Load(); err != nil || ok {
-		t.Fatalf("license must not exist after a declined confirmation (ok=%t err=%v)", ok, err)
+		t.Fatalf("license must not exist (ok=%t err=%v)", ok, err)
 	}
 }
 
