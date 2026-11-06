@@ -114,6 +114,18 @@ const DefaultSharedPOSTWindow = 20 * time.Minute
 // never blindly resent as-is).
 var ErrRecordsRejected = errors.New("records_rejected")
 
+// ErrToolStatusReport reports a failed per-tool status report that
+// followed an ALREADY-confirmed batch upload: by the time the report
+// runs, the syncclient has settled the upload durably (the receipt is
+// reconciled, accepted records keep their advanced baselines and the
+// batch is marked synced in the outbox), so Result's confirmed counts
+// and the drain's recounted pending state stay valid — only the status
+// metadata round failed. Run returns this sentinel wrapping the
+// underlying error (the cause stays matchable through errors.Is/Unwrap)
+// instead of a nil error: a report failure after real confirmed work
+// must never read as full sync success.
+var ErrToolStatusReport = errors.New("tool_status_report")
+
 // isBudgetDecline reports whether err is a shared run-budget decline
 // (internal/syncbudget): the attempt was stopped BEFORE its ingest POST,
 // so nothing was sent, acknowledged or dropped — the batch stays pending
@@ -1667,10 +1679,22 @@ func (d *deviceQueueDrain) step(ctx context.Context) (progressed bool, err error
 					return false, countErr
 				}
 				d.res.PendingRemaining = remaining
+				// The recount above really measured the durable queue,
+				// so the summary may report it: an uncounted queue here
+				// used to render the backlog as "device pending unknown"
+				// even though this stop knows the exact count. Every
+				// other stop path of this stepper already sets the flag.
+				d.res.PendingCounted = true
 				d.res.DrainStopped = fmt.Sprintf("source status report failed: %v", err)
 				d.res.DrainStop = DrainStopFailed
 				d.finished = true
-				return false, err
+				// The upload itself already succeeded and was confirmed
+				// durably (receipt reconciled, batch marked synced); the
+				// failure is the metadata report that follows it. The
+				// sentinel lets callers classify this stop without
+				// trusting the underlying free text, while the wrapped
+				// cause keeps every errors.Is match it had.
+				return false, fmt.Errorf("%w: source status report after the confirmed upload of device batch %s: %w", ErrToolStatusReport, entry.BatchID, err)
 			}
 		}
 	}

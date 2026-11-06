@@ -890,6 +890,8 @@ func periodicRunErrorSafeText(err, ctxErr error) string {
 		return "local access denied; check permissions"
 	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
 		return "operation timed out"
+	case errors.Is(err, collection.ErrToolStatusReport):
+		return "the usage upload was confirmed, but its source status report failed; remaining work stays pending"
 	default:
 		return "the collection round failed (details withheld; review the configuration before another run)"
 	}

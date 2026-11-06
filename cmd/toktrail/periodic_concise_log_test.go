@@ -958,6 +958,20 @@ func TestPeriodicRunErrorSafeTextSentinels(t *testing.T) {
 	if got := periodicRunErrorSafeText(fmt.Errorf("wrap: %w", context.Canceled), nil); got != "the run was cancelled before it finished" {
 		t.Fatalf("the cancel sentinel keeps its curated wording, got %q", got)
 	}
+	// A failed status report follows a durable usage ACK; identify the
+	// failed stage without leaking the underlying server or transport text.
+	statusErr := fmt.Errorf("%w: %w", collection.ErrToolStatusReport, hostile)
+	wantStatus := "the usage upload was confirmed, but its source status report failed; remaining work stays pending"
+	if got := periodicRunErrorSafeText(statusErr, nil); got != wantStatus {
+		t.Fatalf("a source status failure renders its fixed stage reason, got %q", got)
+	}
+	if got := displayErrorText(safeDisplayError(statusErr, periodicRunErrorSafeText(statusErr, nil))); got != wantStatus {
+		t.Fatalf("the command failure preserves the source status diagnosis, got %q", got)
+	}
+	// Cancellation and timeouts retain their more specific reason.
+	if got := periodicRunErrorSafeText(fmt.Errorf("%w: %w", collection.ErrToolStatusReport, context.DeadlineExceeded), nil); got != "operation timed out" {
+		t.Fatalf("a status-report timeout keeps its timeout reason, got %q", got)
+	}
 	// Unknown hostile error: the fixed fallback, never the raw text.
 	got := periodicRunErrorSafeText(hostile, nil)
 	if got != "the collection round failed (details withheld; review the configuration before another run)" {

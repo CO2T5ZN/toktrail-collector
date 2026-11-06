@@ -69,6 +69,12 @@ type budgetFakeServer struct {
 	// per-index rejection codes (nil = accept everything), mirroring
 	// fakeCollectorServer's partial-receipt hook.
 	rejectRecords func(records []map[string]any) map[int]string
+	// failToolStatus, when true, answers every tool-status POST with a
+	// synthetic transient 503 (no server error code), so tests can
+	// exercise the per-batch receipt path's failure handling after a
+	// confirmed upload. Failed attempts are not counted in
+	// toolStatusPosts.
+	failToolStatus bool
 }
 
 // fairUpload is one recorded real ingest POST: which queue made it and
@@ -163,8 +169,15 @@ func startBudgetFakeServer(t *testing.T) *budgetFakeServer {
 				t.Errorf("tool-status POST must carry at least one statuses[] entry")
 			}
 			s.mu.Lock()
-			s.toolStatusPosts++
+			failed := s.failToolStatus
+			if !failed {
+				s.toolStatusPosts++
+			}
 			s.mu.Unlock()
+			if failed {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{})
+				return
+			}
 			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/ingest/batches":
 			var body struct {
@@ -222,6 +235,14 @@ func (s *budgetFakeServer) setPauseFromSelfRequest(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pauseFromSelfRequest = n
+}
+
+// setFailToolStatus arms or clears the synthetic transient tool-status
+// failure (503 with no server error code) for every tool-status POST.
+func (s *budgetFakeServer) setFailToolStatus(fail bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failToolStatus = fail
 }
 
 func (s *budgetFakeServer) counters() (selfRequests, srcPosts, devicePosts, toolStatusPosts, grantAcks int) {
