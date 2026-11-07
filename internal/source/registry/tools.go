@@ -26,6 +26,8 @@ type ToolSpec struct {
 	Aliases        []string // Case-insensitive matching aliases
 	Source         string   // Collector adapter source identifier
 	DefaultSubpath []string // Path segments relative to user home directory
+	// FallbackSubpaths are probed in order only when the preferred path is absent.
+	FallbackSubpaths [][]string
 	// Mode classifies the collection path. The zero value behaves as
 	// ModeLocal so every pre-existing local tool spec is unchanged.
 	Mode SourceMode
@@ -54,11 +56,12 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
-		Tool:           "WorkBuddy",
-		Aliases:        []string{"workbuddy", "workbuddy-ai"},
-		Source:         adapter.WorkBuddyJSONLSource,
-		DefaultSubpath: []string{".workbuddy-ai", "projects"},
-		Mode:           ModeLocal,
+		Tool:             "WorkBuddy",
+		Aliases:          []string{"workbuddy", "workbuddy-ai"},
+		Source:           adapter.WorkBuddyJSONLSource,
+		DefaultSubpath:   []string{".workbuddy-ai", "projects"},
+		FallbackSubpaths: [][]string{{".workbuddy", "projects"}},
+		Mode:             ModeLocal,
 	},
 	{
 		Tool:           "Qwen Code",
@@ -178,4 +181,19 @@ func (t ToolSpec) ResolveDefaultInput(homeDir string) string {
 	}
 	parts := append([]string{homeDir}, t.DefaultSubpath...)
 	return filepath.Join(parts...)
+}
+
+// DefaultInputCandidates returns the preferred directory followed by known
+// alternate layouts. It does not read the filesystem or grant access itself.
+func (t ToolSpec) DefaultInputCandidates(homeDir string) []string {
+	primary := t.ResolveDefaultInput(homeDir)
+	if primary == "" {
+		return nil
+	}
+	paths := []string{primary}
+	for _, subpath := range t.FallbackSubpaths {
+		parts := append([]string{homeDir}, subpath...)
+		paths = append(paths, filepath.Join(parts...))
+	}
+	return paths
 }

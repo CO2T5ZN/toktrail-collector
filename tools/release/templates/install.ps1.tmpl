@@ -166,26 +166,41 @@ try {
         # value) and SetEnvironmentVariable writes REG_SZ, which permanently
         # breaks every %VAR% entry in the user PATH. Preserve the raw text and
         # the value kind.
-        $envKey = Get-Item -LiteralPath 'HKCU:\Environment'
-        $userPath = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        $alreadyThere = $false
-        foreach ($dir in @($userPath -split ';')) {
-          if ($dir -and $dir.TrimEnd([char]'\') -ieq $installPath.TrimEnd([char]'\')) { $alreadyThere = $true }
-        }
-        if ($alreadyThere) {
-          Write-Host "==> $installPath is already in your user PATH"
-        } else {
-          $newPath = if ($userPath) { "$installPath;$userPath" } else { $installPath }
-          $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
-          try { if ($envKey.GetValueKind('Path') -eq [Microsoft.Win32.RegistryValueKind]::String) { $kind = [Microsoft.Win32.RegistryValueKind]::String } } catch { }
-          $envKey.SetValue('Path', $newPath, $kind)
-          $env:Path = "$installPath;$env:Path"
+        $envKey = $null
+        try {
+          # Registry provider Get-Item can return a read-only handle even in an
+          # elevated PowerShell. Explicitly request write access instead.
+          $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+          if ($null -eq $envKey) {
+            $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          }
+          $userPath = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $alreadyThere = $false
+          foreach ($dir in @($userPath -split ';')) {
+            if ($dir -and $dir.TrimEnd([char]'\') -ieq $installPath.TrimEnd([char]'\')) { $alreadyThere = $true }
+          }
+          if ($alreadyThere) {
+            Write-Host "==> $installPath is already in your user PATH"
+          } else {
+            $newPath = if ($userPath) { "$installPath;$userPath" } else { $installPath }
+            $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+            try { if ($envKey.GetValueKind('Path') -eq [Microsoft.Win32.RegistryValueKind]::String) { $kind = [Microsoft.Win32.RegistryValueKind]::String } } catch { }
+            $envKey.SetValue('Path', $newPath, $kind)
+            Write-Host ""
+            Write-Host "==> added to your user PATH: $installPath"
+            Write-Host "    open a new terminal to use 'toktrail'"
+            Write-Host "    to undo: remove that entry in System Properties > Environment Variables"
+            Write-Host ""
+          }
+        } catch {
           Write-Host ""
-          Write-Host "==> added to your user PATH: $installPath"
-          Write-Host "    open a new terminal to use 'toktrail'; this session has it already"
-          Write-Host "    to undo: remove that entry in System Properties > Environment Variables"
+          Write-Host "note: could not update your user PATH; installation will continue."
+          Write-Host "      add $installPath through System Properties > Environment Variables if you want 'toktrail' in a shell."
           Write-Host ""
+        } finally {
+          if ($null -ne $envKey) { $envKey.Dispose() }
         }
+        $env:Path = "$installPath;$env:Path"
         Write-Host "note: scheduled collection does not need PATH: the task invokes $installPath\toktrail.exe directly."
         Write-Host ""
       }

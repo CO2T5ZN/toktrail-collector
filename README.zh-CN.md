@@ -248,8 +248,8 @@ WorkBuddy 说明：
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
 - 不覆盖 WorkBuddy 的 SQLite 历史库；只存在于 SQLite 中的用量不会被采集。
 - 可以可靠归属的历史请求模型标识会随用量上传，但不代表已验证其后端模型身份。
-- 默认目录是 `~/.workbuddy-ai/projects`（新版 WorkBuddy AI）。旧版 WorkBuddy 使用 `~/.workbuddy/projects`；旧目录没有自动回退，需显式授权，例如 `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`。
-- `connect` 会按服务端授权列表重新应用 grants，并禁用不在列表中的手动授权。旧目录 `~/.workbuddy/projects` 的显式授权需在 `connect` 之后（重新）添加，且每次重新 connect 后需重新检查。
+- 默认优先探测 `~/.workbuddy-ai/projects`，仅当其不存在时自动回退至 `~/.workbuddy/projects`；`connect` 和定时 grant 同步均支持这两种布局，不会自动合并两个目录。Windows 下 `~` 对应当前运行账户的用户目录。
+- 定时 grant 同步保留已有的默认布局授权和手动禁用状态。`connect` 仍会重新应用当前授权；非标准或自定义路径可在 `connect` 后通过 `toktrail sources enable --source workbuddy-jsonl --input <path>` 显式添加，并在重新连接后检查。
 
 绑定并同步到本地开发服务：
 

@@ -251,8 +251,8 @@ WorkBuddy specifics:
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
 - It does not cover the WorkBuddy SQLite history database; usage recorded only there is not collected.
 - Recorded request model identifiers are included in uploads when they can be attributed reliably; they do not imply a verified backend identity.
-- The default directory is `~/.workbuddy-ai/projects` (current WorkBuddy AI versions). Older WorkBuddy versions used `~/.workbuddy/projects`; there is no automatic fallback for the old layout, so grant it explicitly, for example `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`.
-- `connect` reapplies the server-authorized grants and disables manually enabled grants that are not part of them. Add the old-layout `~/.workbuddy/projects` grant after running `connect`, and re-check it after every reconnect.
+- Both `connect` and scheduled grant sync prefer `~/.workbuddy-ai/projects` and fall back to `~/.workbuddy/projects` only when the preferred directory is absent. They do not automatically merge the two directories. On Windows, `~` is the home directory of the account running the collector.
+- Scheduled grant sync preserves existing grants for known default layouts and manual disable decisions. `connect` still reapplies the current authorization; add custom or non-standard paths afterward with `toktrail sources enable --source workbuddy-jsonl --input <path>` and re-check them after reconnecting.
 
 Bind and sync against a local development server:
 

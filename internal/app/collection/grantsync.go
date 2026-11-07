@@ -476,7 +476,17 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 			// source state governs them.
 			continue
 		}
+		candidates := spec.DefaultInputCandidates(homeDir)
 		def := spec.ResolveDefaultInput(homeDir)
+		// Keep an existing grant for a known layout, including a manually
+		// disabled one. A newly created preferred directory must not bypass
+		// the user's earlier decision to disable the alternate layout.
+		for _, candidate := range candidates {
+			if _, exists := grantOf(cfg, spec.Source, candidate); exists {
+				def = candidate
+				break
+			}
+		}
 		pair, pairExists := grantOf(cfg, spec.Source, def)
 		if pairExists {
 			if pair.Enabled {
@@ -506,9 +516,16 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 		// error, an I/O error, or a path that exists but is not a
 		// directory) must surface: classifying a real local fault as
 		// "not found" would disguise it as an uninstalled tool.
-		missing, probeErr := probe(def)
-		if probeErr != nil {
-			return nil, nil, fmt.Errorf("probe default directory for tool %q: %w", tool, probeErr)
+		missing := true
+		for _, candidate := range candidates {
+			candidateMissing, probeErr := probe(candidate)
+			if probeErr != nil {
+				return nil, nil, fmt.Errorf("probe default directory for tool %q: %w", tool, probeErr)
+			}
+			if !candidateMissing {
+				def, missing = candidate, false
+				break
+			}
 		}
 		if missing {
 			if anyEnabledForSource(cfg, spec.Source) {

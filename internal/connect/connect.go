@@ -721,6 +721,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				statFn = opt.statDefaultDir
 			}
 			stat, err := statFn(targetDir)
+			for _, candidate := range spec.DefaultInputCandidates(homeDir)[1:] {
+				if !errors.Is(err, os.ErrNotExist) {
+					break
+				}
+				candidateStat, candidateErr := statFn(candidate)
+				if !errors.Is(candidateErr, os.ErrNotExist) {
+					targetDir, stat, err = candidate, candidateStat, candidateErr
+					break
+				}
+			}
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
 					// A permission or I/O failure must never masquerade
