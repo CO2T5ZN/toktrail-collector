@@ -225,6 +225,54 @@ func TestToolStatusRetryTerminalHTTP(t *testing.T) {
 	}
 }
 
+// Return a real HTTP response from a deterministic transport after cancelling
+// the request context. A live httptest server can instead surface transport
+// cancellation, hiding the response/cancellation boundary that broke macOS CI.
+func TestToolStatusRetryResponseAfterCancellation(t *testing.T) {
+	for _, stage := range []string{"self", "post"} {
+		for _, body := range []string{"", `{}`} {
+			t.Run(stage+"/"+body, func(t *testing.T) {
+				dir, store, _ := setupBoundState(t)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				gets, posts := 0, 0
+				client := &http.Client{Transport: toolStatusRoundTrip(func(r *http.Request) (*http.Response, error) {
+					self := r.URL.Path == "/v1/devices/self"
+					if self {
+						gets++
+					} else {
+						posts++
+					}
+					status, content := http.StatusServiceUnavailable, body
+					if self && stage == "post" {
+						status = http.StatusOK
+						content = `{"device":{"deviceId":"dev-1","uploadAuthorized":true,"consentRevision":4}}`
+					} else {
+						cancel()
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": []string{"3"}}, Body: io.NopCloser(strings.NewReader(content)), Request: r}, nil
+				})}
+				clock := newFakeRetryClock(time.Now())
+				_, err := ReportToolStatuses(ctx, store, Options{
+					StateDir: dir, ServerURL: "http://example.test", HTTPClient: client,
+					Retry:        syncretry.New(syncretry.WithClock(clock)),
+					ToolStatuses: []ToolStatus{{Tool: "Codex", Status: "synced"}},
+				})
+				wantPosts := 0
+				if stage == "post" {
+					wantPosts = 1
+				}
+				if !errors.Is(err, context.Canceled) || gets != 1 || posts != wantPosts || len(clock.recordedWaits()) != 0 {
+					t.Fatalf("cancelled response must not wait or retry: gets=%d posts=%d waits=%v err=%v", gets, posts, clock.recordedWaits(), err)
+				}
+				if errors.Is(err, syncretry.ErrRetryExhausted) || errors.Is(err, syncretry.ErrRetryPastDeadline) {
+					t.Fatalf("cancelled response must not report retry exhaustion or deadline: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestToolStatusRetryBoundsAndCompatibility(t *testing.T) {
 	for _, mode := range []string{"exhausted", "deadline", "cancelled", "nil", "old", "redirect", "bad-self"} {
 		t.Run(mode, func(t *testing.T) {

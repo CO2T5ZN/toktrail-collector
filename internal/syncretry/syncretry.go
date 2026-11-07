@@ -204,6 +204,13 @@ func (p *Policy) Do(ctx context.Context, send Send) error {
 		if err == nil {
 			return nil
 		}
+		// A response and cancellation can arrive together. Send layers may
+		// deliberately stop marking the failure retryable once ctx is done;
+		// preserve that cancellation before classifying the response or retry
+		// budget. Keep confirmed success above, and keep both failure causes.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("syncretry: attempt %d stopped: %w: %w", attempt, ctxErr, err)
+		}
 		if !IsRetryable(err) {
 			return err
 		}
