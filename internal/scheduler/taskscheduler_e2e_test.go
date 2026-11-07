@@ -160,6 +160,46 @@ func TestWindowsSchedulerNativeIntegration(t *testing.T) {
 	if !strings.Contains(xmlText, xmlEscape(userID)) {
 		t.Fatalf("registered task XML is missing principal UserId %q:\n%s", userID, xmlText)
 	}
+	_, doc, err := parseWindowsTask(xmlText, cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsRefreshPrincipal(doc, userID); err != nil {
+		t.Fatalf("Task Scheduler round-tripped an unexpected principal: %v\n%s", err, xmlText)
+	}
+	if _, err := RefreshWindows(InstallOptions{Config: cfg}); err != nil {
+		t.Fatalf("refresh of the registered background task must be idempotent: %v", err)
+	}
+
+	// Also exercise real legacy migration with the default RunLevel omitted.
+	// This is a private probe task, never the runner's production schedule.
+	legacy := strings.Replace(xmlText, "<RunLevel>LeastPrivilege</RunLevel>", "", 1)
+	start, end := strings.Index(legacy, "<Exec>"), strings.Index(legacy, "</Exec>")+len("</Exec>")
+	if start < 0 || end <= start {
+		t.Fatal("registered probe task has no Exec action")
+	}
+	legacy = legacy[:start] + "<Exec><Command>" + xmlEscape(binary) + "</Command><Arguments>periodic --state-dir " + xmlEscape(windowsQuoteArg(stateDir)) + "</Arguments></Exec>" + legacy[end:]
+	legacyFile := filepath.Join(root, "legacy-probe.task.xml")
+	if err := os.WriteFile(legacyFile, encodeUTF16LEWithBOM(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (ExecRunner{}).Run("schtasks", "/Create", "/F", "/XML", legacyFile, "/TN", taskName); err != nil {
+		t.Fatalf("register legacy probe: %v", err)
+	}
+	if _, err := RefreshWindows(InstallOptions{Config: cfg}); err != nil {
+		t.Fatalf("migrate legacy probe with default run level: %v", err)
+	}
+	refreshed, err := WindowsTaskStatus(cfg)
+	if err != nil || !refreshed.Background || refreshed.Collector != binary {
+		t.Fatalf("migrated probe action: %+v err=%v", refreshed, err)
+	}
+	updatedXML, err := (ExecRunner{}).RunOutput("schtasks", "/Query", "/TN", taskName, "/XML")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updatedXML), formatWindowsInterval(cfg.Interval)) {
+		t.Fatal("migration changed the scheduled interval")
+	}
 
 	// 3. Execute the task: no console may be allocated, stdout/stderr must
 	// be captured, and Task Scheduler must receive the child's exit code.

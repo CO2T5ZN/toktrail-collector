@@ -34,8 +34,11 @@ type windowsTaskDocument struct {
 	URI        string   `xml:"RegistrationInfo>URI"`
 	Principals []struct {
 		UserID    string `xml:"UserId"`
+		GroupID   string `xml:"GroupId"`
 		LogonType string `xml:"LogonType"`
-		RunLevel  string `xml:"RunLevel"`
+		// Task Scheduler may omit the default least-privilege element.
+		// A pointer distinguishes absence from an explicitly empty value.
+		RunLevel *string `xml:"RunLevel"`
 	} `xml:"Principals>Principal"`
 	Actions struct {
 		Exec []struct {
@@ -199,6 +202,27 @@ func readWindowsTask(cfg TaskConfig, runner Runner) (WindowsTaskInfo, string, er
 	return info, text, nil
 }
 
+func validateWindowsRefreshPrincipal(doc windowsTaskDocument, userID string) error {
+	if len(doc.Principals) != 1 {
+		return errors.New("task must have exactly one principal; refusing to change it")
+	}
+	principal := doc.Principals[0]
+	if userID == "" || !strings.EqualFold(principal.UserID, userID) || principal.GroupID != "" {
+		return errors.New("task principal differs from the current user; refusing to change it")
+	}
+	if principal.LogonType != "InteractiveToken" {
+		return errors.New("task principal does not use interactive-token logon; refusing to change it")
+	}
+	// IPrincipal defaults to TASK_RUNLEVEL_LUA (0). Task Scheduler's XML
+	// serialization may omit that value even when registration supplied it.
+	// Only absence or the exact valid enum is acceptable, never an empty,
+	// unknown or explicitly elevated value.
+	if principal.RunLevel != nil && *principal.RunLevel != "LeastPrivilege" {
+		return errors.New("task principal is not least-privilege; refusing to change it")
+	}
+	return nil
+}
+
 // RefreshWindows migrates only the Exec action of an existing owned task.
 // It preserves the original trigger, principal, settings, identity and state.
 // A failed registration is followed by an attempt to restore the exact old XML.
@@ -226,8 +250,8 @@ func RefreshWindows(opt InstallOptions) (WindowsTaskInfo, error) {
 	if err != nil {
 		return info, err
 	}
-	if len(doc.Principals) != 1 || !strings.EqualFold(doc.Principals[0].UserID, userID) || doc.Principals[0].LogonType != "InteractiveToken" || doc.Principals[0].RunLevel != "LeastPrivilege" {
-		return info, errors.New("task principal differs from the current least-privilege interactive user; refusing to change it")
+	if err := validateWindowsRefreshPrincipal(doc, userID); err != nil {
+		return info, err
 	}
 	newXML, err := replaceWindowsExec(oldXML, cfg.Binary, cfg.StateDir)
 	if err != nil {
