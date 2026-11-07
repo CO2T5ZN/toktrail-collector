@@ -651,8 +651,8 @@ func runPeriodicIO(args []string, stdout, stderr io.Writer) error {
 // collection result, the run error (nil on the historical zero-exit
 // shapes; every non-nil error is wrapped with its curated SafeDisplay
 // text while the chain and err.Error() stay verbatim), the run
-// context's own state at return time (nil while the context is still
-// live) for the §6.5 deadline/cancellation classification, and whether
+// context's cancellation/deadline state for §6.5 classification (including
+// a proven elapsed deadline before the context timer fires), and whether
 // the collection round actually started (false for the pre-run
 // failures, so the summary reports not_run instead of a drained
 // queue).
@@ -762,13 +762,13 @@ func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collectio
 		result, err = collection.Run(ctx, options)
 	}
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if periodicRunTimedOut(err, ctx.Err(), retryDeadline, time.Now()) {
 			if verbose {
 				printPeriodicResult(human, result)
 				fmt.Fprintf(human, "incomplete: the periodic run timeout (%s) elapsed; remaining work stays pending\n", syncTimeout)
 			}
 			msg := fmt.Sprintf("periodic incomplete: run timeout (%s) elapsed", syncTimeout)
-			return result, safeDisplayError(fmt.Errorf("%s: %w", msg, err), msg+"; remaining work stays pending"), ctx.Err(), true
+			return result, safeDisplayError(fmt.Errorf("%s: %w", msg, err), msg+"; remaining work stays pending"), context.DeadlineExceeded, true
 		}
 		if isSyncBudgetDecline(err) {
 			// The shared upload budget stopped the run before some of its
@@ -869,6 +869,20 @@ func runPeriodicRound(fs *flag.FlagSet, human io.Writer, progress func(collectio
 	return result, nil, ctx.Err(), true
 }
 
+// periodicRunTimedOut recognizes the run's own deadline independently of when
+// the context timer goroutine updates Err. On Windows that update can lag the
+// wall-clock check in syncretry. A retry that cannot fit a future deadline, or
+// a client timeout while the run still has time, must not claim time elapsed.
+func periodicRunTimedOut(err, ctxErr error, deadline, now time.Time) bool {
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, syncretry.ErrRetryPastDeadline) {
+		return false
+	}
+	if errors.Is(ctxErr, context.Canceled) {
+		return false
+	}
+	return errors.Is(ctxErr, context.DeadlineExceeded) || (!deadline.IsZero() && !now.Before(deadline))
+}
+
 // periodicRunErrorSafeText maps a non-budget, non-timeout run error to
 // its closed English rendering for main's unified failure line. The
 // mapping keys only off error sentinels — never message text — and the
@@ -884,6 +898,8 @@ func periodicRunErrorSafeText(err, ctxErr error) string {
 		return "another collector process holds the collector state lock; no work was performed"
 	case errors.Is(err, syncretry.ErrRetryExhausted):
 		return "periodic incomplete: the bounded retry policy spent its retries before the run deadline; remaining work stays pending"
+	case errors.Is(err, syncretry.ErrRetryPastDeadline):
+		return "periodic incomplete: the next retry cannot fit within the run deadline; remaining work stays pending"
 	case errors.Is(err, context.Canceled), errors.Is(ctxErr, context.Canceled):
 		return "the run was cancelled before it finished"
 	case errors.Is(err, os.ErrPermission):
