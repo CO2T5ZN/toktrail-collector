@@ -30,13 +30,13 @@
 package scheduler
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -69,11 +69,22 @@ type ExecRunner struct{}
 func (ExecRunner) Run(name string, args ...string) error { return runCommand(name, args...) }
 
 func (ExecRunner) RunOutput(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
+	cmd := schedulerOutputCommand(name, args...)
 	configureSchedulerCommand(cmd)
-	out, err := cmd.CombinedOutput()
+	// Keep diagnostic stderr separate from XML stdout: mixing a warning
+	// into an otherwise valid task document corrupts its encoding/content.
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
+		err = schedulerOutputError(name, args, err)
+		if errors.Is(err, errWindowsTaskMissing) {
+			return nil, err
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(string(out))
+		}
 		if msg == "" {
 			return nil, err
 		}
@@ -671,7 +682,7 @@ func IsInstalledWithRunner(cfg TaskConfig, runner Runner) (bool, []string, error
 			return false, nil, fmt.Errorf("windows scheduled task query failed: %w", err)
 		}
 		xmlText := decodeUTF16LEOrUTF8(out)
-		if err := OwnedFileCheckText(xmlText, plan.TaskName, plan.Marker); err != nil {
+		if _, err := checkedWindowsTask(xmlText, plan.TaskName, plan.Marker); err != nil {
 			return false, nil, fmt.Errorf("scheduled task %s ownership check failed: %w", taskName, err)
 		}
 		found = append(found, "schtasks:"+taskName)
@@ -718,6 +729,9 @@ func encodeUTF16LEWithBOM(s string) []byte {
 func isTaskNotFound(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errWindowsTaskMissing) {
+		return true
 	}
 	var cmdErr *commandError
 	if errors.As(err, &cmdErr) {

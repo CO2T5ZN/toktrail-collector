@@ -31,6 +31,7 @@ type WindowsTaskInfo struct {
 
 type windowsTaskDocument struct {
 	XMLName    xml.Name `xml:"Task"`
+	URI        string   `xml:"RegistrationInfo>URI"`
 	Principals []struct {
 		UserID    string `xml:"UserId"`
 		LogonType string `xml:"LogonType"`
@@ -58,8 +59,25 @@ func windowsXMLDecoder(text string) *xml.Decoder {
 
 func parseWindowsTask(text, stateDir string) (WindowsTaskInfo, windowsTaskDocument, error) {
 	var doc windowsTaskDocument
-	if err := windowsXMLDecoder(text).Decode(&doc); err != nil {
+	decoder := windowsXMLDecoder(text)
+	if err := decoder.Decode(&doc); err != nil {
 		return WindowsTaskInfo{}, doc, fmt.Errorf("invalid registered task XML: %w", err)
+	}
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return WindowsTaskInfo{}, doc, fmt.Errorf("invalid registered task XML: %w", err)
+		}
+		if chars, ok := token.(xml.CharData); ok && strings.TrimSpace(string(chars)) == "" {
+			continue
+		}
+		if _, ok := token.(xml.Comment); ok {
+			continue
+		}
+		return WindowsTaskInfo{}, doc, errors.New("registered task XML has trailing content")
 	}
 	if len(doc.Actions.Exec) != 1 {
 		return WindowsTaskInfo{}, doc, errors.New("registered task must have exactly one Exec action")
@@ -138,6 +156,20 @@ func splitWindowsArguments(command string) ([]string, error) {
 	return args, nil
 }
 
+// checkedWindowsTask validates authoritative XML fields instead of looking for
+// a path substring in serialized XML. Equivalent entity encodings are accepted;
+// mentions in descriptions/comments cannot authorize a foreign Exec action.
+func checkedWindowsTask(text, identity, marker string) (WindowsTaskInfo, error) {
+	info, doc, err := parseWindowsTask(text, marker)
+	if err != nil {
+		return WindowsTaskInfo{}, err
+	}
+	if doc.URI != windowsTaskName(identity) {
+		return WindowsTaskInfo{}, errors.New("registered task URI does not match the collector task identity")
+	}
+	return info, nil
+}
+
 func WindowsTaskStatus(cfg TaskConfig) (WindowsTaskInfo, error) {
 	info, _, err := readWindowsTask(cfg, ExecRunner{})
 	return info, err
@@ -160,11 +192,11 @@ func readWindowsTask(cfg TaskConfig, runner Runner) (WindowsTaskInfo, string, er
 		return WindowsTaskInfo{}, "", fmt.Errorf("windows scheduled task query failed: %w", err)
 	}
 	text := decodeUTF16LEOrUTF8(out)
-	if err := OwnedFileCheckText(text, plan.TaskName, plan.Marker); err != nil {
+	info, err := checkedWindowsTask(text, plan.TaskName, plan.Marker)
+	if err != nil {
 		return WindowsTaskInfo{}, "", fmt.Errorf("scheduled task ownership check failed: %w", err)
 	}
-	info, _, err := parseWindowsTask(text, plan.Marker)
-	return info, text, err
+	return info, text, nil
 }
 
 // RefreshWindows migrates only the Exec action of an existing owned task.

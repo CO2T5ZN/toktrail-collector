@@ -37,8 +37,9 @@ The Windows leg of the `test` job runs these steps in order:
    `windows-test-output.jsonl` (structured failure log).
 2. **Scheduler native integration**: `TOKTRAIL_WINDOWS_SCHEDULER_E2E=1` +
    `go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -v`.
-   The test registers, queries, and removes a real per-user Task Scheduler task
-   on the runner; it does not trigger the task.
+   The test registers, queries, actually runs, and removes a real per-user
+   Task Scheduler task. It verifies Unicode XML round-tripping, console-free
+   execution, captured logs and the synthetic child's exit code.
 3. **Connect native integration**: `TOKTRAIL_WINDOWS_CONNECT_E2E=1` +
    `go test ./cmd/toktrail -run '^TestWindowsConnectNativeIntegration$' -count=1 -v`.
 4. **SQLite cancel-resource stress**: one parallel
@@ -178,7 +179,46 @@ the same change.
 
 ## Local equivalents
 
-Run from the repository root. CI uses `GOPROXY=off` with the committed
+Use the **same pinned Go patch version as the workflows**. A successful test
+with a different installed Go version is useful compatibility evidence, not a
+CI-equivalent validation result. The local preflight entry points reject a
+version mismatch:
+
+```sh
+TOKTRAIL_GO=/absolute/path/to/go1.24.13/bin/go sh scripts/check-ci.sh
+```
+
+The POSIX preflight runs full vet/tests, 50 shuffled repeats of scheduler and
+retry-related packages, race checks, Windows cross-compilation and the real
+six-platform signed-release chain using a temporary TEST key. It finishes by
+explicitly reporting **native Windows gates NOT RUN**. Cross-compilation is
+never a substitute for executing the Task Scheduler integrations.
+
+On Windows with Go 1.24.13 and PowerShell 7, use:
+
+```powershell
+pwsh -NoProfile -File scripts/check-ci.ps1 -Go 'C:\path\to\go1.24.13\bin\go.exe'
+```
+
+This runs the full Windows gate, including actual temporary task execution,
+pass-count verification (SKIP is not PASS), the 50-iteration SQLite stress,
+smoke, and shuffled regression repeats. Only synthetic temporary tasks are
+created; do not treat a passing plain `go test ./...` as equivalent, since the
+native integration gates are opt-in.
+
+Windows task XML queries use the installed Windows PowerShell and Task
+Scheduler COM API, emitting original Unicode XML as explicit UTF-8 bytes.
+They do not rely on `schtasks`' locale-dependent pipe encoding, and remain
+windowless. The native suite includes a no-console Unicode bridge test;
+registered task ownership is checked against decoded URI and action fields,
+not a path mentioned in descriptions or comments.
+
+Record each platform's result as PASS / FAIL / NOT RUN. Do not report all CI
+checks passed until the actual matching-commit GitHub Actions run is green.
+These scripts do not commit, push, launch workflows, change gate definitions,
+or publish releases.
+
+For the individual commands below, run from the repository root. CI uses `GOPROXY=off` with the committed
 `vendor/` tree; do the same locally to validate the offline path:
 
 ```sh
@@ -195,7 +235,7 @@ go vet ./...
 go test ./... -count=1 -timeout=3m -v -json 2>&1 | Tee-Object -FilePath windows-test-output.jsonl
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# Real Task Scheduler integration (registers/removes a real per-user task):
+# Real Task Scheduler integration (registers/runs/removes a temporary synthetic task):
 $env:TOKTRAIL_WINDOWS_SCHEDULER_E2E = '1'
 go test ./internal/scheduler -run '^TestWindowsSchedulerNativeIntegration$' -count=1 -v
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

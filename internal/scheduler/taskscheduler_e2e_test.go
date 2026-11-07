@@ -39,6 +39,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestWindowsSchedulerNativeIntegration(t *testing.T) {
@@ -127,18 +128,14 @@ func TestWindowsSchedulerNativeIntegration(t *testing.T) {
 	// 2. Real query: the task exists, passes the ownership check against
 	// this identity and state dir, and the non-ASCII state dir survived
 	// the UTF-16 round trip intact.
-	installed, found, err := IsInstalled(cfg)
-	if err != nil {
-		t.Fatalf("IsInstalled after install: %v", err)
-	}
-	if !installed {
-		t.Fatalf("task not reported as installed: %v", found)
-	}
 	xmlOut, err := (ExecRunner{}).RunOutput("schtasks", "/Query", "/TN", taskName, "/XML")
 	if err != nil {
 		t.Fatalf("query task XML: %v", err)
 	}
-	xmlText := decodeUTF16LEOrUTF8(xmlOut)
+	if !utf8.Valid(xmlOut) {
+		t.Fatal("production task query must return explicit UTF-8, not locale-dependent output")
+	}
+	xmlText := string(xmlOut)
 	// The registered XML carries the task name only in its schtasks form
 	// (\TokTrailCollector-<hash>); the raw identity correspondence is
 	// already proven by the ownership check inside IsInstalled above.
@@ -147,6 +144,14 @@ func TestWindowsSchedulerNativeIntegration(t *testing.T) {
 			t.Fatalf("registered task XML is missing %q (encoding or content regression):\n%s", want, xmlText)
 		}
 	}
+	installed, found, err := IsInstalled(cfg)
+	if err != nil {
+		t.Fatalf("IsInstalled after Unicode XML query: %v", err)
+	}
+	if !installed {
+		t.Fatalf("task not reported as installed: %v", found)
+	}
+
 	// The principal must carry the non-empty, system-resolved identity.
 	userID, err := windowsPrincipalUserID()
 	if err != nil {
