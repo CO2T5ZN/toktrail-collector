@@ -78,10 +78,12 @@ func runWindowsTaskProbe(t *testing.T, cfg TaskConfig, taskName string) {
 			}
 			command := "$ErrorActionPreference='Stop'; [Console]::Write((Get-ScheduledTaskInfo -TaskName '" + strings.TrimPrefix(taskName, "\\") + "').LastTaskResult)"
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			out, err := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
+			cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+			configureSchedulerCommand(cmd)
+			out, stderr, err := captureSchedulerOutput(cmd)
 			cancel()
 			if err != nil {
-				t.Fatalf("query task result: %v\n%s", err, out)
+				t.Fatalf("query task result: %v\nstdout: %q\nstderr: %q", err, out, stderr)
 			}
 			if strings.TrimSpace(string(out)) != "7" {
 				continue

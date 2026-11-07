@@ -30,7 +30,6 @@
 package scheduler
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -73,15 +72,13 @@ func (ExecRunner) RunOutput(name string, args ...string) ([]byte, error) {
 	configureSchedulerCommand(cmd)
 	// Keep diagnostic stderr separate from XML stdout: mixing a warning
 	// into an otherwise valid task document corrupts its encoding/content.
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := captureSchedulerOutput(cmd)
 	if err != nil {
 		err = schedulerOutputError(name, args, err)
 		if errors.Is(err, errWindowsTaskMissing) {
 			return nil, err
 		}
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(string(stderr))
 		if msg == "" {
 			msg = strings.TrimSpace(string(out))
 		}

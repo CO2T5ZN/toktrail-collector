@@ -55,9 +55,9 @@ func TestSchedulerXMLBridgePreservesUnicodeWithoutConsole(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded)
 	configureSchedulerCommand(cmd)
-	out, err := cmd.Output()
+	out, stderr, err := captureSchedulerOutput(cmd)
 	if err != nil {
-		t.Fatalf("Unicode bridge execution failed: %v", err)
+		t.Fatalf("Unicode bridge execution failed: %v\nstderr: %q", err, stderr)
 	}
 	if !utf8.Valid(out) || string(out) != payload {
 		t.Fatalf("windowless Unicode output was transcoded: %q", out)
