@@ -14,7 +14,6 @@ package scheduler
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 )
@@ -38,19 +37,14 @@ func registeredBinaryWithRunner(cfg TaskConfig, runner Runner) (string, string, 
 	}
 	switch cfg.Platform {
 	case "windows":
-		taskName := windowsTaskName(plan.TaskName)
-		out, err := runCommandOutput(runner, "schtasks", "/Query", "/TN", taskName, "/XML")
+		info, _, err := readWindowsTask(cfg, runner)
 		if err != nil {
-			if isTaskNotFound(err) {
-				return "", "", false, nil
-			}
-			return "", "", false, fmt.Errorf("windows scheduled task query failed: %w", err)
+			return "", "", false, err
 		}
-		xmlText := decodeUTF16LEOrUTF8(out)
-		if err := OwnedFileCheckText(xmlText, plan.TaskName, plan.Marker); err != nil {
-			return "", "", false, fmt.Errorf("scheduled task %s ownership check failed: %w", taskName, err)
+		if !info.Registered {
+			return "", "", false, nil
 		}
-		return xmlElementText(xmlText, "Command"), "schtasks:" + taskName, true, nil
+		return info.Collector, "schtasks:" + windowsTaskName(plan.TaskName), true, nil
 	default:
 		for _, file := range plan.RemoveFiles {
 			raw, readErr := os.ReadFile(file)

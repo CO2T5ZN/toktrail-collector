@@ -1,6 +1,7 @@
 package distribution
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -53,6 +54,85 @@ func TestParseManifestValid(t *testing.T) {
 	}
 	if _, err := m.FindArtifact("plan9", "arm64"); err == nil {
 		t.Error("FindArtifact accepted unsupported platform")
+	}
+}
+
+// TestParseManifestBackgroundHelper covers the optional Windows GUI helper
+// fields: a fully described windows helper parses, the fields are strictly
+// all-or-nothing, windows-only, and the entry name is fixed.
+func TestParseManifestBackgroundHelper(t *testing.T) {
+	withHelper := func(m *Manifest) *Manifest {
+		m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+		m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+		m.Artifacts[1].BackgroundBinarySize = 4567
+		return m
+	}
+	if _, err := ParseManifest(marshalManifest(t, withHelper(validManifest(t)))); err != nil {
+		t.Fatalf("windows artifact with a fully described helper rejected: %v", err)
+	}
+
+	mutations := map[string]func(m *Manifest){
+		"unix artifact": func(m *Manifest) {
+			m.Artifacts[0].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[0].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[0].BackgroundBinarySize = 4567
+		},
+		"only name": func(m *Manifest) { m.Artifacts[1].BackgroundBinary = "toktrail-background.exe" },
+		"only sha": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+		},
+		"only size": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"name and sha only": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+		},
+		"name and size only": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"sha and size only": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"wrong name": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "helper.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"traversal name": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "../../toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"bad sha": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = "XYZ"
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"upper sha": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 63) + "A"
+			m.Artifacts[1].BackgroundBinarySize = 4567
+		},
+		"zero size": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[1].BackgroundBinarySize = 0
+		},
+		"huge size": func(m *Manifest) {
+			m.Artifacts[1].BackgroundBinary = "toktrail-background.exe"
+			m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+			m.Artifacts[1].BackgroundBinarySize = MaxBinarySize + 1
+		},
+	}
+	for name, mutate := range mutations {
+		m := validManifest(t)
+		mutate(m)
+		if _, err := ParseManifest(marshalManifest(t, m)); err == nil {
+			t.Errorf("helper mutation %q accepted", name)
+		}
 	}
 }
 
@@ -164,5 +244,84 @@ func TestManifestJSONFieldNames(t *testing.T) {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("artifact JSON missing field %s", want)
 		}
+	}
+	// The helper fields marshal with exactly these names, and are omitted
+	// entirely from artifacts without a helper so a helper-less manifest
+	// stays byte-compatible with the pre-extension schema 1.
+	if strings.Contains(string(data), "backgroundBinary") {
+		t.Errorf("helper-less artifact must not marshal background fields, got %s", data)
+	}
+	helperData, err := json.Marshal(withBackgroundHelper(validManifest(t)).Artifacts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"backgroundBinary"`, `"backgroundBinarySha256"`, `"backgroundBinarySize"`,
+	} {
+		if !strings.Contains(string(helperData), want) {
+			t.Errorf("helper artifact JSON missing field %s: %s", want, helperData)
+		}
+	}
+}
+
+// withBackgroundHelper fully describes the Windows GUI helper on the
+// manifest's windows artifact (index 1 of validManifest's artifacts).
+func withBackgroundHelper(m *Manifest) *Manifest {
+	m.Artifacts[1].BackgroundBinary = BackgroundHelperEntryName()
+	m.Artifacts[1].BackgroundBinarySha256 = strings.Repeat("9", 64)
+	m.Artifacts[1].BackgroundBinarySize = 4567
+	return m
+}
+
+// TestParseManifestRejectsUnknownBackgroundFields pins the bootstrap
+// compatibility property from the other side: a parser that does not know
+// the optional helper fields must reject a manifest that carries them,
+// exactly like every released installer older than the helper extension.
+// Machines running such an installer must first bootstrap the new
+// toktrail-release binary (e.g. via the new release's bootstrap script)
+// before a helper-carrying release installs or upgrades.
+func TestParseManifestRejectsUnknownBackgroundFields(t *testing.T) {
+	data := marshalManifest(t, withBackgroundHelper(validManifest(t)))
+	if _, err := ParseManifest(data); err != nil {
+		t.Fatalf("current parser must accept the helper fields: %v", err)
+	}
+
+	// A strict decoder whose artifact struct predates the extension,
+	// using the same decoding rules ParseManifest uses.
+	type legacyArtifact struct {
+		OS                    string `json:"os"`
+		Arch                  string `json:"arch"`
+		Binary                string `json:"binary"`
+		BinarySha256          string `json:"binarySha256"`
+		BinarySize            int64  `json:"binarySize"`
+		Archive               string `json:"archive"`
+		ArchiveSha256         string `json:"archiveSha256"`
+		ArchiveSize           int64  `json:"archiveSize"`
+		InstallerBinary       string `json:"installerBinary"`
+		InstallerBinarySha256 string `json:"installerBinarySha256"`
+		InstallerBinarySize   int64  `json:"installerBinarySize"`
+	}
+	type legacyManifest struct {
+		Schema      int              `json:"schema"`
+		Product     string           `json:"product"`
+		Version     string           `json:"version"`
+		GeneratedAt string           `json:"generatedAt"`
+		Artifacts   []legacyArtifact `json:"artifacts"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var lm legacyManifest
+	if err := dec.Decode(&lm); err == nil {
+		t.Fatal("a strict parser without helper support accepted a helper-carrying manifest")
+	}
+
+	// The same legacy parser must still accept a helper-less manifest:
+	// releases without the helper stay installable everywhere.
+	legacyData := marshalManifest(t, validManifest(t))
+	dec2 := json.NewDecoder(bytes.NewReader(legacyData))
+	dec2.DisallowUnknownFields()
+	var lm2 legacyManifest
+	if err := dec2.Decode(&lm2); err != nil {
+		t.Fatalf("legacy parser must accept helper-less manifest: %v", err)
 	}
 }

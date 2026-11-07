@@ -10,6 +10,7 @@ import (
 // credentials because no secret is ever passed as an argument.
 func runCommand(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	configureSchedulerCommand(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))

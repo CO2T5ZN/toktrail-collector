@@ -53,6 +53,21 @@ func CollectorRawBinaryName(version, osName, arch string) string {
 	return fmt.Sprintf("toktrail-%s-%s-%s%s", version, osName, arch, BinaryExt(osName))
 }
 
+// BackgroundHelperEntryName returns the fixed name of the Windows GUI
+// helper inside release archives and after installation. It is identical
+// for every version and platform the manifest validator allows.
+func BackgroundHelperEntryName() string {
+	return BackgroundBinaryName + ".exe"
+}
+
+// BackgroundRawBinaryName returns the versioned dist-layout file name of
+// the Windows GUI helper produced by scripts/release.sh
+// (toktrail-background-<version>-windows-<arch>.exe). The assembler packs
+// it into the platform archive under the fixed entry name above.
+func BackgroundRawBinaryName(version, osName, arch string) string {
+	return fmt.Sprintf("%s-%s-%s-%s%s", BackgroundBinaryName, version, osName, arch, BinaryExt(osName))
+}
+
 // RuntimePlatform returns the GOOS and GOARCH of the current process.
 func RuntimePlatform() (string, string) {
 	return runtime.GOOS, runtime.GOARCH

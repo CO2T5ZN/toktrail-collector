@@ -66,6 +66,26 @@ build_target() {
   extension=
   if [ "$build_os" = windows ]; then extension=.exe; fi
   echo "Building $build_os/$build_arch"
+  # Windows releases bundle the GUI helper (toktrail-background.exe) next to
+  # the collector inside the platform archive. It is built FIRST, as a
+  # windowed-subsystem binary (-H=windowsgui: no console window at runtime),
+  # stripped like every release binary, with the same main.version linker
+  # variable. The dist file keeps the versioned layout
+  # toktrail-background-VERSION-windows-ARCH.exe; the assembler packs it into
+  # the zip under the fixed archive entry name toktrail-background.exe and
+  # verifies its PE subsystem is WINDOWS_GUI (a plain console go build is
+  # rejected there as well).
+  # Fail closed when the helper source is missing: a formal Windows release
+  # must never silently ship without the helper.
+  if [ "$build_os" = windows ]; then
+    if [ ! -d ./cmd/toktrail-background ]; then
+      echo "release: cmd/toktrail-background is missing; refusing to build a windows release without the GUI helper" >&2
+      exit 1
+    fi
+    GOOS=$build_os GOARCH=$build_arch CGO_ENABLED=0 "$go_bin" build -trimpath \
+      -ldflags "-H=windowsgui -s -w -X main.version=$version" \
+      -o "$dist_dir/toktrail-background-$version-$build_os-$build_arch$extension" ./cmd/toktrail-background
+  fi
   # Pin the release public key into the collector binary so `toktrail upgrade`
   # can verify a release on a machine that has no copy of the key. The value is
   # base64 of the PEM text: a linker flag is one token, and the key is public

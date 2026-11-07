@@ -70,6 +70,7 @@ func (ExecRunner) Run(name string, args ...string) error { return runCommand(nam
 
 func (ExecRunner) RunOutput(name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
+	configureSchedulerCommand(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -339,6 +340,14 @@ func Install(opt InstallOptions) (Plan, error) {
 	runner := opt.Runner
 	if runner == nil {
 		runner = ExecRunner{}
+	}
+	if opt.Config.Platform == "windows" {
+		switch runner.(type) {
+		case ExecRunner, *ExecRunner:
+			if err := validateBackgroundLauncher(opt.Config.Binary); err != nil {
+				return plan, err
+			}
+		}
 	}
 	for _, dir := range plan.EnsureDirs {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

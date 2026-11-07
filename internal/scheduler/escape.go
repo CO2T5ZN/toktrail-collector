@@ -78,21 +78,33 @@ func systemdEscapeArg(arg string) string {
 // action Arguments string using standard command-line quoting: wrapped in
 // double quotes when it contains whitespace, with internal quotes doubled.
 func windowsQuoteArg(arg string) string {
-	if !strings.ContainsAny(arg, " \t\"") {
+	var clean strings.Builder
+	for _, r := range arg {
+		if r >= 0x20 {
+			clean.WriteRune(r)
+		}
+	}
+	arg = clean.String()
+	if arg != "" && !strings.ContainsAny(arg, " \t\"") {
 		return arg
 	}
 	var b strings.Builder
 	b.WriteByte('"')
+	slashes := 0
 	for _, r := range arg {
+		if r == '\\' {
+			slashes++
+			continue
+		}
 		if r == '"' {
-			b.WriteString(`\"`)
-			continue
+			b.WriteString(strings.Repeat("\\", 2*slashes+1))
+		} else {
+			b.WriteString(strings.Repeat("\\", slashes))
 		}
-		if r < 0x20 {
-			continue
-		}
+		slashes = 0
 		b.WriteRune(r)
 	}
+	b.WriteString(strings.Repeat("\\", 2*slashes))
 	b.WriteByte('"')
 	return b.String()
 }

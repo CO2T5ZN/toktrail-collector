@@ -8,13 +8,26 @@ without an explicit consent path.
 
 ## What the scheduled task runs
 
-The installed task runs exactly:
+On macOS and Linux, the installed task runs:
 
 ```
 <toktrail binary> periodic --state-dir <absolute state dir>
 ```
 
-Nothing else is on the command line: no server URL and no secrets. The
+On Windows, the task invokes the GUI-subsystem launcher beside the collector:
+
+```
+<toktrail-background.exe> --collector <absolute toktrail.exe> --state-dir <absolute state dir>
+```
+
+The launcher starts the same `periodic` command with `CREATE_NO_WINDOW`, no
+interactive stdin, and stdout/stderr redirected to bounded rotating files in
+`<state dir>/logs/periodic.out.log` and `periodic.err.log`. It waits for the child
+and propagates its exit code; a kill-on-close Windows Job Object manages the
+child lifetime. The regular CLI remains a console application.
+
+Only local binary and state paths are on these command lines: no server URL
+and no secrets. The
 server endpoint is resolved at runtime from the bound device state, so a
 server move after install requires no task change. The task is a
 complete-exit job: each run collects, exports, drains a bounded number of
@@ -117,6 +130,38 @@ output, or logs.
 - Deactivation command failures are tolerated; file removal is refused,
   not guessed, when ownership cannot be proven.
 
+## Windows background migration
+
+The Windows task stays under the current `InteractiveToken` user with
+`LeastPrivilege`. `Hidden` controls Task Scheduler's list visibility, not
+console allocation, and is not used as a window-hiding mechanism.
+
+Install or upgrade the complete Windows release so `toktrail.exe` and
+`toktrail-background.exe` are beside each other, then migrate an existing task:
+
+```powershell
+& "$env:USERPROFILE\.toktrail\bin\toktrail.exe" service refresh --state-dir "$env:APPDATA\toktrail" --dry-run
+& "$env:USERPROFILE\.toktrail\bin\toktrail.exe" service refresh --state-dir "$env:APPDATA\toktrail"
+```
+
+Use the actual custom state and collector paths when different. Refresh changes
+only the existing Exec action, preserves the task's account, triggers, settings
+and identity, and never rebinds, reads source content or changes grants. A
+missing task, foreign collector, unexpected principal, or missing launcher is
+refused before mutation. Registration failure attempts to restore the original
+XML without deleting the task. Repeated refresh is safe. Installing a fresh
+schedule through `connect` or `service install` selects the launcher directly.
+
+Binary upgrade deliberately does not rewrite scheduler registration. Older
+strict manifest parsers do not recognize release metadata for the launcher;
+use the new release's bootstrap installer once before refreshing, rather than
+an old collector's built-in upgrader. `doctor` reports old visible-console
+schedules as a warning, missing helpers as a failure, and resolves a background
+action back to the underlying collector for installation identity checks.
+
+For Windows 10/11 manual verification, see
+[the Windows background test plan](WINDOWS_BACKGROUND_TEST_PLAN.zh-CN.md).
+
 ## Sources and plugins visibility
 
 - `toktrail sources list|enable|disable` manages the local grant config
@@ -167,11 +212,14 @@ Not verified here and required before production rollout on each platform:
    macOS launchd, Linux systemd user timers, and Windows Task Scheduler,
    including actual execution and per-user session behavior. On Windows,
    `TestWindowsSchedulerNativeIntegration` (gated by
-   `TOKTRAIL_WINDOWS_SCHEDULER_E2E=1`) registers, queries, and removes a real
-   per-user task on the `windows-2025` CI runner. The connect integration
-   also registers a real task, but neither test triggers the scheduled task.
-   Actual execution and logon behavior remain rollout prerequisites; see
-   [CI and release gates](CI.md). macOS and Linux native runtime verification
+   `TOKTRAIL_WINDOWS_SCHEDULER_E2E=1`) registers, queries, actually runs,
+   and removes a real per-user task. Its synthetic collector verifies that
+   no console exists, writes fixed stdout/stderr markers, and exits with code 7;
+   the test checks the logs and Task Scheduler's propagated result. The connect
+   integration also checks that an idempotent `service refresh` leaves grants
+   unchanged. Interactive desktop observation on Windows 10 and 11 remains a
+   rollout prerequisite; see [CI and release gates](CI.md). macOS and Linux
+   native runtime verification
    also remain external prerequisites.
 2. Real-platform quoting behavior beyond the API-level guarantees (for
    example, `schtasks`/`Register-ScheduledTask` argument passing for the

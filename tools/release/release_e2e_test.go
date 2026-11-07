@@ -81,6 +81,36 @@ func TestEndToEndRelease(t *testing.T) {
 		t.Fatalf("built %d artifacts, want %d", len(m.Artifacts), len(distribution.ReleasePlatforms))
 	}
 
+	// 3a. Windows releases must carry the GUI helper: release.sh fails
+	// closed when the helper source is missing, so a successful build
+	// implies the helper was built, packed and signed.
+	for i := range m.Artifacts {
+		a := &m.Artifacts[i]
+		if a.OS != "windows" {
+			if a.BackgroundBinary != "" {
+				t.Fatalf("%s/%s must not carry background fields", a.OS, a.Arch)
+			}
+			continue
+		}
+		if a.BackgroundBinary != "toktrail-background.exe" {
+			t.Fatalf("windows/%s has no background helper in the manifest", a.Arch)
+		}
+		helperRaw := filepath.Join(distDir, distribution.BackgroundRawBinaryName(version, a.OS, a.Arch))
+		sha, size, err := distribution.SHA256File(helperRaw)
+		if err != nil {
+			t.Fatalf("helper dist file for windows/%s: %v", a.Arch, err)
+		}
+		if sha != a.BackgroundBinarySha256 || size != a.BackgroundBinarySize {
+			t.Fatalf("helper dist file for windows/%s does not match the manifest", a.Arch)
+		}
+		// The helper must be extractable from the signed archive with the
+		// manifest's hash and size.
+		out := filepath.Join(t.TempDir(), "toktrail-background.exe")
+		if err := installer.ExtractBinaryEntry(filepath.Join(distDir, a.Archive), a.BackgroundBinary, out, a.BackgroundBinarySize, a.BackgroundBinarySha256); err != nil {
+			t.Fatalf("extract helper from %s: %v", a.Archive, err)
+		}
+	}
+
 	// 3b. Verify the signed capabilities metadata shipped with the release:
 	// content matches the registry compiled into this same source tree, the
 	// raw 64-byte Ed25519 signature verifies against the pinned key, and the

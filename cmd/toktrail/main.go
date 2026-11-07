@@ -2237,7 +2237,7 @@ func runPlugins(args []string) error {
 
 func runService(args []string) error {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: toktrail service <install|uninstall> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: toktrail service <install|refresh|uninstall> [flags]")
 		return flag.ErrHelp
 	}
 	sub := args[0]
@@ -2245,6 +2245,8 @@ func runService(args []string) error {
 	switch sub {
 	case "install":
 		return runServiceInstall(rest)
+	case "refresh":
+		return runServiceRefresh(rest)
 	case "uninstall":
 		return runServiceUninstall(rest)
 	}
@@ -2533,7 +2535,7 @@ Commands:
 
 Planned by the approved architecture:
   sources / plugins            adapter visibility and enablement
-  service install|uninstall    platform scheduled sync
+  service install|refresh|uninstall    platform scheduled sync
   privacy / doctor             consent and diagnostics
 
 Scheduling and diagnostics (implemented):
@@ -2586,6 +2588,7 @@ Scheduling and diagnostics (implemented):
                                revoke that grant
   plugins                      list the compiled-in adapters
   service install --grant <source>=<input> [--interval 30m] [--dry-run]
+  service refresh [--state-dir <dir>] [--dry-run]  (Windows: migrate an existing task without changing grants)
                                install the per-user scheduled task
                                (launchd / user systemd timer / Task
                                Scheduler); user scope only; does NOT bind,

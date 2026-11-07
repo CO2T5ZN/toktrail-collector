@@ -298,7 +298,7 @@ The installed task runs only:
 <toktrail binary> periodic --state-dir <absolute state dir>
 ```
 
-No server URL or secret appears on the scheduler command line. See [Scheduled collection](docs/SCHEDULING.md) for the full model and platform notes.
+No server URL or secret appears on the scheduler command line. See [Scheduled collection](docs/SCHEDULING.md) for the full model and platform notes. Windows uses the bundled `toktrail-background.exe` to collect without a console window. After installing the complete new release, migrate an existing task with `toktrail service refresh`; binding and grants stay unchanged. See the [Windows 10/11 test plan](docs/WINDOWS_BACKGROUND_TEST_PLAN.zh-CN.md).
 
 ## Signed releases and installation
 

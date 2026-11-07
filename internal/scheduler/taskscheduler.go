@@ -131,11 +131,8 @@ func renderTaskSchedulerUninstall(cfg TaskConfig, plan Plan) (Plan, error) {
 // no-stored-credentials, only-while-logged-on semantics of a per-user
 // task.
 func renderWindowsTaskXML(taskName, userID, binary, stateDir string, interval time.Duration) string {
-	arguments := strings.Join([]string{
-		"periodic",
-		"--state-dir",
-		windowsQuoteArg(stateDir),
-	}, " ")
+	arguments := windowsBackgroundArguments(binary, stateDir)
+	launcher := WindowsBackgroundPath(binary)
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-16"?>` + "\n")
 	b.WriteString(`<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\n")
@@ -187,7 +184,7 @@ func renderWindowsTaskXML(taskName, userID, binary, stateDir string, interval ti
 	b.WriteString("  <Actions Context=\"Author\">\n")
 	b.WriteString("    <Exec>\n")
 	b.WriteString("      <Command>")
-	b.WriteString(xmlEscape(binary))
+	b.WriteString(xmlEscape(launcher))
 	b.WriteString("</Command>\n")
 	b.WriteString("      <Arguments>")
 	b.WriteString(xmlEscape(arguments))

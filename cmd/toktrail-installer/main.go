@@ -31,16 +31,41 @@ Usage:
 Trust model: verification always requires an explicitly pinned public key
 (-pubkey). Missing trust root, invalid signature, malformed manifest,
 hash/size mismatch, unsupported platform, or version mismatch all abort
-before anything is installed. The installer only places the binary: it
-never changes upload consent, collector state, or scheduler registration,
-and never contacts the upload (sync) endpoint.
+before anything is installed. The installer only places release binaries:
+it never changes upload consent, collector state, or scheduler
+registration, and never contacts the upload (sync) endpoint.
+
+Windows GUI helper: a release may carry toktrail-background.exe inside the
+platform archive (manifest fields backgroundBinary/backgroundBinarySha256/
+backgroundBinarySize, strictly all-or-nothing, Windows-only, fixed name).
+When present, the helper is verified against the signed manifest and
+installed or replaced together with toktrail.exe as one unit: both files
+are staged and verified first, and a handled failure restores the previous
+files instead of leaving a new/old mix. Releases without the helper (all
+unix releases, and windows releases predating it) install exactly as
+before. Compatibility: the manifest is shared by all platforms, so once
+any windows artifact carries the helper fields, the whole manifest is
+rejected by every older client on every platform - including older
+darwin/linux collectors running their builtin "toktrail upgrade", not just
+older Windows installers. Machines running any older client must first
+bootstrap the new installer via a helper-carrying release's bootstrap
+scripts (install-<version>.sh on unix, install-<version>.ps1 on Windows;
+both pin and verify the matching toktrail-release binary) before
+installing or upgrading to that release. The strictness is deliberate:
+lenient parsing would let an old client silently ignore a helper it
+cannot verify.
 
 upgrade replaces only an existing toktrail binary, in place, at its
 original path: the directory given with -install-dir, or the first match
 on PATH when omitted. It refuses a missing, non-regular or unidentifiable
 existing binary, refuses same-version and downgrade targets unless
 -allow-downgrade is set, and keeps the previous binary as <binary>.previous
-by default (disable with -keep-old=false). There is no "latest" channel:
+by default (disable with -keep-old=false). A helper-carrying release also
+replaces toktrail-background.exe next to the collector through the same
+verified pipeline; it never touches scheduled tasks, services or user
+state - migrating an existing registration to the new helper is an
+explicit step owned by the collector CLI (toktrail service refresh), never
+a side effect of an upgrade. There is no "latest" channel:
 -version is always an exact version from trusted release notes. There is
 no automatic rollback: .previous is an unverified snapshot, and a verified
 rollback means stopping scheduled runs and reinstalling the previous signed
@@ -121,6 +146,9 @@ func runInstall(args []string) error {
 		action = "replaced"
 	}
 	fmt.Printf("%s toktrail %s (%s) at %s\n", action, res.Version, res.Platform, res.BinaryPath)
+	if res.BackgroundBinaryPath != "" {
+		fmt.Printf("installed windows gui helper %s (verified against the signed manifest)\n", res.BackgroundBinaryPath)
+	}
 	if res.KeptOldPath != "" {
 		fmt.Printf("previous binary kept at %s\n", res.KeptOldPath)
 	}
@@ -157,6 +185,9 @@ func runUpgrade(args []string) error {
 	}
 
 	fmt.Printf("upgraded toktrail %s -> %s (%s) at %s\n", res.FromVersion, res.Version, res.Platform, res.BinaryPath)
+	if res.BackgroundBinaryPath != "" {
+		fmt.Printf("upgraded windows gui helper %s (verified against the signed manifest)\n", res.BackgroundBinaryPath)
+	}
 	if res.KeptOldPath != "" {
 		fmt.Printf("previous binary kept at %s (unverified copy; to roll back, stop scheduled runs and restore it, or reinstall the previous signed release with install -allow-downgrade)\n", res.KeptOldPath)
 	}
@@ -164,6 +195,9 @@ func runUpgrade(args []string) error {
 		fmt.Printf("note: the target was found via PATH; only %s was upgraded - if a scheduler invokes a different path, rerun with -install-dir pointing at the scheduler's directory\n", res.BinaryPath)
 	}
 	fmt.Println("note: nothing else was changed - no state, grants or outbox, no upload consent, no connect, no scheduler registration")
+	if res.BackgroundBinaryPath != "" {
+		fmt.Println("note: to migrate an existing background service or scheduled task to the new helper, run the collector's explicit 'toktrail service refresh' command")
+	}
 	return nil
 }
 

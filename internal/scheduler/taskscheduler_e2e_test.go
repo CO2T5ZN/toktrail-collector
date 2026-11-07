@@ -22,12 +22,11 @@ package scheduler
 //   - Cleanup deletes only that exact task name (never a wildcard or
 //     another task) and the private temp directory; production tasks and
 //     other users' state are never touched.
-//   - The scheduled command is this test binary. The trigger grid starts
-//     in 2020 with a 30-minute repetition and StartWhenAvailable is
-//     false, so the task is not expected to fire during the seconds the
-//     test runs; if it ever does, the test binary without
-//     TOKTRAIL_WINDOWS_SCHEDULER_E2E skips the E2E test and exits
-//     (complete-exit), leaving no state behind.
+//   - The scheduled command is a synthetic collector launched by the real
+//     GUI helper. It reads only its explicit temporary state directory, records
+//     whether a console exists, writes fixed log lines, and exits with code 7.
+//     The test explicitly starts it and checks Task Scheduler's result; it
+//     never binds, scans a user home, or uploads usage.
 //   - schtasks must be on PATH; after the opt-in gates every failure
 //     (missing schtasks, unqueryable store, registration, verification)
 //     is a hard failure, never a skip, because the operator explicitly
@@ -69,12 +68,9 @@ func TestWindowsSchedulerNativeIntegration(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatalf("create state dir: %v", err)
 	}
-	// The test binary is a real, existing, absolute executable path; it
-	// never needs to run for this test to pass.
-	binary, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve test binary: %v", err)
-	}
+	// A synthetic collector touches only this test's state directory. Run it
+	// through the real GUI launcher to verify console, logs and exit status.
+	binary := buildWindowsTaskProbe(t, root)
 	cfg := TaskConfig{
 		Platform: "windows",
 		StateDir: stateDir,
@@ -160,7 +156,11 @@ func TestWindowsSchedulerNativeIntegration(t *testing.T) {
 		t.Fatalf("registered task XML is missing principal UserId %q:\n%s", userID, xmlText)
 	}
 
-	// 3. Real uninstall: the task is gone from the store.
+	// 3. Execute the task: no console may be allocated, stdout/stderr must
+	// be captured, and Task Scheduler must receive the child's exit code.
+	runWindowsTaskProbe(t, cfg, taskName)
+
+	// 4. Real uninstall: the task is gone from the store.
 	if _, err := Uninstall(UninstallOptions{Config: cfg}); err != nil {
 		t.Fatalf("real schtasks uninstall failed: %v", err)
 	}

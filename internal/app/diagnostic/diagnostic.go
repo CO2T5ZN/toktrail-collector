@@ -323,6 +323,26 @@ func resolvePath(path string) string {
 	return clean
 }
 
+func backgroundTaskCheck(info scheduler.WindowsTaskInfo, inspectErr error, stateDir string) Check {
+	check := Check{Name: "background"}
+	switch {
+	case inspectErr != nil:
+		check.Status, check.Detail = CheckWarn, "scheduled background action could not be verified"
+	case !info.Registered:
+		check.Status, check.Detail = CheckSkipped, "no scheduled task to inspect"
+	case !info.Background:
+		check.Status, check.Detail = CheckWarn, "the legacy scheduled task opens a console; run `toktrail service refresh` to migrate it without changing grants or binding"
+	default:
+		file, err := os.Lstat(info.Launcher)
+		if err != nil || !file.Mode().IsRegular() {
+			check.Status, check.Detail = CheckFail, "the scheduled background launcher is missing or is not a regular file; reinstall the complete Windows release"
+		} else {
+			check.Status, check.Detail = CheckOK, "windowless launch configured; logs in "+filepath.Join(stateDir, "logs")
+		}
+	}
+	return check
+}
+
 func scanCacheCheck(stateDir string) Check {
 	sources := []string{
 		adapter.CodexJSONLSource,
@@ -468,6 +488,13 @@ func Doctor(opt DoctorOptions) (DoctorReport, error) {
 	// nothing for the scheduled runs. Compare the three paths that matter and
 	// say which is which instead of leaving "I upgraded but nothing changed".
 	report.Checks = append(report.Checks, binaryIdentityCheck(opt))
+	if platformOf() == "windows" && strings.TrimSpace(opt.Binary) != "" {
+		info, inspectErr := scheduler.WindowsTaskStatus(scheduler.TaskConfig{
+			Platform: "windows", StateDir: stateDir, Binary: opt.Binary,
+			HomeDir: opt.HomeDir, Interval: scheduler.DefaultInterval,
+		})
+		report.Checks = append(report.Checks, backgroundTaskCheck(info, inspectErr, stateDir))
+	}
 
 	// 6. Optional server check (the only network path, explicit opt-in).
 	if opt.CheckServer {

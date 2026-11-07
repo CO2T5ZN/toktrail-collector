@@ -51,6 +51,11 @@ type InstallResult struct {
 	BinaryPath  string
 	Replaced    bool
 	KeptOldPath string
+	// BackgroundBinaryPath is the installed Windows GUI helper
+	// (toktrail-background.exe), empty when the release carries no
+	// helper. When set, the helper was verified against the signed
+	// manifest and replaced together with the collector binary.
+	BackgroundBinaryPath string
 }
 
 // Install verifies a release end-to-end and installs exactly one file: the
@@ -163,6 +168,19 @@ func Install(opts InstallOptions) (*InstallResult, error) {
 		return nil, fmt.Errorf("extract binary: %w", err)
 	}
 
+	// 8b. When the signed manifest describes the Windows GUI helper
+	// (strictly all-or-nothing, Windows-only, fixed name - enforced by
+	// ParseManifest), extract it from the same archive with its own size
+	// and hash checks. The archive validation pass rejects symlink and
+	// traversal entries for every member, helper included.
+	var helperPath string
+	if art.BackgroundBinary != "" {
+		helperPath = filepath.Join(tmpDir, art.BackgroundBinary)
+		if err := ExtractBinaryEntry(archivePath, art.BackgroundBinary, helperPath, art.BackgroundBinarySize, art.BackgroundBinarySha256); err != nil {
+			return nil, fmt.Errorf("extract background helper: %w", err)
+		}
+	}
+
 	// 9. Install atomically.
 	if opts.InstallDir == "" {
 		return nil, errors.New("-install-dir is required")
@@ -173,10 +191,67 @@ func Install(opts InstallOptions) (*InstallResult, error) {
 	target := filepath.Join(opts.InstallDir, art.Binary)
 	res := &InstallResult{Version: m.Version, Platform: osName + "/" + arch, BinaryPath: target}
 
-	if _, err := os.Lstat(target); err == nil {
-		if opts.NoReplace {
-			return nil, fmt.Errorf("target %s already exists and -no-replace is set (no-clobber mode)", target)
+	// A helper-less release (every unix platform, and windows releases
+	// predating the helper) keeps the original single-file install path,
+	// byte for byte.
+	if art.BackgroundBinary == "" {
+		if _, err := os.Lstat(target); err == nil {
+			if opts.NoReplace {
+				return nil, fmt.Errorf("target %s already exists and -no-replace is set (no-clobber mode)", target)
+			}
+			res.Replaced = true
+			// Downgrade protection: ask the installed binary for its version.
+			if cur, verr := installedVersion(target); verr == nil {
+				if curVer, perr := distribution.ParseVersion(cur); perr == nil {
+					if c := distribution.CompareVersions(curVer, wantVer); c > 0 && !opts.AllowDowngrade {
+						return nil, fmt.Errorf("refusing to downgrade from installed %s to %s (pass -allow-downgrade to override)", cur, opts.Version)
+					}
+				}
+			}
+			if opts.KeepOld {
+				old := target + previousBinarySuffix
+				if err := keepPrevious(target, old); err != nil {
+					return nil, fmt.Errorf("keep old binary: %w", err)
+				}
+				res.KeptOldPath = old
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect target: %w", err)
 		}
+
+		if err := atomicInstall(binPath, target); err != nil {
+			return nil, fmt.Errorf("install: %w", err)
+		}
+		return res, nil
+	}
+
+	// 9b. Helper-carrying install (Windows): both executables are staged
+	// next to their targets and then replaced together. A handled
+	// failure at any point restores the old files; if a restore itself
+	// fails, the backup copy is kept and its path is reported in the
+	// error. The two renames are not crash-atomic: a hard kill between
+	// them can leave one file new and the other old (see replace.go).
+	// The collector keeps its downgrade protection and KeepOld
+	// semantics; the helper follows the collector's decision (it is
+	// never executed for a version probe).
+	helperTarget := filepath.Join(opts.InstallDir, art.BackgroundBinary)
+	for _, t := range []string{target, helperTarget} {
+		if info, lerr := os.Lstat(t); lerr == nil {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("%s exists and is not a regular file; links placed in the install directory are never overwritten - remove or rename it first", t)
+			}
+		} else if !errors.Is(lerr, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect target: %w", lerr)
+		}
+	}
+	if opts.NoReplace {
+		for _, t := range []string{target, helperTarget} {
+			if _, lerr := os.Lstat(t); lerr == nil {
+				return nil, fmt.Errorf("target %s already exists and -no-replace is set (no-clobber mode)", t)
+			}
+		}
+	}
+	if _, err := os.Lstat(target); err == nil {
 		res.Replaced = true
 		// Downgrade protection: ask the installed binary for its version.
 		if cur, verr := installedVersion(target); verr == nil {
@@ -197,10 +272,56 @@ func Install(opts InstallOptions) (*InstallResult, error) {
 		return nil, fmt.Errorf("inspect target: %w", err)
 	}
 
-	if err := atomicInstall(binPath, target); err != nil {
+	if err := installCollectorAndHelper(binPath, helperPath, target, helperTarget, art); err != nil {
 		return nil, fmt.Errorf("install: %w", err)
 	}
+	res.BackgroundBinaryPath = helperTarget
 	return res, nil
+}
+
+// installCollectorAndHelper places the collector binary and the Windows
+// GUI helper as one unit: both files are staged beside their targets
+// (re-verified while copying), existing targets are backed up, and the
+// staged files are then renamed into place. If any rename fails, every
+// already-replaced target is restored from its backup, so a failed install
+// leaves the previous files in place instead of a new/old mix.
+func installCollectorAndHelper(collectorSrc, helperSrc, collectorTarget, helperTarget string, art *distribution.Artifact) error {
+	items := []struct {
+		src      string
+		target   string
+		wantSha  string
+		wantSize int64
+	}{
+		{collectorSrc, collectorTarget, art.BinarySha256, art.BinarySize},
+		{helperSrc, helperTarget, art.BackgroundBinarySha256, art.BackgroundBinarySize},
+	}
+	var placements []placement
+	// Stage first: nothing in the install directory is touched until every
+	// staged copy passed verification.
+	for _, it := range items {
+		staged, err := stageVerifiedFile(it.src, it.target, it.wantSha, it.wantSize)
+		if err != nil {
+			cleanupPlacements(placements)
+			return fmt.Errorf("stage %s: %w", filepath.Base(it.target), err)
+		}
+		placements = append(placements, placement{staged: staged, target: it.target})
+	}
+	// Back up existing targets so a mid-commit failure can restore them.
+	for i := range placements {
+		p := &placements[i]
+		if _, err := os.Lstat(p.target); err == nil {
+			backup, berr := backupExisting(p.target)
+			if berr != nil {
+				cleanupPlacements(placements)
+				return fmt.Errorf("back up %s: %w", p.target, berr)
+			}
+			p.backup, p.hadOld = backup, true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			cleanupPlacements(placements)
+			return fmt.Errorf("inspect target: %w", err)
+		}
+	}
+	return commitPlacements(placements)
 }
 
 // VerifyOptions configures standalone verification of release files.
@@ -264,17 +385,28 @@ func Verify(opts VerifyOptions) (*distribution.Manifest, error) {
 }
 
 func verifyDistFiles(m *distribution.Manifest, distDir string) error {
+	type distCheck struct {
+		name string
+		path string
+		sha  string
+		size int64
+	}
 	for i := range m.Artifacts {
 		a := &m.Artifacts[i]
-		checks := []struct {
-			name string
-			path string
-			sha  string
-			size int64
-		}{
+		checks := []distCheck{
 			{"archive", filepath.Join(distDir, a.Archive), a.ArchiveSha256, a.ArchiveSize},
 			{"collector binary", filepath.Join(distDir, distribution.CollectorRawBinaryName(m.Version, a.OS, a.Arch)), a.BinarySha256, a.BinarySize},
 			{"installer binary", filepath.Join(distDir, a.InstallerBinary), a.InstallerBinarySha256, a.InstallerBinarySize},
+		}
+		// A helper-carrying artifact must also ship its versioned helper
+		// input; the archive hash above covers the packed copy.
+		if a.BackgroundBinary != "" {
+			checks = append(checks, distCheck{
+				"background helper",
+				filepath.Join(distDir, distribution.BackgroundRawBinaryName(m.Version, a.OS, a.Arch)),
+				a.BackgroundBinarySha256,
+				a.BackgroundBinarySize,
+			})
 		}
 		for _, c := range checks {
 			sha, size, err := distribution.SHA256File(c.path)
@@ -296,6 +428,9 @@ func installedVersion(binPath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binPath, "version")
+	// Never flash a console window when the installer runs from a GUI
+	// context (e.g. alongside the Windows GUI helper).
+	hideConsoleWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

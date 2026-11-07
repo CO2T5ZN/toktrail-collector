@@ -24,6 +24,11 @@ const (
 	// a manifest may reference, chosen by target OS.
 	CollectorBinaryName       = "toktrail"
 	InstallerBinaryNamePrefix = "toktrail-release"
+	// BackgroundBinaryName is the base name of the optional Windows GUI
+	// helper. Inside archives and after installation it always appears as
+	// BackgroundBinaryName + ".exe" ("toktrail-background.exe"): the name
+	// is fixed by the manifest validator, never negotiated.
+	BackgroundBinaryName = "toktrail-background"
 
 	MaxManifestBytes = 1 << 20 // 1 MiB
 	MaxArtifacts     = 64
@@ -69,6 +74,37 @@ type Artifact struct {
 	InstallerBinary       string `json:"installerBinary"`
 	InstallerBinarySha256 string `json:"installerBinarySha256"`
 	InstallerBinarySize   int64  `json:"installerBinarySize"`
+	// BackgroundBinary / BackgroundBinarySha256 / BackgroundBinarySize
+	// describe the optional Windows GUI helper (toktrail-background.exe)
+	// carried inside the SAME archive as the collector binary, with the
+	// fixed entry name BackgroundBinaryName + ".exe". The three fields are
+	// strictly all-or-nothing: a helper is either fully described (name,
+	// hash and size) or entirely absent, and it may only appear on a
+	// windows artifact.
+	//
+	// BOOTSTRAP / UPGRADE COMPATIBILITY (schema stays 1): these fields are
+	// optional and omitted entirely when a release carries no helper, so
+	// manifests produced before this extension keep parsing and installing
+	// unchanged. The reverse direction does NOT hold: manifests that DO
+	// carry the fields are rejected by older clients, whose strict parser
+	// (DisallowUnknownFields) fails closed on the unknown backgroundBinary*
+	// keys. One manifest describes ALL platforms, so a single windows
+	// artifact with helper fields makes the whole document unreadable for
+	// every older client on every platform - including older darwin/linux
+	// collectors running their builtin `toktrail upgrade`, not just older
+	// Windows installers. A helper-carrying release therefore requires
+	// clients built from this code or newer on ALL platforms: existing
+	// machines must first bootstrap the new installer via that release's
+	// bootstrap scripts (install-<version>.sh and install-<version>.ps1,
+	// which pin and verify the new toktrail-release binary per platform)
+	// before they can install or upgrade to a helper-carrying release.
+	// The strictness is deliberate: lenient unknown-field parsing would
+	// let an old client silently ignore the helper it cannot verify.
+	// Publish helper-carrying releases only together with the matching
+	// bootstrap scripts for every platform.
+	BackgroundBinary       string `json:"backgroundBinary,omitempty"`
+	BackgroundBinarySha256 string `json:"backgroundBinarySha256,omitempty"`
+	BackgroundBinarySize   int64  `json:"backgroundBinarySize,omitempty"`
 }
 
 // Manifest is the signed release manifest. Field set is closed: unknown
@@ -198,6 +234,29 @@ func validateArtifact(version string, a *Artifact) error {
 		if val > MaxBinarySize {
 			return fmt.Errorf("%s %d exceeds limit %d", name, val, MaxBinarySize)
 		}
+	}
+	// Optional Windows GUI helper: strictly all-or-nothing, Windows-only,
+	// fixed entry name. An artifact without the fields keeps the exact
+	// pre-extension schema-1 semantics.
+	if a.BackgroundBinary == "" && a.BackgroundBinarySha256 == "" && a.BackgroundBinarySize == 0 {
+		return nil
+	}
+	if a.OS != "windows" {
+		return fmt.Errorf("backgroundBinary fields are only allowed on windows artifacts (the GUI helper is Windows-only), found on %s", a.OS)
+	}
+	// The helper entry name inside the archive is fixed, exactly like the
+	// collector binary name: anything else is rejected.
+	if want := BackgroundBinaryName + ".exe"; a.BackgroundBinary != want {
+		return fmt.Errorf("backgroundBinary name %q, want the fixed name %q", a.BackgroundBinary, want)
+	}
+	if !hex64.MatchString(a.BackgroundBinarySha256) {
+		return fmt.Errorf("backgroundBinarySha256 %q is not 64 lowercase hex characters", a.BackgroundBinarySha256)
+	}
+	if a.BackgroundBinarySize <= 0 {
+		return fmt.Errorf("backgroundBinarySize must be positive, got %d", a.BackgroundBinarySize)
+	}
+	if a.BackgroundBinarySize > MaxBinarySize {
+		return fmt.Errorf("backgroundBinarySize %d exceeds limit %d", a.BackgroundBinarySize, MaxBinarySize)
 	}
 	return nil
 }

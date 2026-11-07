@@ -61,6 +61,11 @@ type UpgradeResult struct {
 	Platform    string
 	BinaryPath  string
 	KeptOldPath string
+	// BackgroundBinaryPath is the upgraded Windows GUI helper
+	// (toktrail-background.exe), empty when the release carries no
+	// helper. It is placed next to the collector binary through the same
+	// verified pipeline.
+	BackgroundBinaryPath string
 	// DiscoveredViaPATH is true when the upgraded binary was found by
 	// PATH lookup rather than an explicit -install-dir. The caller should
 	// not claim the whole device was upgraded: a scheduler may invoke a
@@ -70,17 +75,26 @@ type UpgradeResult struct {
 
 // Upgrade performs an explicit, verified, in-place upgrade of an existing
 // collector installation. It reuses the exact trust pipeline of Install and
-// changes at most two files: the collector binary at its original absolute
-// path and, when KeepOld is set, <binary>.previous.
+// changes at most three files: the collector binary at its original absolute
+// path, the Windows GUI helper (toktrail-background.exe) beside it when the
+// release carries one, and <binary>.previous when KeepOld is set.
+//
+// On Windows a helper-carrying release replaces the collector and the
+// helper as one unit: both are staged and verified first, and a failure
+// restores the previous files instead of leaving a new/old mix.
 //
 // It never re-runs connect or bind, never reads or writes collector state
 // (grants, cursors, outbox, export journal), never inspects or rewrites
-// scheduler registration, and never contacts the upload endpoint. Because
-// the binary path is unchanged, an existing scheduler entry that invokes
-// this exact path keeps working without re-registration; when the target is
-// discovered via PATH, callers must not assume that path is the one the
-// scheduler invokes - with multiple installations or symlinks, pass the
-// scheduler's actual directory as -install-dir.
+// scheduler registration, and never contacts the upload endpoint. In
+// particular it never registers, re-registers or refreshes the background
+// helper service or any scheduled task: migrating an existing registration
+// to a newly installed helper is an explicit step owned by the collector
+// binary's own CLI (service refresh), never a side effect of an upgrade.
+// Because the binary path is unchanged, an existing scheduler entry that
+// invokes this exact path keeps working without re-registration; when the
+// target is discovered via PATH, callers must not assume that path is the
+// one the scheduler invokes - with multiple installations or symlinks, pass
+// the scheduler's actual directory as -install-dir.
 //
 // There is no automatic rollback: a failed upgrade leaves the previous
 // binary in place (verification happens before replacement), and the kept
@@ -170,12 +184,13 @@ func Upgrade(opts UpgradeOptions) (*UpgradeResult, error) {
 		return nil, err
 	}
 	return &UpgradeResult{
-		FromVersion:       cur,
-		Version:           res.Version,
-		Platform:          res.Platform,
-		BinaryPath:        res.BinaryPath,
-		KeptOldPath:       res.KeptOldPath,
-		DiscoveredViaPATH: viaPATH,
+		FromVersion:          cur,
+		Version:              res.Version,
+		Platform:             res.Platform,
+		BinaryPath:           res.BinaryPath,
+		KeptOldPath:          res.KeptOldPath,
+		BackgroundBinaryPath: res.BackgroundBinaryPath,
+		DiscoveredViaPATH:    viaPATH,
 	}, nil
 }
 

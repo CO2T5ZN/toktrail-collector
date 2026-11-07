@@ -162,6 +162,14 @@ func runAssemble(args []string) error {
 		archiveName string
 		archivePath string
 		entryName   string
+		// helperRawPath / helperEntryName describe the optional Windows
+		// GUI helper. Empty when this platform carries no helper: a
+		// helper-less platform keeps the exact pre-extension manifest
+		// shape (no backgroundBinary* fields).
+		helperRawPath string
+		helperEntry   string
+		helperSha     string
+		helperSize    int64
 	}
 
 	var toProcess []platformFiles
@@ -184,7 +192,7 @@ func runAssemble(args []string) error {
 		arcPath := filepath.Join(absDistDir, arcName)
 		entryName := distribution.CollectorBinaryName + ext
 
-		toProcess = append(toProcess, platformFiles{
+		pf := platformFiles{
 			osName:      osName,
 			arch:        arch,
 			rawBinPath:  rawPath,
@@ -192,7 +200,40 @@ func runAssemble(args []string) error {
 			archiveName: arcName,
 			archivePath: arcPath,
 			entryName:   entryName,
-		})
+		}
+
+		// The GUI helper is Windows-only and optional: a release built
+		// without it (or an older fixture) assembles exactly as before.
+		// When the versioned helper input is present for a Windows
+		// platform it is packed into the archive under its fixed entry
+		// name and fully described in the signed manifest. A helper input
+		// for any other platform is a release misconfiguration and fails
+		// closed before anything is written.
+		helperRawName := distribution.BackgroundRawBinaryName(*ver, osName, arch)
+		helperRawPath := filepath.Join(absDistDir, helperRawName)
+		if _, err := os.Stat(helperRawPath); err == nil {
+			if osName != "windows" {
+				return fmt.Errorf("background helper %s found for %s/%s, but the GUI helper is Windows-only; remove it from the dist directory", helperRawPath, osName, arch)
+			}
+			// The helper must be a windowed-subsystem (GUI) executable:
+			// a plain console go build would flash a window on every
+			// start. This fails closed before anything is written.
+			if err := verifyWindowsGUISubsystem(helperRawPath); err != nil {
+				return fmt.Errorf("background helper %s: %w", helperRawPath, err)
+			}
+			helperSha, helperSize, herr := distribution.SHA256File(helperRawPath)
+			if herr != nil {
+				return fmt.Errorf("hash background helper %s: %w", helperRawPath, herr)
+			}
+			pf.helperRawPath = helperRawPath
+			pf.helperEntry = distribution.BackgroundHelperEntryName()
+			pf.helperSha = helperSha
+			pf.helperSize = helperSize
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect background helper %s: %w", helperRawPath, err)
+		}
+
+		toProcess = append(toProcess, pf)
 	}
 
 	var artifacts []distribution.Artifact
@@ -202,7 +243,11 @@ func runAssemble(args []string) error {
 			return fmt.Errorf("hash collector binary %s: %w", pf.rawBinPath, err)
 		}
 
-		if err := CreateArchive(pf.archivePath, pf.rawBinPath, pf.entryName); err != nil {
+		entries := []ArchiveEntry{{Name: pf.entryName, SrcPath: pf.rawBinPath}}
+		if pf.helperRawPath != "" {
+			entries = append(entries, ArchiveEntry{Name: pf.helperEntry, SrcPath: pf.helperRawPath})
+		}
+		if err := CreateArchiveEntries(pf.archivePath, entries); err != nil {
 			return fmt.Errorf("create archive %s: %w", pf.archivePath, err)
 		}
 
@@ -216,7 +261,7 @@ func runAssemble(args []string) error {
 			return fmt.Errorf("hash installer binary %s: %w", pf.toolBinPath, err)
 		}
 
-		artifacts = append(artifacts, distribution.Artifact{
+		art := distribution.Artifact{
 			OS:                    pf.osName,
 			Arch:                  pf.arch,
 			Binary:                pf.entryName,
@@ -228,7 +273,16 @@ func runAssemble(args []string) error {
 			InstallerBinary:       filepath.Base(pf.toolBinPath),
 			InstallerBinarySha256: toolSha,
 			InstallerBinarySize:   toolSize,
-		})
+		}
+		if pf.helperRawPath != "" {
+			// Helper-carrying artifacts require an installer built with
+			// helper support: older installers reject these fields (see
+			// the compatibility note in internal/distribution/manifest.go).
+			art.BackgroundBinary = pf.helperEntry
+			art.BackgroundBinarySha256 = pf.helperSha
+			art.BackgroundBinarySize = pf.helperSize
+		}
+		artifacts = append(artifacts, art)
 	}
 
 	m := &distribution.Manifest{

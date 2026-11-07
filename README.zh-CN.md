@@ -295,7 +295,7 @@ go run ./cmd/toktrail service install \
 <toktrail binary> periodic --state-dir <absolute state dir>
 ```
 
-调度器命令行上不会出现 server URL 或 secret。完整模型与平台说明见 [Scheduled collection](docs/SCHEDULING.md)。
+调度器命令行上不会出现 server URL 或 secret。完整模型与平台说明见 [Scheduled collection](docs/SCHEDULING.md)。Windows 使用随包的 `toktrail-background.exe` 无窗口启动采集；已有任务在安装完整新版后运行 `toktrail service refresh` 迁移，不需要重新绑定或授权。详见 [Windows 10/11 测试方案](docs/WINDOWS_BACKGROUND_TEST_PLAN.zh-CN.md)。
 
 ## 签名发布与安装
 

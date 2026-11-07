@@ -37,6 +37,10 @@ func TestWindowsConnectNativeIntegration(t *testing.T) {
 	if out, err := exec.CommandContext(ctx, "go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build collector: %v\n%s", err, out)
 	}
+	launcher := scheduler.WindowsBackgroundPath(binary)
+	if out, err := exec.CommandContext(ctx, "go", "build", "-ldflags=-H=windowsgui", "-o", launcher, "../toktrail-background").CombinedOutput(); err != nil {
+		t.Fatalf("build background launcher: %v\n%s", err, out)
+	}
 	cfg := scheduler.TaskConfig{Platform: "windows", StateDir: state, HomeDir: home, Binary: binary, Interval: scheduler.DefaultInterval}
 	installed, _, err := scheduler.IsInstalled(cfg)
 	if err != nil || installed {
@@ -82,5 +86,22 @@ func TestWindowsConnectNativeIntegration(t *testing.T) {
 	installed, _, err = scheduler.IsInstalled(cfg)
 	if err != nil || !installed {
 		t.Fatalf("connect did not register its task: installed=%v err=%v", installed, err)
+	}
+	info, err := scheduler.WindowsTaskStatus(cfg)
+	if err != nil || !info.Background || !strings.EqualFold(info.Collector, binary) {
+		t.Fatalf("connect did not configure its background collector: %+v err=%v", info, err)
+	}
+	before, err := os.ReadFile(grants.New(state).Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh := exec.CommandContext(ctx, binary, "service", "refresh", "--state-dir", state)
+	refresh.Env = cmd.Env
+	if out, err := refresh.CombinedOutput(); err != nil || !strings.Contains(string(out), "background=true") {
+		t.Fatalf("idempotent service refresh: %v\n%s", err, out)
+	}
+	after, err := os.ReadFile(grants.New(state).Path())
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("service refresh changed source grants: %v", err)
 	}
 }

@@ -66,3 +66,53 @@ func TestCreateArchiveRoundTrip(t *testing.T) {
 		t.Error("second CreateArchive to same path succeeded; want no-clobber")
 	}
 }
+
+// TestCreateArchiveEntriesRoundTrip covers the multi-entry form used for
+// windows archives carrying the collector plus the GUI helper.
+func TestCreateArchiveEntriesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	collector := filepath.Join(dir, "toktrail.exe")
+	helper := filepath.Join(dir, "toktrail-background.exe")
+	collectorContent := "fake collector"
+	helperContent := "fake gui helper"
+	collectorSha, collectorSize := writeTestFile(t, collector, collectorContent)
+	helperSha, helperSize := writeTestFile(t, helper, helperContent)
+
+	entries := []ArchiveEntry{
+		{Name: "toktrail.exe", SrcPath: collector},
+		{Name: "toktrail-background.exe", SrcPath: helper},
+	}
+	zp := filepath.Join(dir, "out.zip")
+	if err := CreateArchiveEntries(zp, entries); err != nil {
+		t.Fatalf("CreateArchiveEntries zip: %v", err)
+	}
+	for _, e := range []struct {
+		name string
+		sha  string
+		size int64
+	}{
+		{"toktrail.exe", collectorSha, collectorSize},
+		{"toktrail-background.exe", helperSha, helperSize},
+	} {
+		out := filepath.Join(dir, "extracted-"+e.name)
+		if err := installer.ExtractBinaryEntry(zp, e.name, out, e.size, e.sha); err != nil {
+			t.Fatalf("ExtractBinaryEntry %s: %v", e.name, err)
+		}
+	}
+
+	// Duplicate entry names and empty entry lists are refused.
+	if err := CreateArchiveEntries(filepath.Join(dir, "dup.zip"), []ArchiveEntry{
+		{Name: "toktrail.exe", SrcPath: collector},
+		{Name: "toktrail.exe", SrcPath: helper},
+	}); err == nil {
+		t.Error("duplicate entry names accepted")
+	}
+	if err := CreateArchiveEntries(filepath.Join(dir, "empty.zip"), nil); err == nil {
+		t.Error("empty entry list accepted")
+	}
+	if err := CreateArchiveEntries(filepath.Join(dir, "unsafe.zip"), []ArchiveEntry{
+		{Name: "../toktrail.exe", SrcPath: collector},
+	}); err == nil {
+		t.Error("unsafe entry name accepted")
+	}
+}
