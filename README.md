@@ -23,6 +23,7 @@ Supported sources in the current implementation:
 - Pi session JSONL (`pi-jsonl`): assistant message plus usage/model_usage entry counters only.
 - Oh My Pi session JSONL (`omp-jsonl`): same format as Pi, read under `~/.omp`.
 - CodeBuddy IDE session history (`codebuddy-history`): passive per-request usage counters from `index.json` files under the CodeBuddy IDE local data directory; completed requests only, conversation bodies are never read.
+- OpenCode CLI session SQLite (`opencode-sqlite`): passive assistant-message usage counters from `~/.local/share/opencode/opencode.db`; message bodies are never read.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -245,6 +246,20 @@ Scan and export CodeBuddy IDE usage from a local directory:
 go run ./cmd/toktrail scan --source codebuddy-history --input "~/AppData/Local/CodeBuddyExtension/Data"
 go run ./cmd/toktrail export --source codebuddy-history --input "~/AppData/Local/CodeBuddyExtension/Data" --out ./codebuddy-batch.json --batch codebuddy-demo-1
 ```
+
+Scan and export OpenCode usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source opencode-sqlite --input ~/.local/share/opencode
+go run ./cmd/toktrail export --source opencode-sqlite --input ~/.local/share/opencode --out ./opencode-batch.json --batch opencode-demo-1
+```
+
+OpenCode specifics:
+
+- OpenCode stores every conversation message in one SQLite database at `~/.local/share/opencode/opencode.db`. The adapter reads only assistant rows in the `session_message` table, which is the current layout's authoritative message store and a superset of the legacy `message` table, so reading it alone avoids double counting.
+- OpenCode usage uses OpenAI-style disjoint buckets: `tokens.input` excludes cache reads, `tokens.cache.read`/`write` are listed separately, and `tokens.reasoning` is an informational subset of `output` that is not uploaded separately. The four uploaded buckets are verbatim `input`/`cacheRead`/`cacheWrite`/`output`.
+- Reads use a read-only immutable SQLite DSN to avoid creating sidecar files in the live OpenCode directory. WAL-only commits may appear on the next scheduled read after checkpointing.
+- The `model` field is recorded as `providerID/modelID` when attribution is present; messages without it report `unknown`.
 
 CodeBuddy specifics:
 

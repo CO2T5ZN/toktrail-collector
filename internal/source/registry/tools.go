@@ -132,6 +132,18 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		// OpenCode CLI stores every conversation message in one SQLite
+		// database at ~/.local/share/opencode/opencode.db; the adapter reads
+		// per-request usage counters from assistant rows in session_message
+		// through a read-only immutable DSN and never writes to the
+		// directory.
+		Tool:           "OpenCode",
+		Aliases:        []string{"opencode", "open code", "open-code", "opencodecli", "opencode cli", "sst opencode"},
+		Source:         adapter.OpenCodeSQLiteSource,
+		DefaultSubpath: []string{".local", "share", "opencode"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It
